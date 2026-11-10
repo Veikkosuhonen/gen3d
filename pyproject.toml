@@ -1,0 +1,23 @@
+[project]
+name = "gen3d"
+version = "0.1.0"
+description = "Procedural SDF shape workbench: GLSL shapes -> live preview -> mesh -> G-code"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fast-simplification>=0.2.0",
+    "glfw>=2.11.0",
+    "lxml>=6.1.3",
+    "moderngl>=5.13.0",
+    "networkx>=3.7",
+    "numpy>=2.5.4",
+    "scikit-image>=0.26.0",
+    "trimesh>=5.2.0",
+]
+
+[project.scripts]
+gen3d = "gen3d.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
