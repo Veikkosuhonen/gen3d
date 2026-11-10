@@ -79,13 +79,27 @@ pub fn headless() -> Result<Gpu> {
 
 impl Gpu {
     /// Create a shader module, catching any wgpu-side validation error instead of panicking.
+    ///
+    /// By default wgpu wraps every loop in a hidden iteration counter (`force_loop_bounding`) and
+    /// guards integer division. On Vulkan that blocks unrolling and adds work to every iteration of
+    /// the raymarch loop and every `map()` loop, which is a large slowdown for SDF shaders. Both are
+    /// turned off here; buffer bounds checks stay on. The cost: a shape with a genuinely infinite
+    /// loop may hang the GPU until the driver resets it, instead of being cut off.
+    /// `GEN3D_SHADER_CHECKS=1` restores wgpu's fully checked mode.
     pub fn shader(&self, compiled: &Compiled, label: &str) -> Result<wgpu::ShaderModule> {
-        self.scoped(|| {
-            self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(compiled.source.as_str().into()),
-            })
-        })
+        let desc = wgpu::ShaderModuleDescriptor {
+            label: Some(label),
+            source: wgpu::ShaderSource::Wgsl(compiled.source.as_str().into()),
+        };
+        if std::env::var_os("GEN3D_SHADER_CHECKS").is_some_and(|v| v != "0") {
+            return self.scoped(|| self.device.create_shader_module(desc));
+        }
+        let mut checks = wgpu::ShaderRuntimeChecks::checked();
+        checks.force_loop_bounding = false;
+        checks.int_div_checks = false;
+        // SAFETY: shapes are local, user-written SDFs; an infinite loop only stalls the user's own
+        // GPU (the driver's watchdog recovers it). Memory bounds checks remain enabled.
+        self.scoped(|| unsafe { self.device.create_shader_module_trusted(desc, checks) })
     }
 
     /// Run `f` inside a validation error scope and turn errors into `Err`.

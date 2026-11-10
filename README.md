@@ -117,6 +117,9 @@ gen3d new    NAME
 
 Outputs go to `out/`; `-D` values are appended to the filename (`out/knob_DIAM-30.stl`).
 `check` only needs naga, not a GPU. `WGPU_BACKEND=vulkan|gl` and `WGPU_ADAPTER_NAME=...` pick the GPU.
+Shaders are compiled without wgpu's loop-bounding and integer-division guards, which slow raymarching a lot
+on Vulkan; an infinite loop in a shape can therefore stall the GPU until the driver resets it.
+`GEN3D_SHADER_CHECKS=1` turns the guards back on.
 
 ## Mesh quality notes
 
