@@ -17,12 +17,12 @@ everything (printer, filament, print settings, start/end G-code).
 
 Override individual settings per run:
 
-    uv run gen3d slice shapes/knob.glsl -- --layer-height 0.15 --fill-density 30% --support-material
+    gen3d slice shapes/knob.wgsl -- --layer-height 0.15 --fill-density 30% --support-material
 
 ## OrcaSlicer
 
 Orca's CLI takes JSON presets. Export your machine / process / filament presets and pass them with
 names containing `machine`, `process` and `filament`:
 
-    uv run gen3d slice shapes/knob.glsl --slicer orca \
+    gen3d slice shapes/knob.wgsl --slicer orca \
         -c printers/machine.json -c printers/process.json -c printers/filament.json
