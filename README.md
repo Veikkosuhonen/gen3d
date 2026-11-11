@@ -9,6 +9,7 @@ shape.wgsl ──► gen3d view    live raymarched preview, reloads on save
            ──► gen3d slice   export + PrusaSlicer/OrcaSlicer CLI → .gcode
            ──► gen3d open    export + open in the slicer GUI
            ──► gen3d export --format vti   SDF + boundary-condition fields as a VTK grid (simulation)
+           ──► gen3d optimize  topology optimization of the design domain → result.vti (live)
 
 result.vti ──► gen3d view    threshold surface of a grid (e.g. a topology-optimization density), live reload
            ──► gen3d export  marching cubes → STL/3MF, or slice / open like a shape
@@ -145,6 +146,7 @@ gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
 gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
+gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--modulus MPA] [--nu V] [-o out.vti]
 
 .vti options (view/render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
@@ -228,7 +230,7 @@ gen3d slice  result.vti --array density                   # straight to G-code
 - **Smooth or blocky:** smooth draws the interpolated threshold surface, the same one `export` meshes.
   `--blocky` (or `M`) draws every inside sample as a cube; for cell data those are exactly the elements.
 - **Colour:** `--color NAME` (or `F`) colours the surface and the section face by another array, using a
-  viridis colour map. The range is the min to max of that array over the inside samples, and the window
+  viridis colour map. The range is the 1st to 99th percentile of that array over the inside samples (so a few hotspots don't flatten it), and the window
   title shows it.
 - **Live reload:** when the file changes on disk, the view reloads but keeps the array, threshold and
   colour you picked. If a write is caught half-finished, the old view stays until the next change.
@@ -248,6 +250,54 @@ Keys in the viewer for `.vti` files:
 The sidebar has the same controls, plus a histogram for picking the threshold and the material volume
 (see [Viewer](#viewer)). `E` / `G` / `O` export, slice or open with the current array and threshold. On a large grid (8M samples)
 a threshold change takes about a second, because the distance field is recomputed on the CPU.
+
+## Topology optimization
+
+`gen3d optimize` finds the stiffest part that uses a given share of the design domain (minimum
+compliance), with the SIMP method on a voxel grid. The problem is a shape file written with the
+[extra fields](#extra-fields-boundary-conditions-and-regions) conventions:
+
+| | |
+|---|---|
+| `map` | the design domain: where material may go |
+| `field_fixed` (f32) | `< 0` where the part is clamped (all three displacement components are held) |
+| `field_load` (vec3f) | load direction where it is non-zero; the total `--force` is spread over these nodes so the magnitudes add up to it |
+| `field_keep` (f32, optional) | `< 0`: forced solid (mounting plates, bosses, faces you need) |
+| `field_void` (f32, optional) | `< 0`: forced empty (clearance for bolts, other parts) |
+
+```sh
+gen3d optimize shapes/bracket_domain.wgsl --volfrac 0.3    # -> out/bracket_domain_topopt.vti
+gen3d view out/bracket_domain_topopt.vti                     # opens on `density`, threshold 0.5
+gen3d export out/bracket_domain_topopt.vti                   # -> out/bracket_domain_topopt.stl
+```
+
+In the viewer, the **Topology optimization** section runs the same thing in the background. **View**
+opens the result in a second window while it is still running. The file is rewritten after every
+iteration, atomically, so you watch the design form; **Stop** ends the run and keeps the last iteration.
+
+- **Output:** cell arrays `density` (0..1) and `energy` (strain energy density, MPa: where the part
+  works hardest), and point array `displacement` (mm). Colour by `energy` or `displacement` to see how
+  the result carries the load.
+- **Units:** mm, N and MPa. The default material is PLA-like (E = 3500 MPa, ν = 0.35), so the printed
+  maximum displacement is a rough real-world estimate for a solid print. It ignores layer adhesion and
+  infill.
+- **Method:**
+  - Each voxel is a trilinear 8-node hex element.
+  - Density is penalized with p = 3, and a density filter with radius `--rmin` voxels sets the minimum
+    member size.
+  - The density update uses optimality criteria (move limit 0.2) under the volume constraint.
+  - It stops when compliance improves by less than 0.1% for 3 iterations, or at `--iters`.
+- **Speed:** the solver is matrix-free conjugate gradient with a Jacobi preconditioner, multithreaded and
+  warm-started. The default voxel keeps the bounds at about 40k elements. On 12 cores, the bracket
+  (34k domain elements) takes about 2 s per iteration and converges in about 30 iterations, under a
+  minute. Time grows quickly with resolution: halving the voxel is 8× the elements and more solver
+  iterations.
+- **Shortcuts in this first version:**
+  - No multigrid, so fine grids are slow.
+  - No Heaviside projection, so about 20–25% of the design stays grey (between 0.1 and 0.9).
+    Thresholding at 0.5 gives a clean part, but its volume differs a little from `--volfrac`.
+  - One load case.
+  - No symmetry or overhang (printability) constraints.
 
 ## Mesh quality notes
 
@@ -278,4 +328,7 @@ cargo clippy --all-targets
 | `src/mesh.rs` | volume / watertight / bodies, decimation, STL/3MF/OBJ/PLY writers |
 | `src/viewer.rs` | raymarching preview harness, viewer window and egui sidebar, headless PNG render |
 | `src/slicer.rs` | PrusaSlicer / OrcaSlicer discovery and CLI driving |
+| `src/vti.rs` | VTK ImageData reader and writers |
+| `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing |
+| `src/topopt.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
 | `src/wgsl/sdf.wgsl` | the SDF library |

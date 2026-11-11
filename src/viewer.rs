@@ -762,6 +762,31 @@ struct Job {
     log: String,
     started: Option<Instant>,
     took: Duration,
+    /// process id while running, for Stop
+    pid: Option<u32>,
+    stopped: bool,
+}
+
+/// Settings of the Topology optimization section (`gen3d optimize` flags).
+struct OptUi {
+    volfrac: f64,
+    iters: usize,
+    /// None = `topopt::auto_voxel`
+    voxel: Option<f32>,
+    force: f64,
+    rmin: f64,
+}
+
+impl Default for OptUi {
+    fn default() -> Self {
+        OptUi {
+            volfrac: 0.3,
+            iters: 50,
+            voxel: None,
+            force: 100.0,
+            rmin: 1.5,
+        }
+    }
 }
 
 struct Viewer {
@@ -775,6 +800,7 @@ struct Viewer {
     iso_drag: Option<f32>,
     /// Grid voxel for "Export VTI" (None = `default_vti_voxel`).
     vti_voxel: Option<f32>,
+    opt: OptUi,
     shape: Shape,
     fields: Vec<Field>,
     params: Vec<Param>,
@@ -1269,6 +1295,7 @@ impl Viewer {
             };
             let result = (|| -> std::io::Result<std::process::ExitStatus> {
                 let mut child = c.spawn()?;
+                job.lock().unwrap().pid = Some(child.id());
                 let (out, err) = (child.stdout.take(), child.stderr.take());
                 let j = job.clone();
                 let reader = std::thread::spawn(move || {
@@ -1292,6 +1319,7 @@ impl Viewer {
             })();
             let mut j = job.lock().unwrap();
             j.running = false;
+            j.pid = None;
             j.took = j.started.map_or_else(Duration::default, |s| s.elapsed());
             j.ok = Some(match result {
                 Ok(s) => s.success(),
@@ -1506,6 +1534,11 @@ impl Viewer {
                 .default_open(true)
                 .show(ui, |ui| self.fields_ui(ui));
         }
+        if self.volume.is_none() && self.loaded {
+            egui::CollapsingHeader::new("Topology optimization")
+                .default_open(self.optimizable())
+                .show(ui, |ui| self.optimize_ui(ui));
+        }
         egui::CollapsingHeader::new("Output")
             .default_open(true)
             .show(ui, |ui| self.output_ui(ui));
@@ -1693,7 +1726,7 @@ impl Viewer {
             let mut fixed = fixed_crange.is_some();
             ui.horizontal(|ui| {
                 ui.checkbox(&mut fixed, "fixed range").on_hover_text(
-                    "by default the range is min..max over the inside samples; fix it to \
+                    "by default the range is the 1st..99th percentile over the inside samples; fix it to \
                      compare iterations or to ignore a few hotspots",
                 );
                 if fixed {
@@ -1736,6 +1769,100 @@ impl Viewer {
             });
         } else if new_crange != fixed_crange {
             self.edit_volume_uniforms(|v| v.color_range = new_crange);
+        }
+    }
+
+    /// Whether the shape defines the fields `gen3d optimize` needs.
+    fn optimizable(&self) -> bool {
+        let has = |n: &str, c: usize| self.fields.iter().any(|f| f.name == n && f.comps == c);
+        has("fixed", 1) && has("load", 3)
+    }
+
+    fn optimize_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.optimizable() {
+            ui.weak(
+                "The shape is the design domain. Add `fn field_fixed(p: vec3f) -> f32` (< 0 where it is \
+                 clamped) and `fn field_load(p: vec3f) -> vec3f` (load direction) to optimize it; \
+                 optional field_keep / field_void force material / empty space. See \
+                 shapes/bracket_domain.wgsl.",
+            );
+            return;
+        }
+        let running = self.job.lock().unwrap().running;
+        let o = &mut self.opt;
+        let auto = crate::topopt::auto_voxel(&self.shape, 40_000.0);
+        egui::Grid::new("opt").num_columns(2).show(ui, |ui| {
+            ui.label("volume fraction");
+            ui.add(egui::Slider::new(&mut o.volfrac, 0.05..=0.8).fixed_decimals(2))
+                .on_hover_text("share of the design domain to fill with material");
+            ui.end_row();
+            ui.label("load");
+            ui.add(
+                egui::DragValue::new(&mut o.force)
+                    .speed(1.0)
+                    .range(0.0..=1e6)
+                    .suffix(" N"),
+            )
+            .on_hover_text("total force over the field_load region; only scales the displacements");
+            ui.end_row();
+            ui.label("voxel");
+            ui.horizontal(|ui| {
+                let mut v = o.voxel.unwrap_or(auto);
+                let speed = v * 0.01;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut v)
+                            .speed(speed)
+                            .range(1e-3..=1e3)
+                            .suffix(" mm"),
+                    )
+                    .on_hover_text("element size; time grows quickly as it shrinks")
+                    .changed()
+                {
+                    o.voxel = Some(v);
+                }
+                if o.voxel.is_some() && ui.small_button("auto").clicked() {
+                    o.voxel = None;
+                }
+            });
+            ui.end_row();
+            ui.label("filter radius");
+            ui.add(
+                egui::Slider::new(&mut o.rmin, 1.0..=4.0)
+                    .fixed_decimals(1)
+                    .suffix(" voxels"),
+            )
+            .on_hover_text("minimum member size: larger gives thicker, simpler members");
+            ui.end_row();
+            ui.label("iterations");
+            ui.add(egui::Slider::new(&mut o.iters, 5..=200))
+                .on_hover_text("at most; stops early when converged");
+            ui.end_row();
+        });
+        let vox = o.voxel.unwrap_or(auto);
+        let n: usize = self
+            .shape
+            .size()
+            .iter()
+            .map(|s| (*s / vox).ceil().max(1.0) as usize)
+            .product();
+        ui.weak(format!("≤ {n} elements (only those inside the domain are solved)"));
+        let args: Vec<String> = [
+            ("--volfrac", o.volfrac),
+            ("--iters", o.iters as f64),
+            ("--voxel", vox as f64),
+            ("--force", o.force),
+            ("--rmin", o.rmin),
+        ]
+        .iter()
+        .flat_map(|(k, v)| [k.to_string(), fmt_num(*v)])
+        .collect();
+        if ui
+            .add_enabled(!running, egui::Button::new("Optimize"))
+            .on_hover_text("run gen3d optimize in the background; View shows the design live")
+            .clicked()
+        {
+            self.run_bg_with("optimize", &args);
         }
     }
 
@@ -1933,30 +2060,57 @@ impl Viewer {
         if cmd.is_empty() {
             return;
         }
-        ui.horizontal(|ui| {
+        let (pid, stopped) = {
+            let j = self.job.lock().unwrap();
+            (j.pid, j.stopped)
+        };
+        ui.horizontal_wrapped(|ui| {
             if running {
                 ui.spinner();
                 let t = started.map_or(0.0, |s| s.elapsed().as_secs_f32());
-                ui.label(format!("{cmd} running… {t:.1} s"));
-            } else if ok == Some(true) {
-                status_dot(ui, OK_GREEN);
-                ui.label(format!("{cmd} finished in {:.1} s", took.as_secs_f32()));
-                if let Some(out) = written_path(&log).filter(|p| is_vti(p))
+                ui.label(format!("{} running… {t:.1} s", cmd.split(' ').next().unwrap_or("")));
+                if let Some(pid) = pid
                     && ui
-                        .small_button("View")
-                        .on_hover_text(format!("open {} in a new viewer window", out.display()))
+                        .small_button("Stop")
+                        .on_hover_text("stop the job (keeps what it wrote)")
                         .clicked()
                 {
-                    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gen3d"));
-                    if let Err(e) = std::process::Command::new(exe).arg("view").arg(&out).spawn() {
-                        self.notice = Some(format!("could not open a viewer: {e}"));
-                    }
+                    self.job.lock().unwrap().stopped = true;
+                    let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
                 }
+            } else if stopped {
+                status_dot(ui, ui.visuals().warn_fg_color);
+                ui.label(format!(
+                    "{} stopped after {:.1} s",
+                    cmd.split(' ').next().unwrap_or(""),
+                    took.as_secs_f32()
+                ));
+            } else if ok == Some(true) {
+                status_dot(ui, OK_GREEN);
+                ui.label(format!(
+                    "{} finished in {:.1} s",
+                    cmd.split(' ').next().unwrap_or(""),
+                    took.as_secs_f32()
+                ));
             } else {
                 status_dot(ui, ui.visuals().error_fg_color);
                 ui.colored_label(ui.visuals().error_fg_color, format!("{cmd} failed"));
             }
+            // a .vti the job wrote (an optimization rewrites it every iteration: watch it live)
+            if (running || stopped || ok == Some(true))
+                && let Some(out) = written_path(&log).filter(|p| is_vti(p))
+                && ui
+                    .small_button("View")
+                    .on_hover_text(format!("open {} in a new viewer window", out.display()))
+                    .clicked()
+            {
+                let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gen3d"));
+                if let Err(e) = std::process::Command::new(exe).arg("view").arg(&out).spawn() {
+                    self.notice = Some(format!("could not open a viewer: {e}"));
+                }
+            }
         });
+        ui.weak(&cmd);
         if !log.is_empty() {
             egui::ScrollArea::vertical()
                 .max_height(160.0)
@@ -2240,6 +2394,7 @@ pub fn view(path: &Path, defines: Vec<(String, f64)>, vopts: VolumeOpts) -> Resu
         volume: None,
         iso_drag: None,
         vti_voxel: None,
+        opt: OptUi::default(),
         loaded: false,
         loaded_at: String::new(),
         mtimes: HashMap::new(),

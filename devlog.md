@@ -3,6 +3,66 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: Topology optimization MVP (`gen3d optimize`)
+
+**What:** minimum-compliance topology optimization with SIMP, in Rust inside gen3d (`src/topopt.rs`).
+The problem is a shape file: `map` is the design domain, with `field_fixed`, `field_load` and the
+optional `field_keep` / `field_void`. The result is a `.vti` (cell `density`, cell `energy`, point
+`displacement`), rewritten atomically after every iteration so `gen3d view` shows the design forming.
+The viewer has a Topology optimization section (volume fraction, load, voxel, filter radius,
+iterations), and jobs now have **Stop** and a **View** button that works while they run.
+
+**Why in gen3d (not a Python script):** the problem already lives in the shape file and the GPU samples
+it. The live viewer and `.vti` → STL export were already in place, so `optimize` closes the loop from
+problem to printable part in one binary.
+
+**Design (shortcuts are deliberate for an MVP):**
+- **Discretization:** one trilinear 8-node hex per voxel. The element stiffness matrix is computed by
+  2×2×2 Gauss for a unit cube with E = 1 (`hex_ke`); a voxel of size h with modulus E has `E·h·ke`.
+  Real units (mm, N, MPa), PLA-like defaults.
+- **Sampling:** domain, keep and void at element centres; fixed and load at nodes. All on the GPU with
+  the existing `sample_field`. Nodes outside the domain are dropped entirely, not given ρ_min, which
+  keeps the system smaller and better conditioned.
+- **Loads:** `field_load` vectors scaled so their magnitudes sum to `--force`.
+- **Solver:** matrix-free K·u gathered per node (each node sums rows of its ≤8 elements), parallel with
+  rayon. Jacobi-preconditioned CG, tolerance 1e-4, warm-started from the previous displacement.
+  E_min = 1e-6·E0, a compromise for Jacobi conditioning.
+- **Filter and update:** density filter (weights rmin - dist over domain elements, kept-solid elements
+  pinned to 1, sensitivities by the chain rule). OC update with move 0.2 and a bisection on the
+  multiplier for the volume of the design elements.
+- **Stopping:** max change < 0.01, or compliance improving < 0.1% for 3 iterations. The max change
+  hovers at the move limit (a few oscillating elements) long after compliance has settled, so the second
+  rule is what usually triggers.
+- **Also changed:**
+  - The automatic colour range is now the 1st–99th percentile over inside samples; with min..max,
+    energy hotspots at the bolts made everything one colour.
+  - `vti::write_grid`: a general, atomic (tmp + rename) writer for point and cell data, with cell arrays
+    first so the viewer opens on `density`.
+
+**Verified:**
+- 12 tests:
+  - `hex_ke` symmetric with zero rigid-body translations.
+  - A 1×1×4 column in tension with ν = 0 matches F·L/(E·A) to 1e-9, which validates the element and
+    the solver together.
+  - `write_grid` round trip.
+- bracket_domain at 1.3 mm: 62×19×31 grid, 34k domain elements, 200 clamped and 399 loaded nodes.
+  - Compliance falls from 96 to 10.4 N·mm (max displacement at 100 N: 1.17 → 0.124 mm).
+  - Stops at iteration 29 in 52 s, about 1.8 s per iteration with roughly 1000 CG iterations each.
+  - The design is a sensible cantilever truss: a tension chord to the pin boss, a compression strut, a
+    web, and the plate.
+- Thresholded at 0.5 and exported: watertight, one body, 27.6 cm³ against about 28.6 expected.
+- The GUI's argument string was run from the CLI.
+
+**Not verified:** clicking Optimize / Stop / View in the window. The screenshot meant for that caught
+the user's active browser window instead of the viewer (they were using the desktop), so it was deleted;
+UI checks now use headless renders unless the user is away.
+
+**Next:**
+- Heaviside projection with β continuation, for crisp 0/1 designs.
+- A multigrid-preconditioned CG, for finer grids.
+- Symmetry planes, several load cases, and an overhang constraint for printability.
+- Use the optimized density inside a `.wgsl` shape (smooth it, add exact holes).
+
 ## 2026-11-12: .vti features in the egui sidebar
 
 **What:** the sidebar now covers the `.vti` workflow in both directions.

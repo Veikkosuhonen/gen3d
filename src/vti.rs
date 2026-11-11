@@ -130,6 +130,83 @@ pub fn save(grid: &Grid, arrays: &[Array], out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One array for `write_grid`: `comps` floats per point (or per cell), x-fastest.
+pub struct GridArray<'a> {
+    pub name: &'a str,
+    pub cell: bool,
+    pub comps: usize,
+    pub data: &'a [f32],
+}
+
+/// Write a regular grid with point and cell arrays. `points` is the number of grid points per axis
+/// (cells = points - 1), `origin` the first point. Cell arrays are written first, so a viewer that
+/// defaults to the first array shows them. The file is written to a temporary name and renamed into
+/// place, so a viewer reloading it never sees a half-written file. Returns the file size.
+pub fn write_grid(
+    path: &Path,
+    origin: [f64; 3],
+    spacing: f64,
+    points: [usize; 3],
+    arrays: &[GridArray],
+) -> Result<u64> {
+    let [px, py, pz] = points;
+    let extent = format!("0 {} 0 {} 0 {}", px - 1, py - 1, pz - 1);
+    let mut xml = [String::new(), String::new()]; // cell, point
+    let mut offset = 0usize;
+    let mut order = vec![];
+    for cell in [true, false] {
+        for a in arrays.iter().filter(|a| a.cell == cell) {
+            let n = if cell {
+                (px - 1) * (py - 1) * (pz - 1)
+            } else {
+                px * py * pz
+            };
+            anyhow::ensure!(a.data.len() == n * a.comps, "{}: wrong length", a.name);
+            let _ = writeln!(
+                xml[!cell as usize],
+                r#"        <DataArray type="Float32" Name="{}" NumberOfComponents="{}" format="appended" offset="{offset}"/>"#,
+                a.name, a.comps
+            );
+            offset += 8 + a.data.len() * 4;
+            order.push(a);
+        }
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("vti.part");
+    {
+        let file = File::create(&tmp).with_context(|| format!("cannot write {}", tmp.display()))?;
+        let mut w = BufWriter::with_capacity(1 << 20, file);
+        write!(
+            w,
+            r#"<?xml version="1.0"?>
+<VTKFile type="ImageData" version="1.0" byte_order="LittleEndian" header_type="UInt64">
+  <ImageData WholeExtent="{extent}" Origin="{} {} {}" Spacing="{spacing} {spacing} {spacing}" Direction="1 0 0 0 1 0 0 0 1">
+    <Piece Extent="{extent}">
+      <CellData>
+{}      </CellData>
+      <PointData>
+{}      </PointData>
+    </Piece>
+  </ImageData>
+  <AppendedData encoding="raw">
+   _"#,
+            origin[0], origin[1], origin[2], xml[0], xml[1]
+        )?;
+        for a in order {
+            w.write_all(&(a.data.len() as u64 * 4).to_le_bytes())?;
+            for v in a.data {
+                w.write_all(&v.to_le_bytes())?;
+            }
+        }
+        w.write_all(b"\n  </AppendedData>\n</VTKFile>\n")?;
+        w.flush()?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
+}
+
 // ------------------------------------------------------------------------------------------ reader
 
 /// A VTK ImageData file: a regular grid plus named arrays. Arrays are converted to f32 and stored
@@ -529,6 +606,35 @@ mod tests {
         assert!(f.arrays[1].cell);
         assert_eq!(f.arrays[1].data, [7.5]);
         assert_eq!(f.lattice(true).0, [1.25, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn write_grid_round_trips() {
+        let dir = std::env::temp_dir().join(format!("gen3d-wg-{}", std::process::id()));
+        let p = dir.join("g.vti");
+        let cells: Vec<f32> = (0..2).map(|i| i as f32 + 0.5).collect();
+        let pts: Vec<f32> = (0..12 * 3).map(|i| i as f32).collect();
+        let arrays = [
+            GridArray {
+                name: "u",
+                cell: false,
+                comps: 3,
+                data: &pts,
+            },
+            GridArray {
+                name: "rho",
+                cell: true,
+                comps: 1,
+                data: &cells,
+            },
+        ];
+        write_grid(&p, [1.0, 2.0, 3.0], 0.5, [3, 2, 2], &arrays).unwrap();
+        let f = read(&p).unwrap();
+        assert_eq!(f.arrays[0].name, "rho"); // cell data first
+        assert_eq!(f.arrays[0].data, cells);
+        assert_eq!(f.arrays[1].data, pts);
+        assert_eq!(f.lattice(true).0, [1.25, 2.25, 3.25]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

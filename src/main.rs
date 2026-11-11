@@ -6,6 +6,7 @@ mod mesh;
 mod mesher;
 mod shape;
 mod slicer;
+mod topopt;
 mod viewer;
 mod volume;
 mod vti;
@@ -189,6 +190,38 @@ enum Cmd {
         /// hide the `field_*` region overlays
         #[arg(long)]
         no_fields: bool,
+    },
+    /// topology optimization (SIMP, minimum compliance) of the shape's design domain; see README
+    Optimize {
+        #[command(flatten)]
+        s: ShapeArgs,
+        /// element size in mm (default: about 40k elements in the bounds)
+        #[arg(long)]
+        voxel: Option<f32>,
+        /// fraction of the design domain to fill
+        #[arg(long, default_value_t = 0.3)]
+        volfrac: f64,
+        /// maximum iterations
+        #[arg(long, default_value_t = 50)]
+        iters: usize,
+        /// density filter radius in voxels (larger = thicker, simpler members)
+        #[arg(long, default_value_t = 1.5)]
+        rmin: f64,
+        /// SIMP penalty
+        #[arg(long, default_value_t = 3.0)]
+        penal: f64,
+        /// total load in N, spread over the field_load region
+        #[arg(long, default_value_t = 100.0)]
+        force: f64,
+        /// Young's modulus in MPa (PLA ~3500)
+        #[arg(long, default_value_t = 3500.0)]
+        modulus: f64,
+        /// Poisson's ratio
+        #[arg(long, default_value_t = 0.35)]
+        nu: f64,
+        /// output .vti (default out/NAME_topopt.vti), rewritten every iteration
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
     /// compile a shape and report errors
     Check {
@@ -385,6 +418,53 @@ fn run(cli: Cli) -> Result<()> {
             };
             viewer::render_png(&s.shape, &defines, &s.volume_opts(), &out, &view)?;
             println!("wrote {}", out.display());
+            Ok(())
+        }
+        Cmd::Optimize {
+            s,
+            voxel,
+            volfrac,
+            iters,
+            rmin,
+            penal,
+            force,
+            modulus,
+            nu,
+            output,
+        } => {
+            if viewer::is_vti(&s.shape) {
+                bail!("optimize takes a .wgsl problem (design domain + field_fixed/field_load), not a .vti");
+            }
+            if !(0.0..1.0).contains(&volfrac) || volfrac == 0.0 {
+                bail!("--volfrac must be between 0 and 1");
+            }
+            let defines = parse_defines(&s.define)?;
+            let shape = load_shape(&s.shape, &defines)?;
+            let settings = topopt::Settings {
+                voxel: voxel.unwrap_or_else(|| topopt::auto_voxel(&shape, 40_000.0)) as f64,
+                volfrac,
+                penal,
+                rmin,
+                iters,
+                tol: 0.01,
+                e0: modulus,
+                nu,
+                force,
+            };
+            let gpu = gpu::headless()?;
+            let problem = topopt::setup(&shape, &settings, &gpu)?;
+            let out = output.unwrap_or_else(|| {
+                let p = default_out(&shape.path, ".vti", &defines);
+                p.with_file_name(format!(
+                    "{}_topopt.vti",
+                    p.file_stem().unwrap_or_default().to_string_lossy()
+                ))
+            });
+            topopt::optimize(&problem, &settings, &out)?;
+            println!(
+                "view it: gen3d view {} (threshold the density, then Export mesh)",
+                out.display()
+            );
             Ok(())
         }
         Cmd::Check { s } if viewer::is_vti(&s.shape) => {

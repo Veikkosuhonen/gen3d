@@ -264,8 +264,15 @@ impl Volume {
                 })
                 .collect()
         };
-        let inside: Vec<f32> = (0..n).filter(|&i| self.blk[i] < 0.0).map(|i| self.col[i]).collect();
-        self.crange = finite_range(if inside.is_empty() { &self.col } else { &inside });
+        let mut vals: Vec<f32> = (0..n)
+            .filter(|&i| self.blk[i] < 0.0)
+            .map(|i| self.col[i])
+            .filter(|v| v.is_finite())
+            .collect();
+        if vals.is_empty() {
+            vals = self.col.iter().copied().filter(|v| v.is_finite()).collect();
+        }
+        self.crange = percentile_range(&mut vals, 0.01);
     }
 
     /// Colour range in use: the fixed one if set, else the automatic one.
@@ -273,7 +280,7 @@ impl Volume {
         self.color_range.unwrap_or(self.crange)
     }
 
-    /// Automatic colour range (min..max of the colour array over the inside samples).
+    /// Automatic colour range (1st..99th percentile of the colour array over the inside samples).
     pub fn auto_crange(&self) -> (f32, f32) {
         self.crange
     }
@@ -378,6 +385,21 @@ impl Volume {
         }
         Ok(mesh)
     }
+}
+
+/// The `q` and `1 - q` quantiles: a colour range that a few extreme values (stress or energy
+/// hotspots) don't flatten. Falls back to min..max when that range would be empty.
+fn percentile_range(v: &mut [f32], q: f64) -> (f32, f32) {
+    if v.is_empty() {
+        return (0.0, 0.0);
+    }
+    let n = v.len();
+    let lo_i = ((n - 1) as f64 * q).round() as usize;
+    let hi_i = ((n - 1) as f64 * (1.0 - q)).round() as usize;
+    let cmp = |a: &f32, b: &f32| a.total_cmp(b);
+    let lo = *v.select_nth_unstable_by(lo_i, cmp).1;
+    let hi = *v.select_nth_unstable_by(hi_i, cmp).1;
+    if hi > lo { (lo, hi) } else { finite_range(v) }
 }
 
 fn trilinear(v: &[f32], d: [usize; 3], q: [f64; 3]) -> f32 {
