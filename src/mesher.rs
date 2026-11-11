@@ -10,20 +10,35 @@ use crate::gpu::Gpu;
 use crate::mesh::Mesh;
 use crate::shape::Shape;
 
-pub const COMPUTE_HARNESS: &str = r#"
+/// Compute entry point `g3d_sample` that evaluates `func(p)` (returning f32, or vec3f when
+/// `comps == 3`) over a slab of the grid and writes `comps` floats per sample.
+pub fn compute_harness(func: &str, comps: usize) -> String {
+    let store = match comps {
+        1 => "g3d_out[i] = v;".to_string(),
+        _ => (0..comps)
+            .map(|k| format!("g3d_out[i * {comps}u + {k}u] = v[{k}];"))
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    format!(
+        r#"
 // ---- gen3d sampling harness ----
-struct G3dSample { origin: vec4f, dims: vec4u }   // origin.w = voxel size, dims.w = slab x offset
+struct G3dSample {{ origin: vec4f, dims: vec4u }}   // origin.w = voxel size, dims.w = slab x offset
 @group(0) @binding(0) var<uniform> g3d_s: G3dSample;
 @group(0) @binding(1) var<storage, read_write> g3d_out: array<f32>;
 
 @compute @workgroup_size(4, 4, 4)
-fn g3d_sample(@builtin(global_invocation_id) gid: vec3u) {
+fn g3d_sample(@builtin(global_invocation_id) gid: vec3u) {{
     let d = g3d_s.dims.xyz;
-    if (any(gid >= d)) { return; }
+    if (any(gid >= d)) {{ return; }}
     let p = g3d_s.origin.xyz + vec3f(gid + vec3u(g3d_s.dims.w, 0u, 0u)) * g3d_s.origin.w;
-    g3d_out[(gid.x * d.y + gid.y) * d.z + gid.z] = map(p);
+    let i = (gid.x * d.y + gid.y) * d.z + gid.z;
+    let v = {func}(p);
+    {store}
+}}
+"#
+    )
 }
-"#;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -55,8 +70,46 @@ pub fn sample_grid(shape: &Shape, voxel: Option<f32>, gpu: &Gpu) -> Result<Grid>
     if n > 1_500_000_000 {
         bail!("grid too large; increase voxel size or shrink bounds");
     }
+    let mut grid = Grid {
+        vol: vec![],
+        dims,
+        origin,
+        step,
+    };
+    grid.vol = sample_field(shape, &grid, "map", 1, gpu)?;
+    let vol = &mut grid.vol;
 
-    let compiled = shape.compile(COMPUTE_HARNESS)?;
+    // force the padding shell to be outside so the surface is always closed
+    let s = step as f32;
+    let idx = |x: usize, y: usize, z: usize| (x * ny + y) * nz + z;
+    for x in 0..nx {
+        for y in 0..ny {
+            for z in 0..nz {
+                if x == 0 || y == 0 || z == 0 || x == nx - 1 || y == ny - 1 || z == nz - 1 {
+                    vol[idx(x, y, z)] = s;
+                }
+            }
+        }
+    }
+    let mut bad = false;
+    for v in vol.iter_mut() {
+        if !v.is_finite() {
+            bad = true;
+            *v = if *v == f32::NEG_INFINITY { -s } else { s };
+        }
+    }
+    if bad {
+        eprintln!("warning: SDF produced NaN/Inf values; treating them as outside");
+    }
+    Ok(grid)
+}
+
+/// Evaluate the shape's function `func` (f32 or vec3f, `comps` floats) at every point of `grid`'s
+/// lattice (`grid.vol` is ignored). Returns `comps` floats per point, in the same order as `Grid::vol`.
+pub fn sample_field(shape: &Shape, grid: &Grid, func: &str, comps: usize, gpu: &Gpu) -> Result<Vec<f32>> {
+    let [nx, ny, nz] = grid.dims;
+    let (origin, step) = (grid.origin, grid.step);
+    let compiled = shape.compile(&compute_harness(func, comps))?;
     let module = gpu.shader(&compiled, "sample")?;
     let constants = compiled.constants();
     let pipeline = gpu.scoped(|| {
@@ -78,7 +131,7 @@ pub fn sample_grid(shape: &Shape, voxel: Option<f32>, gpu: &Gpu) -> Result<Grid>
         .max_storage_buffer_binding_size
         .min(limits.max_buffer_size)
         .min(256 << 20);
-    let layer_bytes = (ny * nz * 4) as u64;
+    let layer_bytes = (ny * nz * comps * 4) as u64;
     if layer_bytes > max_bytes {
         bail!("a single grid layer ({ny}x{nz}) exceeds the GPU buffer limit; increase voxel size");
     }
@@ -117,7 +170,8 @@ pub fn sample_grid(shape: &Shape, voxel: Option<f32>, gpu: &Gpu) -> Result<Grid>
         ],
     });
 
-    let mut vol = vec![0f32; n];
+    let layer = ny * nz * comps;
+    let mut vol = vec![0f32; nx * layer];
     for x0 in (0..nx).step_by(slab) {
         let sx = slab.min(nx - x0);
         let u = SampleUniforms {
@@ -134,37 +188,9 @@ pub fn sample_grid(shape: &Shape, voxel: Option<f32>, gpu: &Gpu) -> Result<Grid>
         }
         gpu.queue.submit([enc.finish()]);
         let bytes = gpu.read_buffer(&out, sx as u64 * layer_bytes)?;
-        vol[x0 * ny * nz..(x0 + sx) * ny * nz].copy_from_slice(bytemuck::cast_slice(&bytes));
+        vol[x0 * layer..(x0 + sx) * layer].copy_from_slice(bytemuck::cast_slice(&bytes));
     }
-
-    // force the padding shell to be outside so the surface is always closed
-    let s = step as f32;
-    let idx = |x: usize, y: usize, z: usize| (x * ny + y) * nz + z;
-    for x in 0..nx {
-        for y in 0..ny {
-            for z in 0..nz {
-                if x == 0 || y == 0 || z == 0 || x == nx - 1 || y == ny - 1 || z == nz - 1 {
-                    vol[idx(x, y, z)] = s;
-                }
-            }
-        }
-    }
-    let mut bad = false;
-    for v in &mut vol {
-        if !v.is_finite() {
-            bad = true;
-            *v = if *v == f32::NEG_INFINITY { -s } else { s };
-        }
-    }
-    if bad {
-        eprintln!("warning: SDF produced NaN/Inf values; treating them as outside");
-    }
-    Ok(Grid {
-        vol,
-        dims,
-        origin,
-        step,
-    })
+    Ok(vol)
 }
 
 pub fn polygonize(mut grid: Grid) -> Result<Mesh> {

@@ -107,7 +107,7 @@ Keys are matched by physical position (US layout), so `[` `]` work without AltGr
 
 ```
 gen3d view   SHAPE [-D NAME=VAL]...
-gen3d export SHAPE [-o out.stl] [--format stl|3mf|obj|ply] [--voxel MM] [--bounds X0 Y0 Z0 X1 Y1 Z1] [--decimate F]
+gen3d export SHAPE [-o out.stl] [--format stl|3mf|obj|ply|vti] [--voxel MM] [--bounds X0 Y0 Z0 X1 Y1 Z1] [--decimate F]
 gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh opts] [-- extra slicer args]
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG]
@@ -120,6 +120,48 @@ Outputs go to `out/`; `-D` values are appended to the filename (`out/knob_DIAM-3
 Shaders are compiled without wgpu's loop-bounding and integer-division guards, which slow raymarching a lot
 on Vulkan; an infinite loop in a shape can therefore stall the GPU until the driver resets it.
 `GEN3D_SHADER_CHECKS=1` turns the guards back on.
+
+## SDF grid export (VTI) for simulation
+
+`gen3d export SHAPE --format vti` (or `-o field.vti`) skips meshing and writes the sampled SDF itself as VTK
+ImageData: a Float32 point array `sdf` (mm, negative inside) plus any extra fields (see below), on a regular grid starting exactly at the
+`bounds` minimum, with spacing `voxel`. Grid points sit at `min + i * voxel`, so a 0..22 mm range at 0.5 mm
+gives 45 points. Use it as the design domain or initial density for topology optimization, for voxel FEA,
+for lattice-Boltzmann/immersed-boundary CFD, and so on. It opens in ParaView and loads in Python with:
+
+```python
+import pyvista as pv
+m = pv.read("out/knob.vti")
+sdf = m["sdf"].reshape(m.dimensions[::-1])   # array indexed [z, y, x]
+solid = sdf < 0                               # or a smooth density: 0.5 - 0.5*np.tanh(sdf / eps)
+```
+
+### Extra fields: boundary conditions and regions
+
+Every function `fn field_<name>(p: vec3f) -> f32` or `-> vec3f` in the shape is sampled on the same grid
+and written as an extra array `<name>` (1 or 3 components). This lets a single `.wgsl` file describe a
+whole simulation or topology-optimization problem: `map` is the design domain, and the fields mark
+supports, loads, and non-design regions. gen3d doesn't interpret the fields; the meaning is up to your
+solver. [`shapes/bracket_domain.wgsl`](shapes/bracket_domain.wgsl) uses these conventions:
+
+| field | type | meaning |
+|---|---|---|
+| `fixed` | f32 | `< 0` where nodes are clamped (the bolt hole walls) |
+| `load` | vec3f | force direction × weight where load is applied, zero elsewhere; the solver scales it to the total force |
+| `keep` | f32 | `< 0` where material is forced solid (mounting plate, pin boss) |
+
+```python
+fixed = m["fixed"] < 0                        # per-point masks
+load = m["load"]                              # (N, 3) array, same point order as m.points
+load *= 1000.0 / np.abs(load[:, 2]).sum()     # e.g. 1 kN total downwards
+```
+
+Write region functions as SDFs (shells via `max(d - t, -d)`, booleans, `-D` parameters), the same way as
+`map`. Keep a region at least a voxel thick, or it may fall between grid points. `gen3d check` lists the
+fields it finds.
+
+The SDF is exact only if the shape's `map` is (smooth booleans, twist and noise give approximate distances;
+the sign is always right).
 
 ## Mesh quality notes
 

@@ -7,6 +7,7 @@ mod mesher;
 mod shape;
 mod slicer;
 mod viewer;
+mod vti;
 
 use std::path::{Path, PathBuf};
 
@@ -56,6 +57,8 @@ enum Format {
     ThreeMf,
     Obj,
     Ply,
+    /// sampled SDF grid as VTK ImageData (no meshing), for simulation
+    Vti,
 }
 
 impl Format {
@@ -65,6 +68,7 @@ impl Format {
             Format::ThreeMf => ".3mf",
             Format::Obj => ".obj",
             Format::Ply => ".ply",
+            Format::Vti => ".vti",
         }
     }
 }
@@ -90,7 +94,7 @@ enum Cmd {
         #[command(flatten)]
         s: ShapeArgs,
     },
-    /// mesh the SDF and write STL/3MF/OBJ/PLY
+    /// mesh the SDF and write STL/3MF/OBJ/PLY, or the raw SDF grid as VTI
     Export {
         #[command(flatten)]
         s: ShapeArgs,
@@ -189,6 +193,34 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
     if let Some(b) = &m.bounds {
         shape.bounds = ([b[0], b[1], b[2]], [b[3], b[4], b[5]]);
     }
+    let vti = ext.is_none()
+        && (m.format == Format::Vti
+            || output.is_some_and(|o| o.extension().is_some_and(|e| e.eq_ignore_ascii_case("vti"))));
+    if vti {
+        let out = output.map_or_else(|| default_out(&shape.path, ".vti", &defines), Path::to_path_buf);
+        let gpu = gpu::headless()?;
+        let grid = mesher::sample_grid(&shape, m.voxel, &gpu)?;
+        let fields = shape.fields()?;
+        let sampled = fields
+            .iter()
+            .map(|f| mesher::sample_field(&shape, &grid, &f.func, f.comps, &gpu))
+            .collect::<Result<Vec<_>>>()?;
+        let mut arrays = vec![vti::Array {
+            name: "sdf",
+            comps: 1,
+            data: &grid.vol,
+        }];
+        arrays.extend(fields.iter().zip(&sampled).map(|(f, data)| vti::Array {
+            name: &f.name,
+            comps: f.comps,
+            data,
+        }));
+        vti::save(&grid, &arrays, &out)?;
+        return Ok((shape, out));
+    }
+    if ext.is_some() && m.format == Format::Vti {
+        bail!("--format vti only applies to `export`");
+    }
     let decimate = m.decimate.or(shape.decimate());
     let mesh = mesher::build_mesh(&shape, m.voxel, decimate)?;
     mesher::report(&mesh);
@@ -263,13 +295,21 @@ fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Check { s } => {
             let shape = load_shape(&s.shape, &parse_defines(&s.define)?)?;
-            shape.compile(mesher::COMPUTE_HARNESS)?;
+            shape.compile(&mesher::compute_harness("map", 1))?;
             shape.compile(viewer::PREVIEW_HARNESS)?;
+            let fields = shape.fields()?;
+            for f in &fields {
+                shape.compile(&mesher::compute_harness(&f.func, f.comps))?;
+            }
             let name = shape.path.file_name().unwrap_or_default().to_string_lossy();
             println!(
                 "ok: {name} compiles; bounds {:?}, voxel {} mm",
                 shape.bounds, shape.voxel
             );
+            if !fields.is_empty() {
+                let list: Vec<_> = fields.iter().map(|f| format!("{} ({}f)", f.name, f.comps)).collect();
+                println!("fields: {}", list.join(", "));
+            }
             Ok(())
         }
     }

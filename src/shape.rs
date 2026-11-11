@@ -66,11 +66,7 @@ impl Shape {
     /// Errors point at `file:line:col` in the user's files.
     pub fn compile(&self, harness: &str) -> Result<Compiled> {
         let source = format!("{}\n{}", self.source, harness);
-        let module = naga::front::wgsl::parse_str(&source).map_err(|e| {
-            let labels: Vec<_> = e.labels().map(|(span, label)| (span, label.to_string())).collect();
-            let notes: Vec<_> = e.notes().map(str::to_string).collect();
-            anyhow!(self.format_error(&source, e.message(), &labels, &notes))
-        })?;
+        let module = self.parse(&source)?;
         let mut validator =
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all());
         validator.validate(&module).map_err(|e| {
@@ -104,6 +100,49 @@ impl Shape {
             source,
             constants: self.defines.clone(),
         })
+    }
+
+    fn parse(&self, source: &str) -> Result<naga::Module> {
+        naga::front::wgsl::parse_str(source).map_err(|e| {
+            let labels: Vec<_> = e.labels().map(|(span, label)| (span, label.to_string())).collect();
+            let notes: Vec<_> = e.notes().map(str::to_string).collect();
+            anyhow!(self.format_error(source, e.message(), &labels, &notes))
+        })
+    }
+
+    /// The shape's extra fields: every `fn field_<name>(p: vec3f) -> f32` (or `-> vec3f`), in
+    /// declaration order. They are sampled alongside the SDF by `export --format vti`.
+    pub fn fields(&self) -> Result<Vec<Field>> {
+        let module = self.parse(&self.source)?;
+        let mut out = vec![];
+        for (_, f) in module.functions.iter() {
+            let Some(func) = f.name.as_deref() else { continue };
+            let Some(name) = func.strip_prefix("field_") else {
+                continue;
+            };
+            let kind = |ty| match module.types[ty].inner {
+                naga::TypeInner::Scalar(naga::Scalar::F32) => Some(1),
+                naga::TypeInner::Vector {
+                    size: naga::VectorSize::Tri,
+                    scalar: naga::Scalar::F32,
+                } => Some(3),
+                _ => None,
+            };
+            let arg_ok = f.arguments.len() == 1 && kind(f.arguments[0].ty) == Some(3);
+            let comps = f.result.as_ref().and_then(|r| kind(r.ty));
+            let (true, Some(comps)) = (arg_ok, comps) else {
+                bail!("fn {func}: fields must be `fn {func}(p: vec3f) -> f32` or `-> vec3f`");
+            };
+            if name.is_empty() || name == "sdf" {
+                bail!("fn {func}: field name `{name}` is reserved; pick another `field_<name>`");
+            }
+            out.push(Field {
+                name: name.to_string(),
+                func: func.to_string(),
+                comps,
+            });
+        }
+        Ok(out)
     }
 
     fn locate(&self, source: &str, offset: usize) -> (String, usize, usize, String) {
@@ -150,6 +189,15 @@ impl Shape {
         }
         out.trim_end().to_string()
     }
+}
+
+/// A user-defined field function, exported as an extra point-data array named `name`.
+#[derive(Clone, Debug)]
+pub struct Field {
+    pub name: String,
+    pub func: String,
+    /// 1 for `-> f32`, 3 for `-> vec3f`
+    pub comps: usize,
 }
 
 /// A validated module ready for `create_shader_module`, plus the override constants to apply.
@@ -345,10 +393,10 @@ mod tests {
         std::fs::write(&p, "//! bounds -1 -1 0 1 1 2\n#include <sdf.wgsl>\noverride R: f32 = 1.0;\nfn map(p: vec3f) -> f32 { return sdSphere(p, R) + fbm(p) * 0.0; }\n").unwrap();
         let s = load_shape(&p, &[("R".into(), 2.0)]).unwrap();
         assert_eq!(s.bounds, ([-1.0, -1.0, 0.0], [1.0, 1.0, 2.0]));
-        s.compile(crate::mesher::COMPUTE_HARNESS).unwrap();
+        s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
         s.compile(crate::viewer::PREVIEW_HARNESS).unwrap();
         let bad = load_shape(&p, &[("NOPE".into(), 2.0)]).unwrap();
-        assert!(bad.compile(crate::mesher::COMPUTE_HARNESS).is_err());
+        assert!(bad.compile(&crate::mesher::compute_harness("map", 1)).is_err());
 
         std::fs::write(
             &p,
@@ -357,10 +405,32 @@ mod tests {
         .unwrap();
         let err = load_shape(&p, &[])
             .unwrap()
-            .compile(crate::mesher::COMPUTE_HARNESS)
+            .compile(&crate::mesher::compute_harness("map", 1))
             .unwrap_err()
             .to_string();
         assert!(err.contains("t.wgsl:4:"), "{err}");
+
+        std::fs::write(
+            &p,
+            "fn map(p: vec3f) -> f32 { return length(p) - 1.0; }\n\
+             fn field_load(p: vec3f) -> vec3f { return p; }\n\
+             fn field_keep(p: vec3f) -> f32 { return p.x; }\n\
+             fn helper(p: vec3f) -> f32 { return 0.0; }\n",
+        )
+        .unwrap();
+        let s = load_shape(&p, &[]).unwrap();
+        let f = s.fields().unwrap();
+        let got: Vec<_> = f.iter().map(|f| (f.name.as_str(), f.comps)).collect();
+        assert_eq!(got, [("load", 3), ("keep", 1)]);
+        for f in &f {
+            s.compile(&crate::mesher::compute_harness(&f.func, f.comps)).unwrap();
+        }
+        std::fs::write(
+            &p,
+            "fn map(p: vec3f) -> f32 { return 0.0; }\nfn field_x(p: vec3f) -> i32 { return 0; }\n",
+        )
+        .unwrap();
+        assert!(load_shape(&p, &[]).unwrap().fields().is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
