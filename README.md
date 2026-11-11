@@ -8,6 +8,10 @@ shape.wgsl ──► gen3d view    live raymarched preview, reloads on save
            ──► gen3d export  GPU compute-shader sampling → marching cubes → watertight STL/3MF
            ──► gen3d slice   export + PrusaSlicer/OrcaSlicer CLI → .gcode
            ──► gen3d open    export + open in the slicer GUI
+           ──► gen3d export --format vti   SDF + boundary-condition fields as a VTK grid (simulation)
+
+result.vti ──► gen3d view    threshold surface of a grid (e.g. a topology-optimization density), live reload
+           ──► gen3d export  marching cubes → STL/3MF, or slice / open like a shape
 ```
 
 ## Quick start
@@ -107,12 +111,14 @@ Keys are matched by physical position (US layout), so `[` `]` work without AltGr
 ## Command reference
 
 ```
-gen3d view   SHAPE [-D NAME=VAL]...
+gen3d view   SHAPE [-D NAME=VAL]...     (SHAPE is a .wgsl file, or a .vti grid with the options below)
 gen3d export SHAPE [-o out.stl] [--format stl|3mf|obj|ply|vti] [--voxel MM] [--bounds X0 Y0 Z0 X1 Y1 Z1] [--decimate F]
 gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh opts] [-- extra slicer args]
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
-gen3d check  SHAPE
+gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
+
+.vti options (view/render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
 ```
 
@@ -170,6 +176,49 @@ the section view (`C`). `F` cycles the overlays.
 
 The SDF is exact only if the shape's `map` is (smooth booleans, twist and noise give approximate distances;
 the sign is always right).
+
+## Viewing and meshing grids (.vti)
+
+`view`, `render`, `export`, `slice` and `open` also take a `.vti` file (VTK ImageData), such as the density
+your topology optimizer writes back. The viewer draws the region where one array is past a threshold:
+
+```sh
+gen3d check  result.vti                                   # list arrays: point/cell data, ranges
+gen3d view   result.vti --array density --color stress    # live view; reloads when the file changes
+gen3d export result.vti --array density --iso 0.5         # marching cubes -> out/result.stl
+gen3d slice  result.vti --array density                   # straight to G-code
+```
+
+- **Arrays:** point data (values at grid points) and cell data (one value per voxel, as SIMP-style
+  optimizers write) are both supported. Vector arrays are shown by magnitude. Data can be raw, base64 or
+  ascii, optionally zlib-compressed, so files from gen3d, pyvista (`grid.save(...)`), ParaView and VTK
+  load as written. LZ4/LZMA compression, multi-piece files and rotated grids (`Direction`) are not
+  supported; a rotation is ignored with a warning.
+- **Threshold:** by default, an SDF-like array (named `*sdf*`, or with values on both sides of 0) is
+  solid where it is `< 0`. Anything else (densities, masks) is solid above the middle of its value range.
+  `--iso`, `--below` and `--above` override this.
+- **Smooth or blocky:** smooth draws the interpolated threshold surface, the same one `export` meshes.
+  `--blocky` (or `M`) draws every inside sample as a cube; for cell data those are exactly the elements.
+- **Colour:** `--color NAME` (or `F`) colours the surface and the section face by another array, using a
+  viridis colour map. The range is the min to max of that array over the inside samples, and the window
+  title shows it.
+- **Live reload:** when the file changes on disk, the view reloads but keeps the array, threshold and
+  colour you picked. If a write is caught half-finished, the old view stays until the next change.
+- **Below the plate:** as with shapes, anything below z = 0 is hidden by the build plate. Grids centred
+  on the origin show only their upper half, so shift the origin when you write the file.
+
+Keys in the viewer for `.vti` files:
+
+| | |
+|---|---|
+| `-` `=` | lower / raise the threshold (1/50 of the value range per press) |
+| `M` | smooth / blocky |
+| `I` | flip which side of the threshold is inside |
+| `A` | next array |
+| `F` | colour by: off, then each array in turn |
+
+`E` / `G` / `O` export, slice or open with the current array and threshold. On a large grid (8M samples)
+a threshold change takes about a second, because the distance field is recomputed on the CPU.
 
 ## Mesh quality notes
 

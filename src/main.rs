@@ -7,6 +7,7 @@ mod mesher;
 mod shape;
 mod slicer;
 mod viewer;
+mod volume;
 mod vti;
 
 use std::path::{Path, PathBuf};
@@ -48,6 +49,42 @@ struct ShapeArgs {
     /// set a shape parameter (an `override` constant), repeatable, e.g. -D RADIUS=12
     #[arg(short = 'D', long = "define", value_name = "NAME=VALUE")]
     define: Vec<String>,
+    /// .vti: array that forms the solid (default: the first)
+    #[arg(long, help_heading = ".vti files")]
+    array: Option<String>,
+    /// .vti: threshold (default: 0 for SDF-like arrays, else the middle of the value range)
+    #[arg(long, allow_negative_numbers = true, help_heading = ".vti files")]
+    iso: Option<f32>,
+    /// .vti: inside is where the array is below the threshold (default for SDF-like arrays)
+    #[arg(long, conflicts_with = "above", help_heading = ".vti files")]
+    below: bool,
+    /// .vti: inside is where the array is above the threshold (default for densities)
+    #[arg(long, help_heading = ".vti files")]
+    above: bool,
+    /// .vti: draw voxels as cubes instead of a smooth surface (view/render)
+    #[arg(long, help_heading = ".vti files")]
+    blocky: bool,
+    /// .vti: colour the surface by this array (view/render)
+    #[arg(long, help_heading = ".vti files")]
+    color: Option<String>,
+}
+
+impl ShapeArgs {
+    fn volume_opts(&self) -> volume::VolumeOpts {
+        volume::VolumeOpts {
+            array: self.array.clone(),
+            iso: self.iso,
+            below: if self.below {
+                Some(true)
+            } else if self.above {
+                Some(false)
+            } else {
+                None
+            },
+            blocky: self.blocky,
+            color: self.color.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum, PartialEq)]
@@ -191,6 +228,9 @@ fn resolve_configs(configs: &[PathBuf], shape: &Shape) -> Vec<PathBuf> {
 /// Mesh the shape. `ext = None` (the `export` command) means `-o` is the mesh path; otherwise the
 /// mesh goes to out/ and `-o` means something else.
 fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>) -> Result<(Shape, PathBuf)> {
+    if viewer::is_vti(&s.shape) {
+        return export_volume(s, m, output, ext);
+    }
     let defines = parse_defines(&s.define)?;
     let mut shape = load_shape(&s.shape, &defines)?;
     if let Some(b) = &m.bounds {
@@ -236,9 +276,51 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
     Ok((shape, out))
 }
 
+/// Mesh the threshold surface of a .vti array (e.g. a topology-optimization density).
+fn export_volume(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>) -> Result<(Shape, PathBuf)> {
+    if !s.define.is_empty() {
+        bail!("-D parameters don't apply to .vti files");
+    }
+    if m.format == Format::Vti {
+        bail!(
+            "{} is already a .vti file; export it as stl, 3mf, obj or ply",
+            s.shape.display()
+        );
+    }
+    if m.voxel.is_some() || m.bounds.is_some() {
+        bail!("--voxel and --bounds don't apply to .vti files (the grid is fixed)");
+    }
+    if s.blocky {
+        bail!("--blocky export is not supported yet; export meshes the smooth threshold surface");
+    }
+    let t0 = std::time::Instant::now();
+    let vol = volume::Volume::load(&s.shape, &s.volume_opts())?;
+    println!(
+        "{}: {} of {} samples inside",
+        vol.label(),
+        vol.inside_count,
+        vol.count()
+    );
+    let mesh = mesher::decimate_checked(vol.mesh()?, m.decimate);
+    println!(
+        "marching cubes in {:.2}s: {} triangles",
+        t0.elapsed().as_secs_f64(),
+        mesh.tris.len()
+    );
+    mesher::report(&mesh);
+    let shape = vol.shape(&s.shape);
+    let out = match (ext, output) {
+        (None, Some(o)) => o.to_path_buf(),
+        (None, None) => default_out(&s.shape, m.format.ext(), &[]),
+        (Some(ext), _) => default_out(&s.shape, ext, &[]),
+    };
+    mesher::save(&mesh, &out)?;
+    Ok((shape, out))
+}
+
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::View { s } => viewer::view(&s.shape, parse_defines(&s.define)?),
+        Cmd::View { s } => viewer::view(&s.shape, parse_defines(&s.define)?, s.volume_opts()),
         Cmd::Export { s, m, output } => export(&s, &m, output.as_deref(), None).map(|_| ()),
         Cmd::Slice {
             s,
@@ -300,8 +382,22 @@ fn run(cli: Cli) -> Result<()> {
                 pitch,
                 show_fields: !no_fields,
             };
-            viewer::render_png(&s.shape, &defines, &out, &view)?;
+            viewer::render_png(&s.shape, &defines, &s.volume_opts(), &out, &view)?;
             println!("wrote {}", out.display());
+            Ok(())
+        }
+        Cmd::Check { s } if viewer::is_vti(&s.shape) => {
+            let f = vti::read(&s.shape)?;
+            let (o, d) = f.lattice(false);
+            println!(
+                "ok: {} points from ({}, {}, {}) mm, spacing {:?} mm\narrays:\n{}",
+                d.iter().map(|n| n.to_string()).collect::<Vec<_>>().join("x"),
+                o[0],
+                o[1],
+                o[2],
+                f.spacing,
+                f.describe().trim_end()
+            );
             Ok(())
         }
         Cmd::Check { s } => {

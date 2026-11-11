@@ -48,6 +48,17 @@ impl Shape {
             .filter(|&f: &f32| f > 0.0)
     }
 
+    /// A shape from generated WGSL (e.g. a .vti volume), not loaded from a .wgsl file. `path` is
+    /// watched for hot reload.
+    pub fn generated(path: &Path, source: &str, bounds: ([f32; 3], [f32; 3]), voxel: f32) -> Shape {
+        Shape {
+            source: source.to_string(),
+            bounds,
+            voxel,
+            ..Shape::placeholder(path)
+        }
+    }
+
     /// A placeholder used by the viewer when the very first load fails.
     pub fn placeholder(path: &Path) -> Shape {
         Shape {

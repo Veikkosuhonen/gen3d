@@ -16,6 +16,7 @@ use winit::window::{Window, WindowId};
 
 use crate::gpu::Gpu;
 use crate::shape::{Field, Shape, load_shape};
+use crate::volume::{Volume, VolumeOpts};
 
 pub const PREVIEW_HARNESS: &str = r#"
 // ---- gen3d preview harness ----
@@ -346,14 +347,106 @@ struct Pipeline {
     bind: wgpu::BindGroup,
 }
 
+/// What the viewer shows: a .wgsl shape, or a .vti grid turned into a shape by `volume.rs`.
+struct Source {
+    shape: Shape,
+    fields: Vec<Field>,
+    harness: String,
+    volume: Option<Volume>,
+}
+
+pub fn is_vti(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("vti"))
+}
+
+fn load_source(path: &Path, defines: &[(String, f64)], vopts: &VolumeOpts) -> Result<Source> {
+    if is_vti(path) {
+        if !defines.is_empty() {
+            anyhow::bail!("-D parameters don't apply to .vti files");
+        }
+        return Ok(volume_source(path, Volume::load(path, vopts)?));
+    }
+    let shape = load_shape(path, defines)?;
+    let fields = shape.fields()?;
+    Ok(Source {
+        harness: preview_harness(&fields),
+        shape,
+        fields,
+        volume: None,
+    })
+}
+
+fn volume_source(path: &Path, v: Volume) -> Source {
+    println!(
+        "{}: {} samples inside of {} ({})",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        v.inside_count,
+        v.count(),
+        v.label()
+    );
+    Source {
+        shape: v.shape(path),
+        fields: vec![],
+        harness: PREVIEW_HARNESS.to_string(),
+        volume: Some(v),
+    }
+}
+
+/// GPU copies of a volume's fields (bindings 1-4 of the preview pipeline).
+struct VolGpu {
+    uni: wgpu::Buffer,
+    sd: wgpu::Buffer,
+    blk: wgpu::Buffer,
+    col: wgpu::Buffer,
+}
+
+impl VolGpu {
+    fn new(gpu: &Gpu, v: &Volume) -> Result<VolGpu> {
+        let bytes = (v.count() * 4) as u64;
+        let limits = gpu.device.limits();
+        let max = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
+        if bytes > max {
+            anyhow::bail!(
+                "grid too large for the GPU ({} samples; this GPU allows {} per array)",
+                v.count(),
+                max / 4
+            );
+        }
+        let storage = |label, data: &[f32]| {
+            gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(data),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        Ok(VolGpu {
+            uni: gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("volume"),
+                contents: bytemuck::bytes_of(&v.uniforms()),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            }),
+            sd: storage("volume sd", &v.sd),
+            blk: storage("volume blocky", &v.blk),
+            col: storage("volume colour", &v.col),
+        })
+    }
+
+    fn upload(&self, gpu: &Gpu, v: &Volume) {
+        gpu.queue.write_buffer(&self.uni, 0, bytemuck::bytes_of(&v.uniforms()));
+        gpu.queue.write_buffer(&self.sd, 0, bytemuck::cast_slice(&v.sd));
+        gpu.queue.write_buffer(&self.blk, 0, bytemuck::cast_slice(&v.blk));
+        gpu.queue.write_buffer(&self.col, 0, bytemuck::cast_slice(&v.col));
+    }
+}
+
 fn build_pipeline(
     gpu: &Gpu,
-    shape: &Shape,
-    fields: &[Field],
+    src: &Source,
     format: wgpu::TextureFormat,
     ubuf: &wgpu::Buffer,
+    vol: Option<&VolGpu>,
 ) -> Result<Pipeline> {
-    let compiled = shape.compile(&preview_harness(fields))?;
+    let compiled = src.shape.compile(&src.harness)?;
     let module = gpu.shader(&compiled, "preview")?;
     let constants = compiled.constants();
     let options = || wgpu::PipelineCompilationOptions {
@@ -383,14 +476,25 @@ fn build_pipeline(
             cache: None,
         })
     })?;
-    let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &pipeline.get_bind_group_layout(0),
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: ubuf.as_entire_binding(),
-        }],
-    });
+    let mut buffers = vec![ubuf];
+    if let Some(v) = vol {
+        buffers.extend([&v.uni, &v.sd, &v.blk, &v.col]);
+    }
+    let entries: Vec<_> = buffers
+        .iter()
+        .enumerate()
+        .map(|(i, b)| wgpu::BindGroupEntry {
+            binding: i as u32,
+            resource: b.as_entire_binding(),
+        })
+        .collect();
+    let bind = gpu.scoped(|| {
+        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &entries,
+        })
+    })?;
     Ok(Pipeline { pipeline, bind })
 }
 
@@ -429,7 +533,13 @@ pub struct RenderView {
 }
 
 /// Render the preview offscreen (same shader as the viewer) to a PNG.
-pub fn render_png(path: &Path, defines: &[(String, f64)], out: &Path, view: &RenderView) -> Result<()> {
+pub fn render_png(
+    path: &Path,
+    defines: &[(String, f64)],
+    vopts: &VolumeOpts,
+    out: &Path,
+    view: &RenderView,
+) -> Result<()> {
     let &RenderView {
         size,
         section,
@@ -437,14 +547,14 @@ pub fn render_png(path: &Path, defines: &[(String, f64)], out: &Path, view: &Ren
         pitch,
         show_fields,
     } = view;
-    let shape = load_shape(path, defines)?;
-    let fields = shape.fields()?;
+    let src = load_source(path, defines, vopts)?;
+    let (shape, fields) = (&src.shape, &src.fields);
     if show_fields {
-        print_legend(&fields);
+        print_legend(fields);
     }
     let gpu = crate::gpu::headless()?;
     let format = wgpu::TextureFormat::Rgba8Unorm;
-    let mut cam = Camera::framing(&shape);
+    let mut cam = Camera::framing(shape);
     cam.yaw = yaw.to_radians();
     cam.pitch = pitch.to_radians();
     let opts = Options {
@@ -452,16 +562,17 @@ pub fn render_png(path: &Path, defines: &[(String, f64)], out: &Path, view: &Ren
         section,
         cut: cam.target[1],
         show_bounds: true,
-        fields: if show_fields { all_fields(&fields) } else { 0 },
+        fields: if show_fields { all_fields(fields) } else { 0 },
         time: 0.0,
     };
     let (w, h) = size;
     let ubuf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("view"),
-        contents: bytemuck::bytes_of(&uniforms(&shape, &cam, &opts, size, true)),
+        contents: bytemuck::bytes_of(&uniforms(shape, &cam, &opts, size, true)),
         usage: wgpu::BufferUsages::UNIFORM,
     });
-    let pipeline = build_pipeline(&gpu, &shape, &fields, format, &ubuf)?;
+    let vol = src.volume.as_ref().map(|v| VolGpu::new(&gpu, v)).transpose()?;
+    let pipeline = build_pipeline(&gpu, &src, format, &ubuf, vol.as_ref())?;
     let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("render"),
         size: wgpu::Extent3d {
@@ -548,11 +659,12 @@ fn print_legend(fields: &[Field]) {
 
 // ------------------------------------------------------------------------------------------ viewer
 
-const HELP: &str = "gen3d viewer — edit the .wgsl file in any editor; it reloads on save.
+const HELP: &str = "gen3d viewer — edit the .wgsl file in any editor; it reloads on save (.vti files too).
   mouse: left-drag orbit · right/middle-drag pan · wheel zoom
   1/2/3/4 front/side/top/iso   R reset camera   F5 force reload
   C section view   [ ] move section plane   B toggle clip-to-bounds   V toggle bounds box
   F cycle field overlays (all, each field alone, off)
+  .vti: - = threshold   M smooth/blocky   I flip inside   A next array   F colour by array
   E export mesh    G slice to G-code        O open in slicer GUI      Q/Esc quit";
 
 struct Window_ {
@@ -563,11 +675,15 @@ struct Window_ {
     gpu: Gpu,
     ubuf: wgpu::Buffer,
     pipeline: Option<Pipeline>,
+    vol: Option<VolGpu>,
 }
 
 struct Viewer {
     path: PathBuf,
     defines: Vec<(String, f64)>,
+    /// .vti display options from the command line
+    vopts: VolumeOpts,
+    volume: Option<Volume>,
     shape: Shape,
     fields: Vec<Field>,
     /// overlay mode: 0 = all fields, 1..=n = only field n-1, n+1 = none
@@ -596,29 +712,65 @@ fn stamp() -> String {
 }
 
 impl Viewer {
+    /// Options that reproduce the current volume view, so a reloaded .vti keeps them.
+    fn current_vopts(&self) -> VolumeOpts {
+        match &self.volume {
+            Some(v) => VolumeOpts {
+                array: Some(v.array_name().to_string()),
+                iso: Some(v.iso),
+                below: Some(v.below),
+                blocky: v.blocky,
+                color: v.color_name().map(str::to_string),
+            },
+            None => self.vopts.clone(),
+        }
+    }
+
     fn reload(&mut self, first: bool) {
-        let shape = match load_shape(&self.path, &self.defines) {
+        // a .vti being rewritten (e.g. by an optimizer) may be caught half-written: keep the old
+        // view and retry on the next change
+        let src = load_source(&self.path, &self.defines, &self.current_vopts()).or_else(|e| {
+            if self.volume.is_some() {
+                load_source(&self.path, &[], &self.vopts)
+            } else {
+                Err(e)
+            }
+        });
+        let src = match src {
             Ok(s) => s,
             Err(e) => {
                 self.mtimes = HashMap::from([(self.path.clone(), mtime(&self.path))]);
-                return self.fail(&e.to_string());
+                return self.fail(&format!("{e:#}"));
             }
         };
-        self.mtimes = shape
+        self.mtimes = src
+            .shape
             .files
             .iter()
             .filter(|f| f.exists())
             .map(|f| (f.clone(), mtime(f)))
             .collect();
-        let fields = match shape.fields() {
-            Ok(f) => f,
-            Err(e) => return self.fail(&e.to_string()),
-        };
+        self.install(src, first);
+    }
+
+    /// Build the GPU pipeline for `src` and switch to it.
+    fn install(&mut self, src: Source, first: bool) {
         let Some(win) = &mut self.win else { return };
-        match build_pipeline(&win.gpu, &shape, &fields, win.config.format, &win.ubuf) {
-            Ok(p) => win.pipeline = Some(p),
+        let vol = match src.volume.as_ref().map(|v| VolGpu::new(&win.gpu, v)).transpose() {
+            Ok(v) => v,
+            Err(e) => return self.fail(&format!("{e:#}")),
+        };
+        match build_pipeline(&win.gpu, &src, win.config.format, &win.ubuf, vol.as_ref()) {
+            Ok(p) => {
+                win.pipeline = Some(p);
+                win.vol = vol;
+            }
             Err(e) => return self.fail(&e.to_string()),
         }
+        let Source {
+            shape, fields, volume, ..
+        } = src;
+        self.volume = volume;
         let bounds_changed = !self.loaded || self.shape.bounds != shape.bounds;
         self.shape = shape;
         let names = |f: &[Field]| f.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
@@ -642,7 +794,12 @@ impl Viewer {
 
     fn fail(&mut self, msg: &str) {
         self.error = true;
-        println!("\n[{}] \x1b[31mshader error\x1b[0m\n{}\n", stamp(), msg.trim());
+        let what = if self.volume.is_some() || is_vti(&self.path) {
+            "error"
+        } else {
+            "shader error"
+        };
+        println!("\n[{}] \x1b[31m{what}\x1b[0m\n{}\n", stamp(), msg.trim());
     }
 
     fn set_field_mask(&mut self) {
@@ -664,6 +821,22 @@ impl Viewer {
         }
     }
 
+    /// Apply a change to the volume view: `rebuild` when the array (and so the grid size) changed.
+    fn edit_volume(&mut self, rebuild: bool, f: impl FnOnce(&mut Volume)) {
+        let Some(mut v) = self.volume.take() else { return };
+        f(&mut v);
+        if rebuild {
+            let src = volume_source(&self.path, v);
+            return self.install(src, false);
+        }
+        if let Some(win) = &self.win
+            && let Some(g) = &win.vol
+        {
+            g.upload(&win.gpu, &v);
+        }
+        self.volume = Some(v);
+    }
+
     fn reset_camera(&mut self) {
         self.cam = Camera::framing(&self.shape);
         self.opts.cut = self.cam.target[1];
@@ -677,6 +850,10 @@ impl Viewer {
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gen3d"));
         let mut c = std::process::Command::new(exe);
         c.arg(cmd).arg(&self.path);
+        if let Some(v) = &self.volume {
+            c.args(["--array", v.array_name(), "--iso", &v.iso.to_string()]);
+            c.arg(if v.below { "--below" } else { "--above" });
+        }
         for (k, v) in &self.defines {
             c.arg("-D").arg(format!("{k}={v}"));
         }
@@ -700,6 +877,29 @@ impl Viewer {
             KeyCode::BracketRight => self.opts.cut += step,
             KeyCode::KeyB => self.opts.clip = !self.opts.clip,
             KeyCode::KeyV => self.opts.show_bounds = !self.opts.show_bounds,
+            KeyCode::Minus | KeyCode::Equal if self.volume.is_some() => {
+                let dir = if key == KeyCode::Minus { -1.0 } else { 1.0 };
+                self.edit_volume(false, |v| v.nudge_iso(dir));
+            }
+            KeyCode::KeyM if self.volume.is_some() => self.edit_volume(false, |v| v.blocky = !v.blocky),
+            KeyCode::KeyI if self.volume.is_some() => self.edit_volume(false, |v| {
+                v.below = !v.below;
+                v.recompute();
+            }),
+            KeyCode::KeyA if self.volume.is_some() => self.edit_volume(true, |v| {
+                let next = (v.array + 1) % v.file.arrays.len();
+                v.select(next);
+                v.recompute();
+            }),
+            KeyCode::KeyF if self.volume.is_some() => self.edit_volume(false, |v| {
+                let n = v.file.arrays.len();
+                v.color = match v.color {
+                    None => Some(0),
+                    Some(c) if c + 1 < n => Some(c + 1),
+                    Some(_) => None,
+                };
+                v.update_color();
+            }),
             KeyCode::KeyF if !self.fields.is_empty() => {
                 self.field_mode = (self.field_mode + 1) % (self.fields.len() + 2);
                 self.set_field_mask();
@@ -809,6 +1009,9 @@ impl Viewer {
         if let Some(l) = self.field_label() {
             flags.push(l);
         }
+        if let Some(v) = &self.volume {
+            flags.push(v.label());
+        }
         if self.busy.load(Ordering::SeqCst) {
             flags.push("working…".into());
         }
@@ -865,6 +1068,7 @@ impl ApplicationHandler for Viewer {
                 gpu,
                 ubuf,
                 pipeline: None,
+                vol: None,
             })
         })();
         match result {
@@ -936,7 +1140,7 @@ impl ApplicationHandler for Viewer {
     }
 }
 
-pub fn view(path: &Path, defines: Vec<(String, f64)>) -> Result<()> {
+pub fn view(path: &Path, defines: Vec<(String, f64)>, vopts: VolumeOpts) -> Result<()> {
     let path = path
         .canonicalize()
         .with_context(|| format!("cannot open {}", path.display()))?;
@@ -948,6 +1152,8 @@ pub fn view(path: &Path, defines: Vec<(String, f64)>) -> Result<()> {
         start: Instant::now(),
         path,
         defines,
+        vopts,
+        volume: None,
         loaded: false,
         mtimes: HashMap::new(),
         error: false,

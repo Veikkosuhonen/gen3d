@@ -223,7 +223,7 @@ pub fn build_mesh(shape: &Shape, voxel: Option<f32>, decimate: Option<f32>) -> R
     let gpu = crate::gpu::headless()?;
     let grid = sample_grid(shape, voxel, &gpu)?;
     let t1 = Instant::now();
-    let mut mesh = polygonize(grid)?;
+    let mesh = polygonize(grid)?;
     let t2 = Instant::now();
     println!(
         "sampled in {:.2}s, marching cubes in {:.2}s: {} triangles",
@@ -231,6 +231,11 @@ pub fn build_mesh(shape: &Shape, voxel: Option<f32>, decimate: Option<f32>) -> R
         (t2 - t1).as_secs_f64(),
         fmt_count(mesh.tris.len())
     );
+    Ok(decimate_checked(mesh, decimate))
+}
+
+/// Decimate to fraction `decimate` of the triangles, unless that breaks watertightness.
+pub fn decimate_checked(mut mesh: Mesh, decimate: Option<f32>) -> Mesh {
     if let Some(f) = decimate.filter(|f| *f > 0.0 && *f < 1.0) {
         let (dec, defects) = mesh.decimated(f);
         if defects.is_empty() && dec.is_watertight() {
@@ -245,7 +250,7 @@ pub fn build_mesh(shape: &Shape, voxel: Option<f32>, decimate: Option<f32>) -> R
             );
         }
     }
-    Ok(mesh)
+    mesh
 }
 
 pub fn report(mesh: &Mesh) {
