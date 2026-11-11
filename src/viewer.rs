@@ -15,7 +15,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::gpu::Gpu;
-use crate::shape::{Shape, load_shape};
+use crate::shape::{Field, Shape, load_shape};
 
 pub const PREVIEW_HARNESS: &str = r#"
 // ---- gen3d preview harness ----
@@ -28,6 +28,8 @@ struct G3dView {
     bmin: vec4f,
     bmax: vec4f,
     flags: vec4u,     // clip to bounds, section, show bounds, apply gamma
+    fmask: vec4u,     // x: bitmask of field overlays to show
+    misc: vec4f,      // x: time in seconds, y: inward offset for field lookups (half a voxel)
 }
 @group(0) @binding(0) var<uniform> g3d_v: G3dView;
 
@@ -157,6 +159,10 @@ fn g3d_fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
             let di = map(p);
             base *= 0.75 + 0.25 * smoothstep(-0.1, 0.1, sin(di * 6.2831));
         }
+        // look fields up just inside the surface, where the exported grid samples them; regions
+        // written as shells around a hole (max(d - t, -d)) have the hole wall on their boundary
+        let ft = g3d_field_tint(p - n * g3d_v.misc.y, frag.xy, scale);
+        base = mix(base, ft.rgb, ft.a);
         let dif = clamp(dot(n, light), 0.0, 1.0);
         let sh = g3d_softShadow(p + n * eps * 4.0, light, scale * 2.0);
         let occ = g3d_ao(p, n, scale * 0.01);
@@ -202,6 +208,62 @@ fn g3d_fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
 }
 "#;
 
+/// Overlay colours for `field_*` regions (linear RGB), cycled by declaration order. Chosen to stand
+/// apart from the orange surface and red section face.
+const FIELD_COLORS: &[[f32; 3]] = &[
+    [0.10, 0.30, 0.95],
+    [0.15, 0.75, 0.20],
+    [0.75, 0.15, 0.80],
+    [0.05, 0.70, 0.75],
+    [0.90, 0.85, 0.10],
+    [0.95, 0.95, 0.95],
+];
+
+fn field_color(i: usize) -> [f32; 3] {
+    FIELD_COLORS[i % FIELD_COLORS.len()]
+}
+
+/// The preview harness plus `g3d_field_tint`, which colours surface points inside the shape's
+/// `field_*` regions: scalar fields where they are < 0, vector fields where they are non-zero (with
+/// bands moving along the vector). Overlapping regions alternate in diagonal screen-space stripes.
+pub fn preview_harness(fields: &[Field]) -> String {
+    let mut f = String::from("\nfn g3d_field_tint(p: vec3f, fc: vec2f, scale: f32) -> vec4f {\n");
+    if !fields.is_empty() {
+        f += &format!(
+            "    let mask = g3d_v.fmask.x;\n    var cols: array<vec3f, {}>;\n    var n = 0u;\n",
+            fields.len()
+        );
+    }
+    for (i, field) in fields.iter().enumerate() {
+        let [r, g, b] = field_color(i);
+        let col = format!("vec3f({r:?}, {g:?}, {b:?})");
+        let func = &field.func;
+        if field.comps == 1 {
+            f += &format!(
+                "    if ((mask & {bit}u) != 0u && {func}(p) < 0.0) {{ cols[n] = {col}; n++; }}\n",
+                bit = 1u32 << i
+            );
+        } else {
+            f += &format!(
+                "    if ((mask & {bit}u) != 0u) {{\n        let v = {func}(p);\n        \
+                 if (dot(v, v) > 0.0) {{\n            \
+                 let band = fract(dot(p, normalize(v)) / (scale * 0.03) - g3d_v.misc.x * 1.5);\n            \
+                 cols[n] = {col} * mix(0.45, 1.0, smoothstep(0.0, 0.15, band) * (1.0 - smoothstep(0.5, 0.65, band)));\n            \
+                 n++;\n        }}\n    }}\n",
+                bit = 1u32 << i
+            );
+        }
+    }
+    if fields.is_empty() {
+        f += "    return vec4f(0.0);\n}\n";
+    } else {
+        f += "    if (n == 0u) { return vec4f(0.0); }\n    \
+              let k = u32(floor((fc.x + fc.y) / 12.0)) % n;\n    \
+              return vec4f(cols[k], 0.85);\n}\n";
+    }
+    format!("{PREVIEW_HARNESS}{f}")
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ViewUniforms {
@@ -213,6 +275,8 @@ struct ViewUniforms {
     bmin: [f32; 4],
     bmax: [f32; 4],
     flags: [u32; 4],
+    fmask: [u32; 4],
+    misc: [f32; 4],
 }
 
 #[derive(Clone, Copy)]
@@ -251,6 +315,9 @@ struct Options {
     section: bool,
     cut: f32,
     show_bounds: bool,
+    /// bitmask of field overlays to draw
+    fields: u32,
+    time: f32,
 }
 
 fn uniforms(shape: &Shape, cam: &Camera, o: &Options, size: (u32, u32), gamma: bool) -> ViewUniforms {
@@ -265,6 +332,8 @@ fn uniforms(shape: &Shape, cam: &Camera, o: &Options, size: (u32, u32), gamma: b
         bmin: [lo[0], lo[1], lo[2], 0.0],
         bmax: [hi[0], hi[1], hi[2], 0.0],
         flags: [o.clip as u32, o.section as u32, o.show_bounds as u32, gamma as u32],
+        fmask: [o.fields, 0, 0, 0],
+        misc: [o.time, 0.5 * shape.voxel, 0.0, 0.0],
     }
 }
 
@@ -273,8 +342,14 @@ struct Pipeline {
     bind: wgpu::BindGroup,
 }
 
-fn build_pipeline(gpu: &Gpu, shape: &Shape, format: wgpu::TextureFormat, ubuf: &wgpu::Buffer) -> Result<Pipeline> {
-    let compiled = shape.compile(PREVIEW_HARNESS)?;
+fn build_pipeline(
+    gpu: &Gpu,
+    shape: &Shape,
+    fields: &[Field],
+    format: wgpu::TextureFormat,
+    ubuf: &wgpu::Buffer,
+) -> Result<Pipeline> {
+    let compiled = shape.compile(&preview_harness(fields))?;
     let module = gpu.shader(&compiled, "preview")?;
     let constants = compiled.constants();
     let options = || wgpu::PipelineCompilationOptions {
@@ -340,17 +415,29 @@ fn draw(gpu: &Gpu, p: &Pipeline, view: &wgpu::TextureView, clear: Option<wgpu::C
     enc.finish()
 }
 
+/// Camera and display settings for `render_png`.
+pub struct RenderView {
+    pub size: (u32, u32),
+    pub section: bool,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub show_fields: bool,
+}
+
 /// Render the preview offscreen (same shader as the viewer) to a PNG.
-pub fn render_png(
-    path: &Path,
-    defines: &[(String, f64)],
-    out: &Path,
-    size: (u32, u32),
-    section: bool,
-    yaw: f32,
-    pitch: f32,
-) -> Result<()> {
+pub fn render_png(path: &Path, defines: &[(String, f64)], out: &Path, view: &RenderView) -> Result<()> {
+    let &RenderView {
+        size,
+        section,
+        yaw,
+        pitch,
+        show_fields,
+    } = view;
     let shape = load_shape(path, defines)?;
+    let fields = shape.fields()?;
+    if show_fields {
+        print_legend(&fields);
+    }
     let gpu = crate::gpu::headless()?;
     let format = wgpu::TextureFormat::Rgba8Unorm;
     let mut cam = Camera::framing(&shape);
@@ -361,6 +448,8 @@ pub fn render_png(
         section,
         cut: cam.target[1],
         show_bounds: true,
+        fields: if show_fields { all_fields(&fields) } else { 0 },
+        time: 0.0,
     };
     let (w, h) = size;
     let ubuf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -368,7 +457,7 @@ pub fn render_png(
         contents: bytemuck::bytes_of(&uniforms(&shape, &cam, &opts, size, true)),
         usage: wgpu::BufferUsages::UNIFORM,
     });
-    let pipeline = build_pipeline(&gpu, &shape, format, &ubuf)?;
+    let pipeline = build_pipeline(&gpu, &shape, &fields, format, &ubuf)?;
     let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("render"),
         size: wgpu::Extent3d {
@@ -428,12 +517,38 @@ pub fn render_png(
     Ok(())
 }
 
+fn all_fields(fields: &[Field]) -> u32 {
+    (0..fields.len().min(32)).fold(0, |m, i| m | 1 << i)
+}
+
+/// Print each field's overlay colour as a terminal swatch.
+fn print_legend(fields: &[Field]) {
+    if fields.is_empty() {
+        return;
+    }
+    let items: Vec<_> = fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let [r, g, b] = field_color(i).map(|c| (c.powf(1.0 / 2.2) * 255.0) as u8);
+            let kind = if f.comps == 1 {
+                "< 0"
+            } else {
+                "≠ 0, bands move along it"
+            };
+            format!("\x1b[38;2;{r};{g};{b}m■\x1b[0m {} ({kind})", f.name)
+        })
+        .collect();
+    println!("fields: {}", items.join("   "));
+}
+
 // ------------------------------------------------------------------------------------------ viewer
 
 const HELP: &str = "gen3d viewer — edit the .wgsl file in any editor; it reloads on save.
   mouse: left-drag orbit · right/middle-drag pan · wheel zoom
   1/2/3/4 front/side/top/iso   R reset camera   F5 force reload
   C section view   [ ] move section plane   B toggle clip-to-bounds   V toggle bounds box
+  F cycle field overlays (all, each field alone, off)
   E export mesh    G slice to G-code        O open in slicer GUI      Q/Esc quit";
 
 struct Window_ {
@@ -450,6 +565,10 @@ struct Viewer {
     path: PathBuf,
     defines: Vec<(String, f64)>,
     shape: Shape,
+    fields: Vec<Field>,
+    /// overlay mode: 0 = all fields, 1..=n = only field n-1, n+1 = none
+    field_mode: usize,
+    start: Instant,
     loaded: bool,
     mtimes: HashMap<PathBuf, Option<SystemTime>>,
     error: bool,
@@ -487,13 +606,24 @@ impl Viewer {
             .filter(|f| f.exists())
             .map(|f| (f.clone(), mtime(f)))
             .collect();
+        let fields = match shape.fields() {
+            Ok(f) => f,
+            Err(e) => return self.fail(&e.to_string()),
+        };
         let Some(win) = &mut self.win else { return };
-        match build_pipeline(&win.gpu, &shape, win.config.format, &win.ubuf) {
+        match build_pipeline(&win.gpu, &shape, &fields, win.config.format, &win.ubuf) {
             Ok(p) => win.pipeline = Some(p),
             Err(e) => return self.fail(&e.to_string()),
         }
         let bounds_changed = !self.loaded || self.shape.bounds != shape.bounds;
         self.shape = shape;
+        let names = |f: &[Field]| f.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        if names(&fields) != names(&self.fields) {
+            self.field_mode = 0;
+            print_legend(&fields);
+        }
+        self.fields = fields;
+        self.set_field_mask();
         self.loaded = true;
         self.error = false;
         if first || bounds_changed {
@@ -509,6 +639,25 @@ impl Viewer {
     fn fail(&mut self, msg: &str) {
         self.error = true;
         println!("\n[{}] \x1b[31mshader error\x1b[0m\n{}\n", stamp(), msg.trim());
+    }
+
+    fn set_field_mask(&mut self) {
+        let n = self.fields.len();
+        self.opts.fields = match self.field_mode {
+            0 => all_fields(&self.fields),
+            m if m <= n.min(32) => 1 << (m - 1),
+            _ => 0,
+        };
+    }
+
+    fn field_label(&self) -> Option<String> {
+        let n = self.fields.len();
+        match self.field_mode {
+            _ if n == 0 => None,
+            0 => Some("fields: all".into()),
+            m if m <= n => Some(format!("field: {}", self.fields[m - 1].name)),
+            _ => Some("fields: off".into()),
+        }
     }
 
     fn reset_camera(&mut self) {
@@ -547,6 +696,10 @@ impl Viewer {
             KeyCode::BracketRight => self.opts.cut += step,
             KeyCode::KeyB => self.opts.clip = !self.opts.clip,
             KeyCode::KeyV => self.opts.show_bounds = !self.opts.show_bounds,
+            KeyCode::KeyF if !self.fields.is_empty() => {
+                self.field_mode = (self.field_mode + 1) % (self.fields.len() + 2);
+                self.set_field_mask();
+            }
             KeyCode::F5 => self.reload(false),
             KeyCode::KeyE => self.run_bg("export"),
             KeyCode::KeyG => self.run_bg("slice"),
@@ -594,6 +747,7 @@ impl Viewer {
             _ => return,
         };
         let size = (win.config.width, win.config.height);
+        self.opts.time = self.start.elapsed().as_secs_f32();
         let u = uniforms(&self.shape, &self.cam, &self.opts, size, win.gamma);
         win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
         let view = frame.texture.create_view(&Default::default());
@@ -647,6 +801,9 @@ impl Viewer {
         }
         if !self.opts.clip {
             flags.push("unclipped".into());
+        }
+        if let Some(l) = self.field_label() {
+            flags.push(l);
         }
         if self.busy.load(Ordering::SeqCst) {
             flags.push("working…".into());
@@ -782,6 +939,9 @@ pub fn view(path: &Path, defines: Vec<(String, f64)>) -> Result<()> {
     let event_loop = EventLoop::new()?;
     let mut app = Viewer {
         shape: Shape::placeholder(&path),
+        fields: vec![],
+        field_mode: 0,
+        start: Instant::now(),
         path,
         defines,
         loaded: false,
@@ -798,6 +958,8 @@ pub fn view(path: &Path, defines: Vec<(String, f64)>) -> Result<()> {
             section: false,
             cut: 0.0,
             show_bounds: true,
+            fields: 0,
+            time: 0.0,
         },
         drag: None,
         cursor: (0.0, 0.0),

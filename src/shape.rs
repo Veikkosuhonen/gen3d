@@ -394,7 +394,7 @@ mod tests {
         let s = load_shape(&p, &[("R".into(), 2.0)]).unwrap();
         assert_eq!(s.bounds, ([-1.0, -1.0, 0.0], [1.0, 1.0, 2.0]));
         s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
-        s.compile(crate::viewer::PREVIEW_HARNESS).unwrap();
+        s.compile(&crate::viewer::preview_harness(&[])).unwrap();
         let bad = load_shape(&p, &[("NOPE".into(), 2.0)]).unwrap();
         assert!(bad.compile(&crate::mesher::compute_harness("map", 1)).is_err());
 
@@ -425,6 +425,7 @@ mod tests {
         for f in &f {
             s.compile(&crate::mesher::compute_harness(&f.func, f.comps)).unwrap();
         }
+        s.compile(&crate::viewer::preview_harness(&f)).unwrap();
         std::fs::write(
             &p,
             "fn map(p: vec3f) -> f32 { return 0.0; }\nfn field_x(p: vec3f) -> i32 { return 0; }\n",

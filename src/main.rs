@@ -148,6 +148,9 @@ enum Cmd {
         yaw: f32,
         #[arg(long, default_value_t = 28.0, allow_negative_numbers = true)]
         pitch: f32,
+        /// hide the `field_*` region overlays
+        #[arg(long)]
+        no_fields: bool,
     },
     /// compile a shape and report errors
     Check {
@@ -286,18 +289,26 @@ fn run(cli: Cli) -> Result<()> {
             section,
             yaw,
             pitch,
+            no_fields,
         } => {
             let defines = parse_defines(&s.define)?;
             let out = output.unwrap_or_else(|| default_out(&s.shape, ".png", &defines));
-            viewer::render_png(&s.shape, &defines, &out, (size[0], size[1]), section, yaw, pitch)?;
+            let view = viewer::RenderView {
+                size: (size[0], size[1]),
+                section,
+                yaw,
+                pitch,
+                show_fields: !no_fields,
+            };
+            viewer::render_png(&s.shape, &defines, &out, &view)?;
             println!("wrote {}", out.display());
             Ok(())
         }
         Cmd::Check { s } => {
             let shape = load_shape(&s.shape, &parse_defines(&s.define)?)?;
             shape.compile(&mesher::compute_harness("map", 1))?;
-            shape.compile(viewer::PREVIEW_HARNESS)?;
             let fields = shape.fields()?;
+            shape.compile(&viewer::preview_harness(&fields))?;
             for f in &fields {
                 shape.compile(&mesher::compute_harness(&f.func, f.comps))?;
             }

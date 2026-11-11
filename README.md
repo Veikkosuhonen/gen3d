@@ -98,6 +98,7 @@ Distance functions are mostly from [Inigo Quilez](https://iquilezles.org/article
 | `1` `2` `3` `4` | front / side / top / iso view |
 | `C`, `[` `]` | toggle cross-section, move the cut plane (the section face shows internal distance bands) |
 | `B` / `V` | toggle clipping to export bounds / bounds box |
+| `F` | cycle `field_*` overlays: all, each field alone, off (see [Extra fields](#extra-fields-boundary-conditions-and-regions)) |
 | `E` / `G` / `O` | export mesh / slice to G-code / open in slicer GUI (runs in the background) |
 | `R`, `F5`, `Q` | reset camera, force reload, quit |
 
@@ -110,7 +111,7 @@ gen3d view   SHAPE [-D NAME=VAL]...
 gen3d export SHAPE [-o out.stl] [--format stl|3mf|obj|ply|vti] [--voxel MM] [--bounds X0 Y0 Z0 X1 Y1 Z1] [--decimate F]
 gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh opts] [-- extra slicer args]
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
-gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG]
+gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
 gen3d check  SHAPE
 gen3d new    NAME
 ```
@@ -159,6 +160,13 @@ load *= 1000.0 / np.abs(load[:, 2]).sum()     # e.g. 1 kN total downwards
 Write region functions as SDFs (shells via `max(d - t, -d)`, booleans, `-D` parameters), the same way as
 `map`. Keep a region at least a voxel thick, or it may fall between grid points. `gen3d check` lists the
 fields it finds.
+
+`view` and `render` draw each field's region as a coloured overlay on the surface and on the section face,
+and print a colour legend. Scalar fields are shown where they are `< 0`, and vector fields where they are
+non-zero, with bands that move in the vector's direction. Overlapping regions alternate in diagonal
+stripes. The lookup happens half a voxel inside the surface (where the exported grid samples the field),
+so a shell written around a hole shows on the hole wall. Regions buried inside the part only appear in
+the section view (`C`). `F` cycles the overlays.
 
 The SDF is exact only if the shape's `map` is (smooth booleans, twist and noise give approximate distances;
 the sign is always right).
