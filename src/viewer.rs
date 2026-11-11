@@ -161,7 +161,7 @@ fn g3d_fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
         }
         // look fields up just inside the surface, where the exported grid samples them; regions
         // written as shells around a hole (max(d - t, -d)) have the hole wall on their boundary
-        let ft = g3d_field_tint(p - n * g3d_v.misc.y, frag.xy, scale);
+        let ft = g3d_field_tint(p - n * g3d_v.misc.y, p, scale);
         base = mix(base, ft.rgb, ft.a);
         let dif = clamp(dot(n, light), 0.0, 1.0);
         let sh = g3d_softShadow(p + n * eps * 4.0, light, scale * 2.0);
@@ -192,7 +192,9 @@ fn g3d_fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
         let bh = g3d_boxHit(ro, rd, bmin, bmax);
         if (bh.x < bh.y && bh.y > 0.0) {
             let w = scale * 0.002;
-            let tFar = select(1e9, t, hit);
+            // shapes often fill their bounds exactly; a tolerance keeps box edges that lie on the
+            // surface consistently visible instead of flickering against it
+            let tFar = select(1e9, t + w * 2.0 * max(1.0, t / scale), hit);
             for (var k = 0; k < 2; k++) {
                 let tb2 = select(bh.y, bh.x, k == 0);
                 if (tb2 > 0.0 && tb2 < tFar) {
@@ -225,9 +227,10 @@ fn field_color(i: usize) -> [f32; 3] {
 
 /// The preview harness plus `g3d_field_tint`, which colours surface points inside the shape's
 /// `field_*` regions: scalar fields where they are < 0, vector fields where they are non-zero (with
-/// bands moving along the vector). Overlapping regions alternate in diagonal screen-space stripes.
+/// bands moving along the vector). Overlapping regions alternate in diagonal stripes fixed to the surface (in world space, so
+/// they don't swim when the camera moves).
 pub fn preview_harness(fields: &[Field]) -> String {
-    let mut f = String::from("\nfn g3d_field_tint(p: vec3f, fc: vec2f, scale: f32) -> vec4f {\n");
+    let mut f = String::from("\nfn g3d_field_tint(p: vec3f, ps: vec3f, scale: f32) -> vec4f {\n");
     if !fields.is_empty() {
         f += &format!(
             "    let mask = g3d_v.fmask.x;\n    var cols: array<vec3f, {}>;\n    var n = 0u;\n",
@@ -258,7 +261,8 @@ pub fn preview_harness(fields: &[Field]) -> String {
         f += "    return vec4f(0.0);\n}\n";
     } else {
         f += "    if (n == 0u) { return vec4f(0.0); }\n    \
-              let k = u32(floor((fc.x + fc.y) / 12.0)) % n;\n    \
+              let j = i32(floor(dot(ps, vec3f(1.0)) / (scale * 0.015)));\n    \
+              let k = u32(((j % i32(n)) + i32(n)) % i32(n));\n    \
               return vec4f(cols[k], 0.85);\n}\n";
     }
     format!("{PREVIEW_HARNESS}{f}")
