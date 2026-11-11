@@ -110,8 +110,15 @@ wgpu device as the raymarcher):
 - **View:** camera presets, section view and cut plane, clip to bounds, bounds box, and a resolution
   slider that raymarches fewer pixels for heavy shapes.
 - **Field overlays:** pick which `field_*` regions to tint, with their colours.
-- **Volume** (for `.vti` files): array, threshold, inside below/above, smooth/blocky, colour by.
-- **Output:** export, slice and open in the slicer, with the job's progress and log.
+- **Volume** (for `.vti` files): array, a histogram of its values with the threshold on it (click or drag
+  it to move the threshold), inside below/above, smooth/blocky, the inside volume (cm³, % of the grid,
+  grams of PLA), and colour by another array with a colour bar and an optional fixed range.
+- **Grid** (for `.vti` files): grid size, spacing and origin, and every array with point/cell data and
+  value range.
+- **Output:** export, slice and open in the slicer, with the job's progress and log. For shapes, **Export
+  VTI** writes the simulation grid (SDF + `field_*` arrays) at its own voxel size. The default keeps it
+  around a million samples; the size and file size are shown before you export. When it's done,
+  **View** opens the `.vti` in a second viewer window.
 - **Errors** appear in a panel under the view (also printed to the terminal); the last version that
   compiled stays on screen until you fix the file.
 
@@ -238,7 +245,8 @@ Keys in the viewer for `.vti` files:
 | `A` | next array |
 | `F` | colour by: off, then each array in turn |
 
-`E` / `G` / `O` export, slice or open with the current array and threshold. On a large grid (8M samples)
+The sidebar has the same controls, plus a histogram for picking the threshold and the material volume
+(see [Viewer](#viewer)). `E` / `G` / `O` export, slice or open with the current array and threshold. On a large grid (8M samples)
 a threshold change takes about a second, because the distance field is recomputed on the CPU.
 
 ## Mesh quality notes

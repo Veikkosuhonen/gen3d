@@ -433,6 +433,11 @@ impl VolGpu {
         })
     }
 
+    /// Upload only the uniforms (mode and colour range): cheap, for edits that keep the fields.
+    fn upload_uniforms(&self, gpu: &Gpu, v: &Volume) {
+        gpu.queue.write_buffer(&self.uni, 0, bytemuck::bytes_of(&v.uniforms()));
+    }
+
     fn upload(&self, gpu: &Gpu, v: &Volume) {
         gpu.queue.write_buffer(&self.uni, 0, bytemuck::bytes_of(&v.uniforms()));
         gpu.queue.write_buffer(&self.sd, 0, bytemuck::cast_slice(&v.sd));
@@ -768,6 +773,8 @@ struct Viewer {
     volume: Option<Volume>,
     /// Threshold being dragged in the Volume panel; applied on release (recomputing is CPU work).
     iso_drag: Option<f32>,
+    /// Grid voxel for "Export VTI" (None = `default_vti_voxel`).
+    vti_voxel: Option<f32>,
     shape: Shape,
     fields: Vec<Field>,
     params: Vec<Param>,
@@ -838,6 +845,120 @@ fn fmt_num(v: f64) -> String {
 }
 
 const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(90, 190, 100);
+/// The preview's surface orange, for "inside" in the Volume panel's histogram.
+const SURFACE_ORANGE: egui::Color32 = egui::Color32::from_rgb(242, 165, 80);
+
+/// Viridis colour map (same polynomial as the shader), as sRGB.
+fn viridis(t: f32) -> egui::Color32 {
+    const C: [[f32; 3]; 7] = [
+        [0.277_727_3, 0.005_407_345, 0.334_099_8],
+        [0.105_093_04, 1.404_613_5, 1.384_590_2],
+        [-0.330_861_83, 0.214_847_56, 0.095_095_16],
+        [-4.634_230_5, -5.799_101, -19.332_441],
+        [6.228_27, 14.179_933, 56.690_55],
+        [4.776_385, -13.745_145, -65.353_035],
+        [-5.435_456, 4.645_852_6, 26.312_435],
+    ];
+    let t = t.clamp(0.0, 1.0);
+    let ch = |k: usize| {
+        let v = C.iter().rev().fold(0.0, |acc, c| acc * t + c[k]);
+        (v.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    egui::Color32::from_rgb(ch(0), ch(1), ch(2))
+}
+
+/// Histogram of a volume's array (log-scaled counts) with the threshold marked; bars on the inside
+/// side are drawn in the surface colour. Returns the response and a function from x to value.
+fn histogram(ui: &mut egui::Ui, hist: &[u32], range: (f32, f32), iso: f32, below: bool) -> (egui::Response, f32) {
+    let (lo, hi) = range;
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 64.0), egui::Sense::click_and_drag());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+    let span = (hi - lo).max(f32::MIN_POSITIVE);
+    let x_of = |v: f32| rect.left() + ((v - lo) / span).clamp(0.0, 1.0) * rect.width();
+    let max = hist.iter().copied().max().unwrap_or(0) as f32;
+    let n = hist.len().max(1) as f32;
+    let bw = rect.width() / n;
+    let weak = ui.visuals().weak_text_color().gamma_multiply(0.6);
+    for (i, &c) in hist.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let h = (1.0 + c as f32).ln() / (1.0 + max).ln() * (rect.height() - 6.0);
+        let centre = lo + (i as f32 + 0.5) / n * span;
+        let inside = if below { centre < iso } else { centre > iso };
+        let x0 = rect.left() + i as f32 * bw;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x0 + 0.5, rect.bottom() - 2.0 - h),
+            egui::pos2((x0 + bw - 0.5).max(x0 + 1.0), rect.bottom() - 2.0),
+        );
+        p.rect_filled(bar, 0.0, if inside { SURFACE_ORANGE } else { weak });
+    }
+    let xi = x_of(iso);
+    p.line_segment(
+        [egui::pos2(xi, rect.top()), egui::pos2(xi, rect.bottom())],
+        egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+    );
+    let value_at = |x: f32| lo + ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) * span;
+    let hover = resp.hover_pos().map(|p| value_at(p.x));
+    let resp = resp.on_hover_text(match hover {
+        Some(v) => format!("{}  ·  click or drag to set the threshold", fmt_num(v as f64)),
+        None => "click or drag to set the threshold".into(),
+    });
+    let picked = resp.interact_pointer_pos().map_or(f32::NAN, |p| value_at(p.x));
+    ui.horizontal(|ui| {
+        ui.weak(fmt_num(lo as f64));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak(fmt_num(hi as f64));
+        });
+    });
+    (resp, picked)
+}
+
+/// A horizontal viridis bar with the range's ends written under it.
+fn colour_bar(ui: &mut egui::Ui, range: (f32, f32)) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 12.0), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    let n = 48;
+    for i in 0..n {
+        let x0 = rect.left() + rect.width() * i as f32 / n as f32;
+        let x1 = rect.left() + rect.width() * (i + 1) as f32 / n as f32;
+        let r = egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1 + 0.5, rect.bottom()));
+        p.rect_filled(r, 0.0, viridis((i as f32 + 0.5) / n as f32));
+    }
+    ui.horizontal(|ui| {
+        ui.weak(fmt_num(range.0 as f64));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak(fmt_num(range.1 as f64));
+        });
+    });
+}
+
+/// Default grid voxel for `export --format vti`: the shape's voxel, coarsened so the grid has at
+/// most about a million samples (simulation grids are usually much coarser than print meshes).
+fn default_vti_voxel(shape: &Shape) -> f32 {
+    let vol: f32 = shape.size().iter().map(|s| s.max(1e-3)).product();
+    let v = shape.voxel.max((vol / 1e6).cbrt());
+    // round up to 2 significant digits
+    let mag = 10f32.powf(v.log10().floor() - 1.0);
+    (v / mag).ceil() * mag
+}
+
+/// Points of the grid `export --format vti` writes for `shape` at `voxel`.
+fn vti_dims(shape: &Shape, voxel: f32) -> [usize; 3] {
+    shape.size().map(|s| (s / voxel).ceil().max(0.0) as usize + 1)
+}
+
+/// The last `wrote PATH (...)` line of a job's log.
+fn written_path(log: &str) -> Option<PathBuf> {
+    log.lines().rev().find_map(|l| {
+        let rest = l.trim().strip_prefix("wrote ")?;
+        let end = rest.rfind(" (").unwrap_or(rest.len());
+        Some(PathBuf::from(&rest[..end]))
+    })
+}
 
 fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
     let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
@@ -869,6 +990,7 @@ impl Viewer {
                 below: Some(v.below),
                 blocky: v.blocky,
                 color: v.color_name().map(str::to_string),
+                color_range: v.color_range,
             },
             None => self.vopts.clone(),
         }
@@ -1001,6 +1123,17 @@ impl Viewer {
         self.volume = Some(v);
     }
 
+    /// Apply a change that only touches the volume's uniforms (smooth/blocky, colour range).
+    fn edit_volume_uniforms(&mut self, f: impl FnOnce(&mut Volume)) {
+        let Some(v) = &mut self.volume else { return };
+        f(v);
+        if let Some(win) = &self.win
+            && let Some(g) = &win.vol
+        {
+            g.upload_uniforms(&win.gpu, v);
+        }
+    }
+
     /// Rebuild the pipeline with the current parameter values. The driver's shader compile takes
     /// ~100 ms, so it runs on a worker thread; changes made meanwhile are coalesced into one more
     /// build, so dragging a slider keeps the UI smooth and the preview follows as fast as it can.
@@ -1093,13 +1226,23 @@ impl Viewer {
     }
 
     fn run_bg(&self, cmd: &str) {
+        self.run_bg_with(cmd, &[]);
+    }
+
+    /// Run `gen3d <cmd> <file> [extra...]` in the background, with the current parameters (or
+    /// volume settings), capturing its output for the Output panel.
+    fn run_bg_with(&self, cmd: &str, extra: &[String]) {
         {
             let mut job = self.job.lock().unwrap();
             if job.running {
                 return;
             }
             *job = Job {
-                cmd: cmd.to_string(),
+                cmd: [cmd.to_string()]
+                    .into_iter()
+                    .chain(extra.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 running: true,
                 started: Some(Instant::now()),
                 ..Default::default()
@@ -1107,7 +1250,7 @@ impl Viewer {
         }
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gen3d"));
         let mut c = std::process::Command::new(exe);
-        c.arg(cmd).arg(&self.path);
+        c.arg(cmd).arg(&self.path).args(extra);
         if let Some(v) = &self.volume {
             c.args(["--array", v.array_name(), "--iso", &v.iso.to_string()]);
             c.arg(if v.below { "--below" } else { "--above" });
@@ -1175,7 +1318,7 @@ impl Viewer {
                 let dir = if key == KeyCode::Minus { -1.0 } else { 1.0 };
                 self.edit_volume(false, |v| v.nudge_iso(dir));
             }
-            KeyCode::KeyM if self.volume.is_some() => self.edit_volume(false, |v| v.blocky = !v.blocky),
+            KeyCode::KeyM if self.volume.is_some() => self.edit_volume_uniforms(|v| v.blocky = !v.blocky),
             KeyCode::KeyI if self.volume.is_some() => self.edit_volume(false, |v| {
                 v.below = !v.below;
                 v.recompute();
@@ -1366,7 +1509,11 @@ impl Viewer {
         egui::CollapsingHeader::new("Output")
             .default_open(true)
             .show(ui, |ui| self.output_ui(ui));
-        egui::CollapsingHeader::new("Shape").show(ui, |ui| self.shape_ui(ui));
+        if self.volume.is_some() {
+            egui::CollapsingHeader::new("Grid").show(ui, |ui| self.grid_ui(ui));
+        } else {
+            egui::CollapsingHeader::new("Shape").show(ui, |ui| self.shape_ui(ui));
+        }
         egui::CollapsingHeader::new("Keyboard & mouse").show(ui, |ui| {
             egui::Grid::new("keys").num_columns(2).striped(true).show(ui, |ui| {
                 for (k, v) in KEYS {
@@ -1462,10 +1609,12 @@ impl Viewer {
         let names: Vec<String> = v.file.arrays.iter().map(|a| a.name.clone()).collect();
         let (cur_array, cur_below, cur_blocky, cur_color) = (v.array, v.below, v.blocky, v.color);
         let (lo, hi) = v.range;
-        let info = format!("{} of {} samples inside", v.inside_count, v.count());
+        let hist = v.hist.clone();
+        let (inside, count, inside_mm3) = (v.inside_count, v.count(), v.inside_volume());
+        let (crange, auto_crange, fixed_crange) = (v.crange(), v.auto_crange(), v.color_range);
         let (mut array, mut below, mut blocky, mut color) = (cur_array, cur_below, cur_blocky, cur_color);
-        let mut iso = self.iso_drag.unwrap_or(v.iso);
         let cur_iso = v.iso;
+        let mut iso = self.iso_drag.unwrap_or(cur_iso);
 
         egui::ComboBox::from_label("array")
             .selected_text(&names[array])
@@ -1475,7 +1624,13 @@ impl Viewer {
                 }
             })
             .response
-            .on_hover_text("A");
+            .on_hover_text("A cycles");
+
+        // threshold: histogram (click/drag) and slider; recomputing is CPU work, so both apply on release
+        let (h, picked) = histogram(ui, &hist, (lo, hi), iso, below);
+        if picked.is_finite() && (h.dragged() || h.clicked()) {
+            iso = picked;
+        }
         let r = ui
             .add(
                 egui::Slider::new(&mut iso, lo..=hi)
@@ -1483,8 +1638,10 @@ impl Viewer {
                     .clamping(egui::SliderClamping::Never),
             )
             .on_hover_text("- and = step it; applied when you let go");
-        let commit = r.drag_stopped() || (r.changed() && !r.dragged());
-        self.iso_drag = if r.dragged() { Some(iso) } else { None };
+        let dragging = h.dragged() || r.dragged();
+        let commit = h.clicked() || h.drag_stopped() || r.drag_stopped() || (r.changed() && !r.dragged());
+        self.iso_drag = if dragging { Some(iso) } else { None };
+
         ui.horizontal(|ui| {
             ui.label("inside is");
             ui.radio_value(&mut below, true, "below");
@@ -1497,7 +1654,29 @@ impl Viewer {
             ui.radio_value(&mut blocky, true, "blocky");
         })
         .response
-        .on_hover_text("M");
+        .on_hover_text("M · blocky draws every inside sample as a cube (for cell data: the elements)");
+
+        // how much material that is
+        let pct = 100.0 * inside as f64 / count.max(1) as f64;
+        egui::Grid::new("vol_stats").num_columns(2).show(ui, |ui| {
+            ui.label("inside");
+            ui.label(format!("{inside} of {count} samples ({pct:.1}%)"))
+                .on_hover_text("the volume fraction, for a density from topology optimization");
+            ui.end_row();
+            ui.label("volume");
+            ui.label(format!(
+                "≈ {} cm³  ·  {} g PLA",
+                fmt_num((inside_mm3 / 1000.0 * 100.0).round() / 100.0),
+                fmt_num((inside_mm3 / 1000.0 * 1.24 * 10.0).round() / 10.0)
+            ))
+            .on_hover_text(
+                "inside samples × cell volume; solid, so an upper bound for the print \
+                 (PLA at 1.24 g/cm³, 100% infill)",
+            );
+            ui.end_row();
+        });
+
+        ui.add_space(4.0);
         egui::ComboBox::from_label("colour by")
             .selected_text(color.map_or("none", |c| names[c].as_str()))
             .show_ui(ui, |ui| {
@@ -1507,8 +1686,27 @@ impl Viewer {
                 }
             })
             .response
-            .on_hover_text("F");
-        ui.weak(info);
+            .on_hover_text("F cycles");
+        let mut new_crange = fixed_crange;
+        if color.is_some() && color == cur_color {
+            colour_bar(ui, crange);
+            let mut fixed = fixed_crange.is_some();
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut fixed, "fixed range").on_hover_text(
+                    "by default the range is min..max over the inside samples; fix it to \
+                     compare iterations or to ignore a few hotspots",
+                );
+                if fixed {
+                    let (mut a, mut b) = fixed_crange.unwrap_or(auto_crange);
+                    let speed = ((b - a).abs() / 200.0).max(1e-6);
+                    ui.add(egui::DragValue::new(&mut a).speed(speed));
+                    ui.add(egui::DragValue::new(&mut b).speed(speed));
+                    new_crange = Some((a, b));
+                } else {
+                    new_crange = None;
+                }
+            });
+        }
 
         if array != cur_array {
             return self.edit_volume(true, |v| {
@@ -1529,14 +1727,67 @@ impl Viewer {
             });
         }
         if blocky != cur_blocky {
-            self.edit_volume(false, |v| v.blocky = blocky);
+            self.edit_volume_uniforms(|v| v.blocky = blocky);
         }
         if color != cur_color {
             self.edit_volume(false, |v| {
                 v.color = color;
                 v.update_color();
             });
+        } else if new_crange != fixed_crange {
+            self.edit_volume_uniforms(|v| v.color_range = new_crange);
         }
+    }
+
+    /// The Grid section for .vti files: lattice and every array in the file.
+    fn grid_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(v) = &self.volume else { return };
+        let (o, sp, d) = v.grid();
+        let f = &v.file;
+        let v3 = |a: [f64; 3]| format!("{} {} {}", fmt_num(a[0]), fmt_num(a[1]), fmt_num(a[2]));
+        let (_, pd) = f.lattice(false);
+        egui::Grid::new("grid").num_columns(2).show(ui, |ui| {
+            ui.label("points");
+            ui.monospace(format!("{} × {} × {}", pd[0], pd[1], pd[2]));
+            ui.end_row();
+            ui.label("spacing");
+            ui.monospace(format!("{} mm", v3(sp)));
+            ui.end_row();
+            ui.label("first sample");
+            ui.monospace(format!("{} mm", v3(o)))
+                .on_hover_text("of the shown array (cell data sits half a cell inside the points)");
+            ui.end_row();
+            ui.label("shown samples");
+            ui.monospace(format!("{} × {} × {}", d[0], d[1], d[2]));
+            ui.end_row();
+        });
+        ui.add_space(4.0);
+        egui::Grid::new("arrays").num_columns(3).striped(true).show(ui, |ui| {
+            ui.strong("array");
+            ui.strong("data");
+            ui.strong("range");
+            ui.end_row();
+            for (i, a) in f.arrays.iter().enumerate() {
+                let name = if a.comps == 1 {
+                    a.name.clone()
+                } else {
+                    format!("{} [{}]", a.name, a.comps)
+                };
+                if i == v.array {
+                    ui.strong(name).on_hover_text("shown");
+                } else {
+                    ui.label(name);
+                }
+                ui.label(if a.cell { "cell" } else { "point" });
+                let (lo, hi) = a
+                    .data
+                    .iter()
+                    .filter(|x| x.is_finite())
+                    .fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+                ui.monospace(format!("{} .. {}", fmt_num(lo as f64), fmt_num(hi as f64)));
+                ui.end_row();
+            }
+        });
     }
 
     fn view_ui(&mut self, ui: &mut egui::Ui) {
@@ -1623,6 +1874,59 @@ impl Viewer {
                 }
             }
         });
+        if let Some(v) = &self.volume {
+            let op = if v.below { "<" } else { ">" };
+            ui.weak(format!("meshes {} {op} {}", v.array_name(), fmt_num(v.iso as f64)));
+        } else if self.loaded {
+            // the simulation grid: SDF plus field_* arrays
+            ui.horizontal(|ui| {
+                let def = default_vti_voxel(&self.shape);
+                let mut vox = self.vti_voxel.unwrap_or(def);
+                let enabled = !running;
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Export VTI"))
+                    .on_hover_text(
+                        "write the SDF and every field_* function as a VTK grid (out/*.vti), \
+                         for simulation or topology optimization",
+                    )
+                    .clicked()
+                {
+                    let args = ["--format", "vti", "--voxel"].map(String::from);
+                    let mut args = args.to_vec();
+                    args.push(fmt_num(vox as f64));
+                    self.run_bg_with("export", &args);
+                }
+                ui.label("voxel");
+                let speed = vox * 0.01;
+                let r = ui.add(
+                    egui::DragValue::new(&mut vox)
+                        .speed(speed)
+                        .range(1e-3..=1e3)
+                        .suffix(" mm"),
+                );
+                if r.changed() {
+                    self.vti_voxel = Some(vox);
+                }
+                if self.vti_voxel.is_some() && ui.small_button("auto").clicked() {
+                    self.vti_voxel = None;
+                }
+            });
+            let vox = self.vti_voxel.unwrap_or_else(|| default_vti_voxel(&self.shape));
+            let d = vti_dims(&self.shape, vox);
+            let n: usize = d.iter().product();
+            let floats = 1 + self.fields.iter().map(|f| f.comps).sum::<usize>();
+            let mut arrays = vec!["sdf".to_string()];
+            arrays.extend(self.fields.iter().map(|f| f.name.clone()));
+            ui.weak(format!(
+                "{} × {} × {} = {} samples, {:.1} MB · {}",
+                d[0],
+                d[1],
+                d[2],
+                n,
+                (n * floats * 4) as f64 / 1e6,
+                arrays.join(", ")
+            ));
+        }
         if !self.defines.is_empty() {
             ui.weak(format!("uses {}", define_flags(&self.defines)));
         }
@@ -1637,6 +1941,17 @@ impl Viewer {
             } else if ok == Some(true) {
                 status_dot(ui, OK_GREEN);
                 ui.label(format!("{cmd} finished in {:.1} s", took.as_secs_f32()));
+                if let Some(out) = written_path(&log).filter(|p| is_vti(p))
+                    && ui
+                        .small_button("View")
+                        .on_hover_text(format!("open {} in a new viewer window", out.display()))
+                        .clicked()
+                {
+                    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gen3d"));
+                    if let Err(e) = std::process::Command::new(exe).arg("view").arg(&out).spawn() {
+                        self.notice = Some(format!("could not open a viewer: {e}"));
+                    }
+                }
             } else {
                 status_dot(ui, ui.visuals().error_fg_color);
                 ui.colored_label(ui.visuals().error_fg_color, format!("{cmd} failed"));
@@ -1924,6 +2239,7 @@ pub fn view(path: &Path, defines: Vec<(String, f64)>, vopts: VolumeOpts) -> Resu
         vopts,
         volume: None,
         iso_drag: None,
+        vti_voxel: None,
         loaded: false,
         loaded_at: String::new(),
         mtimes: HashMap::new(),
@@ -1961,4 +2277,33 @@ pub fn view(path: &Path, defines: Vec<(String, f64)>, vopts: VolumeOpts) -> Resu
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_written_path() {
+        let log =
+            "grid 83x27x43\nwrote /a b/out/x.vti (81x25x41 points, origin -40 -12 0, arrays: sdf, load[3], 2.0 MB)\n";
+        assert_eq!(written_path(log), Some(PathBuf::from("/a b/out/x.vti")));
+        assert_eq!(
+            written_path("wrote out/k.stl (3.3 MB)"),
+            Some(PathBuf::from("out/k.stl"))
+        );
+        assert_eq!(written_path("nothing here"), None);
+    }
+
+    #[test]
+    fn vti_voxel_caps_samples() {
+        let mut s = Shape::placeholder(Path::new("x.wgsl"));
+        s.bounds = ([-20.0, -20.0, 0.0], [20.0, 20.0, 22.0]);
+        s.voxel = 0.12;
+        let v = default_vti_voxel(&s);
+        let n: usize = vti_dims(&s, v).iter().product();
+        assert!((0.3..0.4).contains(&v) && n <= 1_100_000, "{v} -> {n}");
+        s.voxel = 1.0; // already coarse: keep it
+        assert_eq!(default_vti_voxel(&s), 1.0);
+    }
 }

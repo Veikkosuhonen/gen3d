@@ -3,6 +3,47 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: .vti features in the egui sidebar
+
+**What:** the sidebar now covers the `.vti` workflow in both directions.
+
+- **Volume panel (viewing a grid):**
+  - **Histogram** of the shown array over its range. Counts are log-scaled, so a SIMP density's
+    0/1 peaks and its grey middle are both visible. Inside bars are drawn in the surface orange, and a
+    line marks the threshold. Click or drag on the histogram to set the threshold; like the slider, it
+    applies on release, since the distance field is recomputed on the CPU.
+  - **Inside volume:** samples and % of the grid (the volume fraction), cm³ (inside samples × cell
+    volume), and grams of PLA at 1.24 g/cm³ and 100% infill.
+  - **Colour bar** (viridis, the same polynomial as the shader, in Rust), with the range under it.
+    *Fixed range* plus two drag values override the automatic min..max over the inside samples, to
+    compare iterations or ignore hotspots. It's kept across live reloads (`VolumeOpts::color_range`).
+  - Smooth/blocky and colour-range edits upload only the uniform buffer (`edit_volume_uniforms`), not
+    the grid buffers.
+- **Grid section** (replaces Shape for `.vti`): point dims, spacing, first sample of the shown array,
+  shown samples, and a table of every array (point/cell, components, range), as in `gen3d check`.
+- **Output panel (making a grid from a shape):**
+  - **Export VTI** runs `export --format vti --voxel V` with the current `-D` values.
+  - The voxel defaults to the shape's voxel coarsened to about 1M samples, rounded up to 2 significant
+    digits, because a print voxel (0.12 mm for the knob) makes a needlessly huge simulation grid.
+  - The sample count, MB and array names are shown before exporting.
+  - When it's done, **View** spawns `gen3d view out/x.vti` as a second window, taking the path from the
+    job's last `wrote PATH (...)` line, so domain and result sit side by side.
+- `run_bg_with` passes extra arguments; the job label shows them.
+
+**Verified:**
+- clippy clean; 9 tests, with new ones for `written_path` and the default VTI voxel.
+- Screenshots (spectacle, RTX 3080, 165 fps):
+  - density test grid: Volume panel with histogram, stats (3.67 cm³ as before) and stress colour bar;
+    blocky mode; Grid section with cell-data offset and arrays table.
+  - bracket_domain: Export VTI row, whose estimate of 81×25×41 = 83,025 samples, 2.0 MB matches the
+    actual export.
+- The exact command the button runs was checked from the CLI.
+
+**Open:** clicking (histogram drag, fixed-range values, Export VTI → View) wasn't exercised by hand,
+because KDE asks before allowing synthetic input. The histogram uses one bin layout per array, so after a
+live reload with a new value range the bins rescale; fine for watching an optimizer, but it isn't a
+fixed axis across iterations.
+
 ## 2026-11-12: egui sidebar for the viewer
 
 **What:** the viewer gets a real UI instead of keys plus the window title. A left sidebar has

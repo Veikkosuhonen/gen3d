@@ -83,6 +83,7 @@ impl ShapeArgs {
             },
             blocky: self.blocky,
             color: self.color.clone(),
+            color_range: None,
         }
     }
 }

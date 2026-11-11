@@ -27,6 +27,8 @@ pub struct VolumeOpts {
     pub below: Option<bool>,
     pub blocky: bool,
     pub color: Option<String>,
+    /// fixed colour range instead of the automatic one (viewer only)
+    pub color_range: Option<(f32, f32)>,
 }
 
 #[repr(C)]
@@ -58,8 +60,15 @@ pub struct Volume {
     /// colour array resampled onto the lattice (all zeros when off)
     pub col: Vec<f32>,
     crange: (f32, f32),
+    /// fixed colour range set in the viewer; `None` = automatic (min..max over inside samples)
+    pub color_range: Option<(f32, f32)>,
     pub inside_count: usize,
+    /// histogram of the shown array over `range`
+    pub hist: Vec<u32>,
 }
+
+/// Histogram bins for the Volume panel.
+pub const HIST_BINS: usize = 64;
 
 fn scalars(a: &VtiArray) -> Vec<f32> {
     if a.comps == 1 {
@@ -112,7 +121,9 @@ impl Volume {
             blk: vec![],
             col: vec![],
             crange: (0.0, 1.0),
+            color_range: opts.color_range,
             inside_count: 0,
+            hist: vec![],
         };
         v.select(array);
         if let Some(b) = opts.below {
@@ -136,6 +147,11 @@ impl Volume {
         self.values = scalars(a);
         self.range = finite_range(&self.values);
         let (lo, hi) = self.range;
+        self.hist = vec![0; HIST_BINS];
+        for &v in self.values.iter().filter(|v| v.is_finite()) {
+            let t = if hi > lo { (v - lo) / (hi - lo) } else { 0.0 };
+            self.hist[((t * HIST_BINS as f32) as usize).min(HIST_BINS - 1)] += 1;
+        }
         let sdf_like = a.comps == 1 && (a.name.to_lowercase().contains("sdf") || (lo < 0.0 && hi > 0.0));
         self.below = sdf_like;
         self.iso = if sdf_like { 0.0 } else { 0.5 * (lo + hi) };
@@ -252,6 +268,26 @@ impl Volume {
         self.crange = finite_range(if inside.is_empty() { &self.col } else { &inside });
     }
 
+    /// Colour range in use: the fixed one if set, else the automatic one.
+    pub fn crange(&self) -> (f32, f32) {
+        self.color_range.unwrap_or(self.crange)
+    }
+
+    /// Automatic colour range (min..max of the colour array over the inside samples).
+    pub fn auto_crange(&self) -> (f32, f32) {
+        self.crange
+    }
+
+    /// Grid of the shown array: first sample position, spacing, sample counts.
+    pub fn grid(&self) -> ([f64; 3], [f64; 3], [usize; 3]) {
+        (self.origin, self.spacing, self.dims)
+    }
+
+    /// Volume of the inside samples, each counted as one cell (mm³).
+    pub fn inside_volume(&self) -> f64 {
+        self.inside_count as f64 * self.spacing.iter().product::<f64>()
+    }
+
     pub fn uniforms(&self) -> VolUniforms {
         let f = |v: [f64; 3]| [v[0] as f32, v[1] as f32, v[2] as f32, 0.0];
         VolUniforms {
@@ -263,7 +299,12 @@ impl Volume {
                 self.dims[2] as u32,
                 self.blocky as u32,
             ],
-            info: [self.crange.0, self.crange.1, self.color.is_some() as u32 as f32, 0.0],
+            info: [
+                self.crange().0,
+                self.crange().1,
+                self.color.is_some() as u32 as f32,
+                0.0,
+            ],
         }
     }
 
@@ -291,7 +332,8 @@ impl Volume {
         let mode = if self.blocky { "blocky" } else { "smooth" };
         let mut s = format!("{} {op} {:.4} ({mode})", self.array_name(), self.iso);
         if let Some(c) = self.color_name() {
-            s += &format!(" colour: {c} {:.3}..{:.3}", self.crange.0, self.crange.1);
+            let (a, b) = self.crange();
+            s += &format!(" colour: {c} {a:.3}..{b:.3}");
         }
         s
     }
