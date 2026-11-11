@@ -156,6 +156,54 @@ impl Shape {
         Ok(out)
     }
 
+    /// The shape's parameters: every `override NAME: T = default;`, in declaration order. A trailing
+    /// `// comment` on the declaration becomes its note, and `//! range NAME min max` sets the range
+    /// the viewer's slider covers.
+    pub fn params(&self) -> Result<Vec<Param>> {
+        let module = self.parse(&self.source)?;
+        let mut out = vec![];
+        for (_, o) in module.overrides.iter() {
+            let Some(name) = o.name.clone() else { continue };
+            let kind = match module.types[o.ty].inner {
+                naga::TypeInner::Scalar(s) => match s {
+                    naga::Scalar::BOOL => ParamKind::Bool,
+                    naga::Scalar::I32 => ParamKind::Int,
+                    naga::Scalar::U32 => ParamKind::Uint,
+                    _ => ParamKind::Float,
+                },
+                _ => ParamKind::Float,
+            };
+            let default = o.init.and_then(|h| const_value(&module, h)).unwrap_or(0.0);
+            let decl = format!("override {name}");
+            let note = self
+                .source
+                .lines()
+                .find(|l| {
+                    l.trim_start()
+                        .strip_prefix(&decl)
+                        .is_some_and(|r| r.starts_with([':', ' ', '=', ';']))
+                })
+                .and_then(|l| l.split_once("//"))
+                .map(|(_, c)| c.trim().to_string())
+                .unwrap_or_default();
+            let range = self.source.lines().find_map(|l| {
+                let mut it = l.trim_start().strip_prefix("//!")?.split_whitespace();
+                (it.next()? == "range" && it.next()? == name).then_some(())?;
+                let lo: f64 = it.next()?.parse().ok()?;
+                let hi: f64 = it.next()?.parse().ok()?;
+                (hi > lo).then_some((lo, hi))
+            });
+            out.push(Param {
+                name,
+                kind,
+                default,
+                note,
+                range,
+            });
+        }
+        Ok(out)
+    }
+
     fn locate(&self, source: &str, offset: usize) -> (String, usize, usize, String) {
         let offset = offset.min(source.len());
         let line_idx = source[..offset].matches('\n').count();
@@ -209,6 +257,69 @@ pub struct Field {
     pub func: String,
     /// 1 for `-> f32`, 3 for `-> vec3f`
     pub comps: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ParamKind {
+    Float,
+    Int,
+    Uint,
+    Bool,
+}
+
+/// A shape parameter: a WGSL `override` constant, settable with `-D NAME=VALUE`.
+#[derive(Clone, Debug)]
+pub struct Param {
+    pub name: String,
+    pub kind: ParamKind,
+    pub default: f64,
+    /// Trailing comment on the declaration, if any.
+    pub note: String,
+    /// From `//! range NAME min max`.
+    pub range: Option<(f64, f64)>,
+}
+
+impl Param {
+    /// Slider range: the declared one, or a guess around the default.
+    pub fn slider_range(&self) -> (f64, f64) {
+        if let Some(r) = self.range {
+            return r;
+        }
+        let d = self.default;
+        match self.kind {
+            ParamKind::Bool => (0.0, 1.0),
+            _ if d == 0.0 => (-10.0, 10.0),
+            ParamKind::Float if d > 0.0 => (0.0, 2.0 * d),
+            ParamKind::Float => (2.0 * d, -2.0 * d),
+            _ if d > 0.0 => (0.0, (2.0 * d).max(10.0)),
+            _ => (2.0 * d, -2.0 * d),
+        }
+    }
+}
+
+/// Evaluate a simple constant initializer (a literal, possibly negated).
+fn const_value(module: &naga::Module, h: naga::Handle<naga::Expression>) -> Option<f64> {
+    use naga::{Expression, Literal};
+    Some(match module.global_expressions[h] {
+        Expression::Literal(l) => match l {
+            Literal::F64(v) | Literal::AbstractFloat(v) => v,
+            Literal::F32(v) => v as f64,
+            Literal::F16(v) => f32::from(v) as f64,
+            Literal::I32(v) => v as f64,
+            Literal::U32(v) => v as f64,
+            Literal::I16(v) => v as f64,
+            Literal::U16(v) => v as f64,
+            Literal::I64(v) | Literal::AbstractInt(v) => v as f64,
+            Literal::U64(v) => v as f64,
+            Literal::Bool(b) => b as u8 as f64,
+        },
+        Expression::Unary {
+            op: naga::UnaryOperator::Negate,
+            expr,
+        } => -const_value(module, expr)?,
+        Expression::Constant(c) => const_value(module, module.constants[c].init)?,
+        _ => return None,
+    })
 }
 
 /// A validated module ready for `create_shader_module`, plus the override constants to apply.
@@ -406,6 +517,11 @@ mod tests {
         assert_eq!(s.bounds, ([-1.0, -1.0, 0.0], [1.0, 1.0, 2.0]));
         s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
         s.compile(&crate::viewer::preview_harness(&[])).unwrap();
+        let ps = s.params().unwrap();
+        assert_eq!(
+            (ps[0].name.as_str(), ps[0].default, ps[0].kind),
+            ("R", 1.0, ParamKind::Float)
+        );
         let bad = load_shape(&p, &[("NOPE".into(), 2.0)]).unwrap();
         assert!(bad.compile(&crate::mesher::compute_harness("map", 1)).is_err());
 
@@ -437,6 +553,27 @@ mod tests {
             s.compile(&crate::mesher::compute_harness(&f.func, f.comps)).unwrap();
         }
         s.compile(&crate::viewer::preview_harness(&f)).unwrap();
+        std::fs::write(
+            &p,
+            "//! range W 0.5 4\n\
+             override W: f32 = -1.5;   // wall, mm\n\
+             override N: i32 = 6;\n\
+             override HOLLOW: bool = true;\n\
+             fn map(p: vec3f) -> f32 { return length(p) - W + f32(N) + select(0.0, 1.0, HOLLOW); }\n",
+        )
+        .unwrap();
+        let ps = load_shape(&p, &[]).unwrap().params().unwrap();
+        let got: Vec<_> = ps.iter().map(|p| (p.name.as_str(), p.kind, p.default)).collect();
+        assert_eq!(
+            got,
+            [
+                ("W", ParamKind::Float, -1.5),
+                ("N", ParamKind::Int, 6.0),
+                ("HOLLOW", ParamKind::Bool, 1.0)
+            ]
+        );
+        assert_eq!((ps[0].note.as_str(), ps[0].range), ("wall, mm", Some((0.5, 4.0))));
+        assert_eq!(ps[1].slider_range(), (0.0, 12.0));
         std::fs::write(
             &p,
             "fn map(p: vec3f) -> f32 { return 0.0; }\nfn field_x(p: vec3f) -> i32 { return 0; }\n",

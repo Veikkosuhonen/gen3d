@@ -1,21 +1,22 @@
 //! Live raymarching preview window with hot reload, and headless PNG rendering.
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::gpu::Gpu;
-use crate::shape::{Field, Shape, load_shape};
+use crate::shape::{Field, Param, ParamKind, Shape, load_shape};
 use crate::volume::{Volume, VolumeOpts};
 
 pub const PREVIEW_HARNESS: &str = r#"
@@ -393,6 +394,7 @@ fn volume_source(path: &Path, v: Volume) -> Source {
 }
 
 /// GPU copies of a volume's fields (bindings 1-4 of the preview pipeline).
+#[derive(Clone)]
 struct VolGpu {
     uni: wgpu::Buffer,
     sd: wgpu::Buffer,
@@ -439,16 +441,23 @@ impl VolGpu {
     }
 }
 
+/// Validate the source with its preview harness and create the shader module.
+fn preview_module(gpu: &Gpu, src: &Source) -> Result<wgpu::ShaderModule> {
+    let compiled = src.shape.compile(&src.harness)?;
+    gpu.shader(&compiled, "preview")
+}
+
+/// Build the preview pipeline with the given parameter values (`override` constants). Cheap
+/// compared to `preview_module`, so the viewer redoes only this when a parameter changes.
 fn build_pipeline(
     gpu: &Gpu,
-    src: &Source,
+    module: &wgpu::ShaderModule,
+    constants: &[(String, f64)],
     format: wgpu::TextureFormat,
     ubuf: &wgpu::Buffer,
     vol: Option<&VolGpu>,
 ) -> Result<Pipeline> {
-    let compiled = src.shape.compile(&src.harness)?;
-    let module = gpu.shader(&compiled, "preview")?;
-    let constants = compiled.constants();
+    let constants: Vec<(&str, f64)> = constants.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let options = || wgpu::PipelineCompilationOptions {
         constants: &constants,
         ..Default::default()
@@ -458,7 +467,7 @@ fn build_pipeline(
             label: Some("preview"),
             layout: None,
             vertex: wgpu::VertexState {
-                module: &module,
+                module,
                 entry_point: Some("g3d_vs"),
                 compilation_options: options(),
                 buffers: &[],
@@ -467,7 +476,7 @@ fn build_pipeline(
             depth_stencil: None,
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
-                module: &module,
+                module,
                 entry_point: Some("g3d_fs"),
                 compilation_options: options(),
                 targets: &[Some(format.into())],
@@ -498,7 +507,17 @@ fn build_pipeline(
     Ok(Pipeline { pipeline, bind })
 }
 
-fn draw(gpu: &Gpu, p: &Pipeline, view: &wgpu::TextureView, clear: Option<wgpu::Color>) -> wgpu::CommandBuffer {
+/// Raymarch the preview into `view`; without a pipeline (nothing compiled yet) fill it dark red.
+fn draw(gpu: &Gpu, p: Option<&Pipeline>, view: &wgpu::TextureView) -> wgpu::CommandBuffer {
+    let clear = match p {
+        Some(_) => wgpu::Color::BLACK,
+        None => wgpu::Color {
+            r: 0.3,
+            g: 0.05,
+            b: 0.05,
+            a: 1.0,
+        },
+    };
     let mut enc = gpu.device.create_command_encoder(&Default::default());
     {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -508,13 +527,13 @@ fn draw(gpu: &Gpu, p: &Pipeline, view: &wgpu::TextureView, clear: Option<wgpu::C
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear.unwrap_or(wgpu::Color::BLACK)),
+                    load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
                 },
             })],
             ..Default::default()
         });
-        if clear.is_none() {
+        if let Some(p) = p {
             pass.set_pipeline(&p.pipeline);
             pass.set_bind_group(0, &p.bind, &[]);
             pass.draw(0..3, 0..1);
@@ -572,7 +591,8 @@ pub fn render_png(
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let vol = src.volume.as_ref().map(|v| VolGpu::new(&gpu, v)).transpose()?;
-    let pipeline = build_pipeline(&gpu, &src, format, &ubuf, vol.as_ref())?;
+    let module = preview_module(&gpu, &src)?;
+    let pipeline = build_pipeline(&gpu, &module, &src.shape.defines, format, &ubuf, vol.as_ref())?;
     let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("render"),
         size: wgpu::Extent3d {
@@ -595,7 +615,7 @@ pub fn render_png(
         usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let cmd = draw(&gpu, &pipeline, &view, None);
+    let cmd = draw(&gpu, Some(&pipeline), &view);
     let mut enc = gpu.device.create_command_encoder(&Default::default());
     enc.copy_texture_to_buffer(
         tex.as_image_copy(),
@@ -659,47 +679,127 @@ fn print_legend(fields: &[Field]) {
 
 // ------------------------------------------------------------------------------------------ viewer
 
-const HELP: &str = "gen3d viewer — edit the .wgsl file in any editor; it reloads on save (.vti files too).
-  mouse: left-drag orbit · right/middle-drag pan · wheel zoom
-  1/2/3/4 front/side/top/iso   R reset camera   F5 force reload
-  C section view   [ ] move section plane   B toggle clip-to-bounds   V toggle bounds box
-  F cycle field overlays (all, each field alone, off)
-  .vti: - = threshold   M smooth/blocky   I flip inside   A next array   F colour by array
-  E export mesh    G slice to G-code        O open in slicer GUI      Q/Esc quit";
+const KEYS: &[(&str, &str)] = &[
+    ("left-drag", "orbit"),
+    ("right/middle-drag", "pan"),
+    ("wheel", "zoom"),
+    ("double-click", "reset camera"),
+    ("1 2 3 4", "front / side / top / iso"),
+    ("R", "reset camera"),
+    ("C", "section view"),
+    ("[  ]", "move section plane"),
+    ("B", "clip to bounds"),
+    ("V", "bounds box"),
+    ("F", "cycle field overlays (.vti: colour by array)"),
+    ("-  =", ".vti: lower / raise threshold"),
+    ("M", ".vti: smooth / blocky"),
+    ("I", ".vti: flip inside"),
+    ("A", ".vti: next array"),
+    ("F5", "force reload"),
+    ("E  G  O", "export / slice / open in slicer"),
+    ("Q  Esc", "quit"),
+];
+
+/// Format of the offscreen texture the preview is raymarched into. egui samples textures as
+/// gamma-encoded, so the shader applies gamma itself (as for `render_png`).
+const VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// Offscreen target for the preview, shown as an image in the central panel.
+struct Viewport {
+    view: wgpu::TextureView,
+    size: (u32, u32),
+    id: egui::TextureId,
+}
+
+impl Viewport {
+    fn target(gpu: &Gpu, size: (u32, u32)) -> wgpu::TextureView {
+        gpu.device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("viewport"),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: VIEW_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default())
+    }
+}
 
 struct Window_ {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    gamma: bool,
-    gpu: Gpu,
+    gpu: Arc<Gpu>,
     ubuf: wgpu::Buffer,
+    /// The current shape's preview shader; kept so parameter changes only rebuild the pipeline.
+    module: Option<wgpu::ShaderModule>,
     pipeline: Option<Pipeline>,
     vol: Option<VolGpu>,
+    egui: egui::Context,
+    egui_state: egui_winit::State,
+    renderer: egui_wgpu::Renderer,
+    viewport: Viewport,
+}
+
+/// A background `gen3d export|slice|open` run started from the viewer.
+#[derive(Default)]
+struct Job {
+    cmd: String,
+    running: bool,
+    ok: Option<bool>,
+    log: String,
+    started: Option<Instant>,
+    took: Duration,
 }
 
 struct Viewer {
     path: PathBuf,
+    /// Parameter values that differ from the shape's defaults (as `-D NAME=VALUE`).
     defines: Vec<(String, f64)>,
     /// .vti display options from the command line
     vopts: VolumeOpts,
     volume: Option<Volume>,
+    /// Threshold being dragged in the Volume panel; applied on release (recomputing is CPU work).
+    iso_drag: Option<f32>,
     shape: Shape,
     fields: Vec<Field>,
+    params: Vec<Param>,
     /// overlay mode: 0 = all fields, 1..=n = only field n-1, n+1 = none
     field_mode: usize,
     start: Instant,
     loaded: bool,
+    loaded_at: String,
     mtimes: HashMap<PathBuf, Option<SystemTime>>,
-    error: bool,
+    error: Option<String>,
+    /// Pipeline build failure for the current parameter values (the source itself is fine).
+    param_error: Option<String>,
+    notice: Option<String>,
+    params_dirty: bool,
+    /// In-flight background pipeline build (see `request_rebuild`).
+    rebuild: Option<Rebuild>,
+    rebuild_again: bool,
+    /// Bumped on every reload so stale background builds are dropped.
+    rebuild_gen: u64,
     cam: Camera,
     opts: Options,
-    drag: Option<MouseButton>,
-    cursor: (f64, f64),
-    busy: Arc<AtomicBool>,
+    /// Fraction of the viewport's pixels that are raymarched (lower = faster).
+    render_scale: f32,
+    /// Viewport size wanted by this frame's layout, in physical pixels.
+    view_px: (u32, u32),
+    job: Arc<Mutex<Job>>,
+    gpu_name: String,
+    quit: bool,
     win: Option<Window_>,
     last_poll: Instant,
     frames: u32,
+    fps: f32,
     fps_t: Instant,
 }
 
@@ -709,6 +809,54 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 
 fn stamp() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+/// Drop ANSI escape sequences (colours) from a line of job output.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c == '\x1b' {
+            if it.peek() == Some(&'[') {
+                it.next();
+                for c in it.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn fmt_num(v: f64) -> String {
+    let s = format!("{v:.4}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(90, 190, 100);
+
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(r.center(), 4.0, color);
+}
+
+fn define_flags(defines: &[(String, f64)]) -> String {
+    defines
+        .iter()
+        .map(|(k, v)| format!("-D {k}={}", fmt_num(*v)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+type Rebuild = std::sync::mpsc::Receiver<(u64, Vec<(String, f64)>, Result<Pipeline>)>;
+
+fn rgb_gamma(c: [f32; 3]) -> egui::Color32 {
+    let [r, g, b] = c.map(|c| (c.powf(1.0 / 2.2) * 255.0) as u8);
+    egui::Color32::from_rgb(r, g, b)
 }
 
 impl Viewer {
@@ -724,6 +872,10 @@ impl Viewer {
             },
             None => self.vopts.clone(),
         }
+    }
+
+    fn is_volume(&self) -> bool {
+        self.volume.is_some() || is_vti(&self.path)
     }
 
     fn reload(&mut self, first: bool) {
@@ -754,16 +906,50 @@ impl Viewer {
     }
 
     /// Build the GPU pipeline for `src` and switch to it.
-    fn install(&mut self, src: Source, first: bool) {
+    fn install(&mut self, mut src: Source, first: bool) {
+        let params = match src.shape.params() {
+            Ok(p) => p,
+            Err(e) => return self.fail(&e.to_string()),
+        };
+        // values for parameters the shape doesn't (or no longer) declare are dropped
+        let unknown: Vec<String> = self
+            .defines
+            .iter()
+            .filter(|(k, _)| !params.iter().any(|p| &p.name == k))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !unknown.is_empty() {
+            self.defines.retain(|(k, _)| !unknown.contains(k));
+            let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+            let msg = format!(
+                "ignored -D {}: not a parameter of this shape (parameters: {})",
+                unknown.join(", "),
+                if names.is_empty() {
+                    "none".into()
+                } else {
+                    names.join(", ")
+                }
+            );
+            println!("[{}] {msg}", stamp());
+            self.notice = Some(msg);
+        }
+        src.shape.defines = self.defines.clone();
         let Some(win) = &mut self.win else { return };
         let vol = match src.volume.as_ref().map(|v| VolGpu::new(&win.gpu, v)).transpose() {
             Ok(v) => v,
             Err(e) => return self.fail(&format!("{e:#}")),
         };
-        match build_pipeline(&win.gpu, &src, win.config.format, &win.ubuf, vol.as_ref()) {
-            Ok(p) => {
+        let built = preview_module(&win.gpu, &src).and_then(|m| {
+            let p = build_pipeline(&win.gpu, &m, &src.shape.defines, VIEW_FORMAT, &win.ubuf, vol.as_ref())?;
+            Ok((m, p))
+        });
+        match built {
+            Ok((m, p)) => {
+                win.module = Some(m);
                 win.pipeline = Some(p);
                 win.vol = vol;
+                self.rebuild_gen += 1;
+                self.param_error = None;
             }
             Err(e) => return self.fail(&e.to_string()),
         }
@@ -776,49 +962,27 @@ impl Viewer {
         let names = |f: &[Field]| f.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
         if names(&fields) != names(&self.fields) {
             self.field_mode = 0;
-            print_legend(&fields);
         }
         self.fields = fields;
+        self.params = params;
         self.set_field_mask();
         self.loaded = true;
-        self.error = false;
+        self.error = None;
+        self.loaded_at = stamp();
         if first || bounds_changed {
             self.reset_camera();
         }
         println!(
             "[{}] loaded {}",
-            stamp(),
+            self.loaded_at,
             self.path.file_name().unwrap_or_default().to_string_lossy()
         );
     }
 
     fn fail(&mut self, msg: &str) {
-        self.error = true;
-        let what = if self.volume.is_some() || is_vti(&self.path) {
-            "error"
-        } else {
-            "shader error"
-        };
+        let what = if self.is_volume() { "error" } else { "shader error" };
         println!("\n[{}] \x1b[31m{what}\x1b[0m\n{}\n", stamp(), msg.trim());
-    }
-
-    fn set_field_mask(&mut self) {
-        let n = self.fields.len();
-        self.opts.fields = match self.field_mode {
-            0 => all_fields(&self.fields),
-            m if m <= n.min(32) => 1 << (m - 1),
-            _ => 0,
-        };
-    }
-
-    fn field_label(&self) -> Option<String> {
-        let n = self.fields.len();
-        match self.field_mode {
-            _ if n == 0 => None,
-            0 => Some("fields: all".into()),
-            m if m <= n => Some(format!("field: {}", self.fields[m - 1].name)),
-            _ => Some("fields: off".into()),
-        }
+        self.error = Some(msg.trim().to_string());
     }
 
     /// Apply a change to the volume view: `rebuild` when the array (and so the grid size) changed.
@@ -837,15 +1001,109 @@ impl Viewer {
         self.volume = Some(v);
     }
 
+    /// Rebuild the pipeline with the current parameter values. The driver's shader compile takes
+    /// ~100 ms, so it runs on a worker thread; changes made meanwhile are coalesced into one more
+    /// build, so dragging a slider keeps the UI smooth and the preview follows as fast as it can.
+    fn request_rebuild(&mut self) {
+        self.shape.defines = self.defines.clone();
+        if self.rebuild.is_some() {
+            self.rebuild_again = true;
+            return;
+        }
+        let Some(win) = &self.win else { return };
+        let Some(module) = win.module.clone() else { return };
+        let (gpu, ubuf, vol, defines, generation) = (
+            win.gpu.clone(),
+            win.ubuf.clone(),
+            win.vol.clone(),
+            self.defines.clone(),
+            self.rebuild_gen,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = build_pipeline(&gpu, &module, &defines, VIEW_FORMAT, &ubuf, vol.as_ref());
+            let _ = tx.send((generation, defines, result));
+        });
+        self.rebuild = Some(rx);
+    }
+
+    fn poll_rebuild(&mut self) {
+        let Some(rx) = &self.rebuild else { return };
+        let (generation, defines, result) = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.rebuild = None;
+                return;
+            }
+        };
+        self.rebuild = None;
+        // a reload since the request already built the pipeline from the new source
+        if generation == self.rebuild_gen {
+            match result {
+                Ok(p) => {
+                    if let Some(win) = &mut self.win {
+                        win.pipeline = Some(p);
+                    }
+                    self.param_error = None;
+                }
+                Err(e) => {
+                    let msg = format!("with {}: {e}", define_flags(&defines));
+                    println!("\n[{}] \x1b[31mpipeline error\x1b[0m\n{msg}\n", stamp());
+                    self.param_error = Some(msg);
+                }
+            }
+        }
+        if std::mem::take(&mut self.rebuild_again) {
+            self.request_rebuild();
+        }
+    }
+
+    fn param_value(&self, p: &Param) -> f64 {
+        self.defines
+            .iter()
+            .find(|(k, _)| *k == p.name)
+            .map_or(p.default, |(_, v)| *v)
+    }
+
+    fn set_param(&mut self, p: &Param, v: f64) {
+        self.defines.retain(|(k, _)| *k != p.name);
+        if v != p.default {
+            self.defines.push((p.name.clone(), v));
+        }
+        self.params_dirty = true;
+    }
+
+    fn set_field_mask(&mut self) {
+        let n = self.fields.len();
+        self.opts.fields = match self.field_mode {
+            0 => all_fields(&self.fields),
+            m if m <= n.min(32) => 1 << (m - 1),
+            _ => 0,
+        };
+    }
+
     fn reset_camera(&mut self) {
         self.cam = Camera::framing(&self.shape);
         self.opts.cut = self.cam.target[1];
     }
 
+    fn set_view(&mut self, yaw: f32, pitch: f32) {
+        (self.cam.yaw, self.cam.pitch) = (yaw.to_radians(), pitch.to_radians());
+    }
+
     fn run_bg(&self, cmd: &str) {
-        if self.busy.swap(true, Ordering::SeqCst) {
-            println!("busy, wait for the previous job");
-            return;
+        {
+            let mut job = self.job.lock().unwrap();
+            if job.running {
+                return;
+            }
+            *job = Job {
+                cmd: cmd.to_string(),
+                running: true,
+                started: Some(Instant::now()),
+                ..Default::default()
+            };
         }
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("gen3d"));
         let mut c = std::process::Command::new(exe);
@@ -857,20 +1115,56 @@ impl Viewer {
         for (k, v) in &self.defines {
             c.arg("-D").arg(format!("{k}={v}"));
         }
-        let busy = self.busy.clone();
+        c.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let job = self.job.clone();
         std::thread::spawn(move || {
-            if let Err(e) = c.status() {
-                eprintln!("could not run job: {e}");
-            }
-            busy.store(false, Ordering::SeqCst);
+            let push = |job: &Mutex<Job>, line: &str| {
+                let line = strip_ansi(line.rsplit('\r').next().unwrap_or(line));
+                let mut j = job.lock().unwrap();
+                j.log.push_str(&line);
+                j.log.push('\n');
+            };
+            let result = (|| -> std::io::Result<std::process::ExitStatus> {
+                let mut child = c.spawn()?;
+                let (out, err) = (child.stdout.take(), child.stderr.take());
+                let j = job.clone();
+                let reader = std::thread::spawn(move || {
+                    for l in out
+                        .into_iter()
+                        .flat_map(|o| BufReader::new(o).lines().map_while(|l| l.ok()))
+                    {
+                        println!("{l}");
+                        push(&j, &l);
+                    }
+                });
+                for l in err
+                    .into_iter()
+                    .flat_map(|e| BufReader::new(e).lines().map_while(|l| l.ok()))
+                {
+                    eprintln!("{l}");
+                    push(&job, &l);
+                }
+                let _ = reader.join();
+                child.wait()
+            })();
+            let mut j = job.lock().unwrap();
+            j.running = false;
+            j.took = j.started.map_or_else(Duration::default, |s| s.elapsed());
+            j.ok = Some(match result {
+                Ok(s) => s.success(),
+                Err(e) => {
+                    let msg = format!("could not run gen3d {}: {e}\n", j.cmd);
+                    j.log.push_str(&msg);
+                    false
+                }
+            });
         });
     }
 
-    fn on_key(&mut self, key: KeyCode, el: &ActiveEventLoop) {
+    fn on_key(&mut self, key: KeyCode) {
         let step = self.shape.size()[1] / 50.0;
-        let view = |y: f32, p: f32| (y.to_radians(), p.to_radians());
         match key {
-            KeyCode::Escape | KeyCode::KeyQ => el.exit(),
+            KeyCode::Escape | KeyCode::KeyQ => self.quit = true,
             KeyCode::KeyR => self.reset_camera(),
             KeyCode::KeyC => self.opts.section = !self.opts.section,
             KeyCode::BracketLeft => self.opts.cut -= step,
@@ -908,118 +1202,643 @@ impl Viewer {
             KeyCode::KeyE => self.run_bg("export"),
             KeyCode::KeyG => self.run_bg("slice"),
             KeyCode::KeyO => self.run_bg("open"),
-            KeyCode::Digit1 | KeyCode::Digit2 | KeyCode::Digit3 | KeyCode::Digit4 => {
-                (self.cam.yaw, self.cam.pitch) = match key {
-                    KeyCode::Digit1 => view(-90.0, 0.0),
-                    KeyCode::Digit2 => view(0.0, 0.0),
-                    KeyCode::Digit3 => view(-90.0, 89.9),
-                    _ => view(-60.0, 28.0),
-                };
-            }
+            KeyCode::Digit1 => self.set_view(-90.0, 0.0),
+            KeyCode::Digit2 => self.set_view(0.0, 0.0),
+            KeyCode::Digit3 => self.set_view(-90.0, 89.9),
+            KeyCode::Digit4 => self.set_view(-60.0, 28.0),
             _ => {}
         }
     }
 
-    fn on_move(&mut self, x: f64, y: f64) {
-        let (dx, dy) = ((x - self.cursor.0) as f32, (y - self.cursor.1) as f32);
-        self.cursor = (x, y);
-        match self.drag {
-            None => {}
-            Some(MouseButton::Left) => {
-                self.cam.yaw -= dx * 0.008;
-                self.cam.pitch = (self.cam.pitch + dy * 0.008).clamp(-1.55, 1.55);
-            }
-            Some(_) => {
-                let h = self.win.as_ref().map_or(800, |w| w.config.height.max(1));
-                let s = self.cam.dist / h as f32 * 1.1;
-                let right = (-self.cam.yaw.sin(), self.cam.yaw.cos());
-                self.cam.target[0] -= right.0 * dx * s;
-                self.cam.target[1] -= right.1 * dx * s;
-                self.cam.target[2] += dy * s;
-            }
+    // -------------------------------------------------------------------------------------- ui
+
+    fn ui(&mut self, ui: &mut egui::Ui, tex: egui::TextureId) {
+        egui::Panel::left("controls")
+            .resizable(true)
+            .default_size(320.0)
+            .size_range(240.0..=600.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| self.controls(ui));
+            });
+        if let Some(err) = self.error.as_ref().or(self.param_error.as_ref()) {
+            egui::Panel::bottom("error")
+                .resizable(true)
+                .default_size(170.0)
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        let title = if self.is_volume() { "Error" } else { "Shader error" };
+                        ui.colored_label(ui.visuals().error_fg_color, egui::RichText::new(title).strong());
+                        ui.weak(if self.loaded {
+                            "— showing the last version that compiled; fix the file and save"
+                        } else {
+                            "— fix the file and save"
+                        });
+                    });
+                    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(err).monospace()).selectable(true));
+                    });
+                });
+        }
+        egui::CentralPanel::no_frame().show(ui, |ui| self.viewport_ui(ui, tex));
+    }
+
+    fn viewport_ui(&mut self, ui: &mut egui::Ui, tex: egui::TextureId) {
+        let rect = ui.available_rect_before_wrap();
+        let ppp = ui.ctx().pixels_per_point();
+        let px = |v: f32| ((v * ppp * self.render_scale).round() as u32).max(1);
+        self.view_px = (px(rect.width()), px(rect.height()));
+        let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        ui.painter().image(tex, rect, uv, egui::Color32::WHITE);
+
+        // camera: same feel as before (rates per physical pixel)
+        let d = resp.drag_delta();
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            self.cam.yaw -= d.x * ppp * 0.008;
+            self.cam.pitch = (self.cam.pitch + d.y * ppp * 0.008).clamp(-1.55, 1.55);
+        } else if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+            let s = self.cam.dist / rect.height().max(1.0) * 1.1;
+            let right = (-self.cam.yaw.sin(), self.cam.yaw.cos());
+            self.cam.target[0] -= right.0 * d.x * s;
+            self.cam.target[1] -= right.1 * d.x * s;
+            self.cam.target[2] += d.y * s;
+        }
+        if resp.double_clicked() {
+            self.reset_camera();
+        }
+        if resp.hovered() {
+            let dy: f32 = ui.input(|i| {
+                i.events
+                    .iter()
+                    .map(|e| match e {
+                        egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                            egui::MouseWheelUnit::Point => delta.y / 40.0,
+                            egui::MouseWheelUnit::Line => delta.y,
+                            egui::MouseWheelUnit::Page => delta.y * 10.0,
+                        },
+                        _ => 0.0,
+                    })
+                    .sum()
+            });
+            self.cam.dist *= 0.9f32.powf(dy);
+        }
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+
+        // overlay: frame rate and active modes
+        let mut info = vec![format!("{:.0} fps", self.fps)];
+        if self.rebuild.is_some() {
+            info.insert(0, "compiling…".into());
+        }
+        if self.render_scale < 1.0 {
+            info.push(format!("{:.0}% res", self.render_scale * 100.0));
+        }
+        if self.opts.section {
+            info.push(format!("section y = {:.1}", self.opts.cut));
+        }
+        if !self.opts.clip {
+            info.push("unclipped".into());
+        }
+        let painter = ui.painter_at(rect);
+        painter.text(
+            rect.right_top() + egui::vec2(-10.0, 8.0),
+            egui::Align2::RIGHT_TOP,
+            info.join("  ·  "),
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_white_alpha(170),
+        );
+        if !self.loaded {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "no shape loaded yet",
+                egui::FontId::proportional(18.0),
+                egui::Color32::from_white_alpha(200),
+            );
         }
     }
 
-    fn render(&mut self) {
+    fn controls(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(6.0);
+        let name = self.path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        ui.heading(&name).on_hover_text(self.path.display().to_string());
+        ui.horizontal(|ui| {
+            if self.error.is_some() {
+                status_dot(ui, ui.visuals().error_fg_color);
+                ui.colored_label(ui.visuals().error_fg_color, "error");
+            } else if self.loaded {
+                status_dot(ui, OK_GREEN);
+                ui.label(format!("loaded {}", self.loaded_at))
+                    .on_hover_text("reloads automatically when the file (or an include) is saved");
+            }
+            if ui.small_button("Reload").on_hover_text("F5").clicked() {
+                self.reload(false);
+            }
+        });
+        ui.weak(&self.gpu_name);
+        if let Some(n) = self.notice.clone() {
+            ui.colored_label(ui.visuals().warn_fg_color, n);
+            if ui.small_button("Dismiss").clicked() {
+                self.notice = None;
+            }
+        }
+        ui.separator();
+
+        if is_vti(&self.path) {
+            egui::CollapsingHeader::new("Volume")
+                .default_open(true)
+                .show(ui, |ui| self.volume_ui(ui));
+        } else {
+            egui::CollapsingHeader::new("Parameters")
+                .default_open(true)
+                .show(ui, |ui| self.params_ui(ui));
+        }
+        egui::CollapsingHeader::new("View")
+            .default_open(true)
+            .show(ui, |ui| self.view_ui(ui));
+        if !self.fields.is_empty() {
+            egui::CollapsingHeader::new("Field overlays")
+                .default_open(true)
+                .show(ui, |ui| self.fields_ui(ui));
+        }
+        egui::CollapsingHeader::new("Output")
+            .default_open(true)
+            .show(ui, |ui| self.output_ui(ui));
+        egui::CollapsingHeader::new("Shape").show(ui, |ui| self.shape_ui(ui));
+        egui::CollapsingHeader::new("Keyboard & mouse").show(ui, |ui| {
+            egui::Grid::new("keys").num_columns(2).striped(true).show(ui, |ui| {
+                for (k, v) in KEYS {
+                    ui.monospace(*k);
+                    ui.label(*v);
+                    ui.end_row();
+                }
+            });
+        });
+    }
+
+    fn params_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.loaded {
+            ui.weak("shown once the shape compiles");
+            return;
+        }
+        if self.params.is_empty() {
+            ui.weak(
+                "This shape has no parameters. Declare one with\n`override SIZE: f32 = 10.0;` to get a slider here.",
+            );
+            return;
+        }
+        ui.spacing_mut().slider_width = 150.0;
+        let params = self.params.clone();
+        egui::Grid::new("params").num_columns(3).show(ui, |ui| {
+            for p in &params {
+                let cur = self.param_value(p);
+                let mut tip = p.note.clone();
+                if !tip.is_empty() {
+                    tip.push('\n');
+                }
+                tip += &format!("default {}", fmt_num(p.default));
+                ui.label(&p.name).on_hover_text(tip);
+                let mut v = cur;
+                let changed = match p.kind {
+                    ParamKind::Bool => {
+                        let mut b = v != 0.0;
+                        let r = ui.checkbox(&mut b, "");
+                        v = b as u8 as f64;
+                        r.changed()
+                    }
+                    kind => {
+                        let (lo, hi) = p.slider_range();
+                        let mut s = egui::Slider::new(&mut v, lo..=hi).clamping(egui::SliderClamping::Never);
+                        if kind != ParamKind::Float {
+                            s = s.integer();
+                        }
+                        let changed = ui.add(s).changed();
+                        if kind == ParamKind::Uint {
+                            v = v.max(0.0);
+                        }
+                        changed
+                    }
+                };
+                if changed && v != cur {
+                    self.set_param(p, v);
+                }
+                if v != p.default {
+                    if ui
+                        .small_button("reset")
+                        .on_hover_text(format!("reset to {}", fmt_num(p.default)))
+                        .clicked()
+                    {
+                        self.set_param(p, p.default);
+                    }
+                } else {
+                    ui.label("");
+                }
+                ui.end_row();
+            }
+        });
+        ui.horizontal(|ui| {
+            let any = !self.defines.is_empty();
+            if ui.add_enabled(any, egui::Button::new("Reset all")).clicked() {
+                self.defines.clear();
+                self.params_dirty = true;
+            }
+            if ui
+                .add_enabled(any, egui::Button::new("Copy -D flags"))
+                .on_hover_text("copy the changed values as command-line flags")
+                .clicked()
+            {
+                ui.ctx().copy_text(define_flags(&self.defines));
+            }
+        });
+    }
+
+    fn volume_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(v) = &self.volume else {
+            ui.weak("shown once the file loads");
+            return;
+        };
+        let names: Vec<String> = v.file.arrays.iter().map(|a| a.name.clone()).collect();
+        let (cur_array, cur_below, cur_blocky, cur_color) = (v.array, v.below, v.blocky, v.color);
+        let (lo, hi) = v.range;
+        let info = format!("{} of {} samples inside", v.inside_count, v.count());
+        let (mut array, mut below, mut blocky, mut color) = (cur_array, cur_below, cur_blocky, cur_color);
+        let mut iso = self.iso_drag.unwrap_or(v.iso);
+        let cur_iso = v.iso;
+
+        egui::ComboBox::from_label("array")
+            .selected_text(&names[array])
+            .show_ui(ui, |ui| {
+                for (i, n) in names.iter().enumerate() {
+                    ui.selectable_value(&mut array, i, n);
+                }
+            })
+            .response
+            .on_hover_text("A");
+        let r = ui
+            .add(
+                egui::Slider::new(&mut iso, lo..=hi)
+                    .text("threshold")
+                    .clamping(egui::SliderClamping::Never),
+            )
+            .on_hover_text("- and = step it; applied when you let go");
+        let commit = r.drag_stopped() || (r.changed() && !r.dragged());
+        self.iso_drag = if r.dragged() { Some(iso) } else { None };
+        ui.horizontal(|ui| {
+            ui.label("inside is");
+            ui.radio_value(&mut below, true, "below");
+            ui.radio_value(&mut below, false, "above");
+        })
+        .response
+        .on_hover_text("I");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut blocky, false, "smooth");
+            ui.radio_value(&mut blocky, true, "blocky");
+        })
+        .response
+        .on_hover_text("M");
+        egui::ComboBox::from_label("colour by")
+            .selected_text(color.map_or("none", |c| names[c].as_str()))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut color, None, "none");
+                for (i, n) in names.iter().enumerate() {
+                    ui.selectable_value(&mut color, Some(i), n);
+                }
+            })
+            .response
+            .on_hover_text("F");
+        ui.weak(info);
+
+        if array != cur_array {
+            return self.edit_volume(true, |v| {
+                v.select(array);
+                v.recompute();
+            });
+        }
+        if commit && iso != cur_iso {
+            self.edit_volume(false, |v| {
+                v.iso = iso;
+                v.recompute();
+            });
+        }
+        if below != cur_below {
+            self.edit_volume(false, |v| {
+                v.below = below;
+                v.recompute();
+            });
+        }
+        if blocky != cur_blocky {
+            self.edit_volume(false, |v| v.blocky = blocky);
+        }
+        if color != cur_color {
+            self.edit_volume(false, |v| {
+                v.color = color;
+                v.update_color();
+            });
+        }
+    }
+
+    fn view_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for (label, key, yaw, pitch) in [
+                ("Front", "1", -90.0, 0.0),
+                ("Side", "2", 0.0, 0.0),
+                ("Top", "3", -90.0, 89.9),
+                ("Iso", "4", -60.0, 28.0),
+            ] {
+                if ui.button(label).on_hover_text(key).clicked() {
+                    self.set_view(yaw, pitch);
+                }
+            }
+            if ui
+                .button("Reset")
+                .on_hover_text("R, or double-click the view")
+                .clicked()
+            {
+                self.reset_camera();
+            }
+        });
+        ui.checkbox(&mut self.opts.section, "Section view").on_hover_text("C");
+        if self.opts.section {
+            let (lo, hi) = self.shape.bounds;
+            ui.add(
+                egui::Slider::new(&mut self.opts.cut, lo[1]..=hi[1])
+                    .text("cut y (mm)")
+                    .clamping(egui::SliderClamping::Never),
+            )
+            .on_hover_text("[ and ] step it");
+        }
+        ui.checkbox(&mut self.opts.clip, "Clip to bounds").on_hover_text("B");
+        ui.checkbox(&mut self.opts.show_bounds, "Show bounds box")
+            .on_hover_text("V");
+        ui.add(
+            egui::Slider::new(&mut self.render_scale, 0.25..=1.0)
+                .text("resolution")
+                .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
+        )
+        .on_hover_text("raymarch fewer pixels for heavy shapes");
+    }
+
+    fn fields_ui(&mut self, ui: &mut egui::Ui) {
+        let before = self.field_mode;
+        let n = self.fields.len();
+        ui.radio_value(&mut self.field_mode, 0, "All").on_hover_text("F cycles");
+        for (i, f) in self.fields.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.radio_value(&mut self.field_mode, i + 1, &f.name)
+                    .on_hover_text(if f.comps == 1 {
+                        "scalar field: tints the surface where it is < 0"
+                    } else {
+                        "vector field: tints where it is non-zero; bands move along it"
+                    });
+                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, 3.0, rgb_gamma(field_color(i)));
+            });
+        }
+        ui.radio_value(&mut self.field_mode, n + 1, "Off");
+        if self.field_mode != before {
+            self.set_field_mask();
+        }
+    }
+
+    fn output_ui(&mut self, ui: &mut egui::Ui) {
+        let (running, ok, cmd, log, took, started) = {
+            let j = self.job.lock().unwrap();
+            (j.running, j.ok, j.cmd.clone(), j.log.clone(), j.took, j.started)
+        };
+        ui.horizontal_wrapped(|ui| {
+            let enabled = !running && self.loaded;
+            for (label, cmd, key, tip) in [
+                ("Export mesh", "export", "E", "mesh to STL/3MF in out/"),
+                ("Slice", "slice", "G", "export and slice to G-code"),
+                ("Open in slicer", "open", "O", "export and open in the slicer GUI"),
+            ] {
+                if ui
+                    .add_enabled(enabled, egui::Button::new(label))
+                    .on_hover_text(format!("{tip} ({key})"))
+                    .clicked()
+                {
+                    self.run_bg(cmd);
+                }
+            }
+        });
+        if !self.defines.is_empty() {
+            ui.weak(format!("uses {}", define_flags(&self.defines)));
+        }
+        if cmd.is_empty() {
+            return;
+        }
+        ui.horizontal(|ui| {
+            if running {
+                ui.spinner();
+                let t = started.map_or(0.0, |s| s.elapsed().as_secs_f32());
+                ui.label(format!("{cmd} running… {t:.1} s"));
+            } else if ok == Some(true) {
+                status_dot(ui, OK_GREEN);
+                ui.label(format!("{cmd} finished in {:.1} s", took.as_secs_f32()));
+            } else {
+                status_dot(ui, ui.visuals().error_fg_color);
+                ui.colored_label(ui.visuals().error_fg_color, format!("{cmd} failed"));
+            }
+        });
+        if !log.is_empty() {
+            egui::ScrollArea::vertical()
+                .max_height(160.0)
+                .stick_to_bottom(true)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(log.trim_end()).monospace().small()).selectable(true));
+                });
+        }
+    }
+
+    fn shape_ui(&mut self, ui: &mut egui::Ui) {
+        let (lo, hi) = self.shape.bounds;
+        let v3 = |v: [f32; 3]| {
+            format!(
+                "{} {} {}",
+                fmt_num(v[0] as f64),
+                fmt_num(v[1] as f64),
+                fmt_num(v[2] as f64)
+            )
+        };
+        egui::Grid::new("shape").num_columns(2).show(ui, |ui| {
+            ui.label("bounds");
+            ui.monospace(format!("{}  →  {}", v3(lo), v3(hi)));
+            ui.end_row();
+            ui.label("size");
+            ui.monospace(format!("{} mm", v3(self.shape.size())));
+            ui.end_row();
+            ui.label("voxel");
+            ui.monospace(format!("{} mm", fmt_num(self.shape.voxel as f64)));
+            ui.end_row();
+            ui.label("step");
+            ui.monospace(fmt_num(self.shape.step() as f64));
+            ui.end_row();
+            if let Some(d) = self.shape.decimate() {
+                ui.label("decimate");
+                ui.monospace(fmt_num(d as f64));
+                ui.end_row();
+            }
+            ui.label("files");
+            let files: Vec<_> = self.shape.files.iter().map(|f| f.display().to_string()).collect();
+            ui.label(files.len().to_string()).on_hover_text(files.join("\n"));
+            ui.end_row();
+        });
+    }
+
+    // ---------------------------------------------------------------------------------- frame
+
+    fn frame(&mut self) {
         let Some(win) = &mut self.win else { return };
+        let ctx = win.egui.clone();
+        let raw = win.egui_state.take_egui_input(&win.window);
+        let tex = win.viewport.id;
+        let mut out = ctx.run_ui(raw, |ui| self.ui(ui, tex));
+        if std::mem::take(&mut self.params_dirty) {
+            self.request_rebuild();
+        }
+        self.poll_rebuild();
+        self.opts.time = self.start.elapsed().as_secs_f32();
+        let Some(win) = &mut self.win else {
+            out.textures_delta.clear();
+            return;
+        };
+        win.egui_state
+            .handle_platform_output(&win.window, std::mem::take(&mut out.platform_output));
+        // egui's texture uploads must be applied (and frees honoured) even if this frame isn't drawn
+        for (id, deltas) in out.textures_delta.set.drain() {
+            for delta in &deltas {
+                win.renderer.update_texture(&win.gpu.device, &win.gpu.queue, id, delta);
+            }
+        }
+        let free: Vec<_> = out.textures_delta.free.drain().collect();
+        let free_all = |r: &mut egui_wgpu::Renderer| free.iter().for_each(|id| r.free_texture(id));
+
+        if win.viewport.size != self.view_px {
+            win.viewport.size = self.view_px;
+            win.viewport.view = Viewport::target(&win.gpu, self.view_px);
+            win.renderer.update_egui_texture_from_wgpu_texture(
+                &win.gpu.device,
+                &win.viewport.view,
+                wgpu::FilterMode::Linear,
+                win.viewport.id,
+            );
+        }
         let frame = match win.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 win.surface.configure(&win.gpu.device, &win.config);
-                return;
+                return free_all(&mut win.renderer);
             }
-            _ => return,
+            _ => return free_all(&mut win.renderer),
         };
-        let size = (win.config.width, win.config.height);
-        self.opts.time = self.start.elapsed().as_secs_f32();
-        let u = uniforms(&self.shape, &self.cam, &self.opts, size, win.gamma);
+        let u = uniforms(&self.shape, &self.cam, &self.opts, win.viewport.size, true);
         win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
+        let preview = draw(&win.gpu, win.pipeline.as_ref(), &win.viewport.view);
+
+        let (device, queue) = (&win.gpu.device, &win.gpu.queue);
+        let jobs = ctx.tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [win.config.width, win.config.height],
+            pixels_per_point: out.pixels_per_point,
+        };
+        let mut enc = device.create_command_encoder(&Default::default());
+        let extra = win.renderer.update_buffers(device, queue, &mut enc, &jobs, &screen);
         let view = frame.texture.create_view(&Default::default());
-        let cmd = match &win.pipeline {
-            Some(p) => draw(&win.gpu, p, &view, None),
-            None => {
-                // nothing compiled yet: dark red screen until the shape loads
-                let mut enc = win.gpu.device.create_command_encoder(&Default::default());
-                enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
+        {
+            let mut pass = enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: 0.3,
-                                g: 0.05,
-                                b: 0.05,
-                                a: 1.0,
-                            }),
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
                     ..Default::default()
-                });
-                enc.finish()
-            }
-        };
-        win.gpu.queue.submit([cmd]);
+                })
+                .forget_lifetime();
+            win.renderer.render(&mut pass, &jobs, &screen);
+        }
+        queue.submit(std::iter::once(preview).chain(extra).chain([enc.finish()]));
         win.window.pre_present_notify();
-        win.gpu.queue.present(frame);
+        queue.present(frame);
+        free_all(&mut win.renderer);
+
         self.frames += 1;
+        let dt = self.fps_t.elapsed().as_secs_f32();
+        if dt >= 0.5 {
+            self.fps = self.frames as f32 / dt;
+            self.frames = 0;
+            self.fps_t = Instant::now();
+        }
     }
 
-    fn update_title(&mut self) {
-        let now = Instant::now();
-        let dt = (now - self.fps_t).as_secs_f32();
-        if dt < 0.5 {
-            return;
-        }
-        let Some(win) = &self.win else { return };
-        let status = if self.error {
-            "ERROR (see terminal)".to_string()
-        } else {
-            format!("{:.0} fps", self.frames as f32 / dt)
-        };
-        let mut flags = vec![];
-        if self.opts.section {
-            flags.push(format!("section y={:.1}", self.opts.cut));
-        }
-        if !self.opts.clip {
-            flags.push("unclipped".into());
-        }
-        if let Some(l) = self.field_label() {
-            flags.push(l);
-        }
-        if let Some(v) = &self.volume {
-            flags.push(v.label());
-        }
-        if self.busy.load(Ordering::SeqCst) {
-            flags.push("working…".into());
-        }
-        let name = self.path.file_name().unwrap_or_default().to_string_lossy();
-        win.window
-            .set_title(&format!("gen3d — {name} — {status} {}", flags.join(" ")));
-        self.frames = 0;
-        self.fps_t = now;
+    fn open_window(&mut self, el: &ActiveEventLoop) -> Result<Window_> {
+        let name = self.path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let attrs = Window::default_attributes()
+            .with_title(format!("gen3d — {name}"))
+            .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 880.0));
+        let window = Arc::new(el.create_window(attrs)?);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
+            el.owned_display_handle(),
+        )));
+        let surface = instance.create_surface(window.clone())?;
+        let gpu = Arc::new(crate::gpu::create(instance, Some(&surface), true)?);
+        let info = gpu.adapter.get_info();
+        self.gpu_name = format!("{} ({:?})", info.name, info.backend);
+        let caps = surface.get_capabilities(&gpu.adapter);
+        // egui blends in gamma space: prefer a non-sRGB swapchain format
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let size = window.inner_size();
+        let mut config = surface
+            .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
+            .ok_or_else(|| anyhow::anyhow!("surface not supported by the GPU adapter"))?;
+        config.format = format;
+        config.present_mode = wgpu::PresentMode::AutoVsync;
+        surface.configure(&gpu.device, &config);
+        let ubuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view"),
+            size: std::mem::size_of::<ViewUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let egui = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            Some(gpu.device.limits().max_texture_dimension_2d as usize),
+        );
+        let mut renderer = egui_wgpu::Renderer::new(&gpu.device, format, Default::default());
+        let view = Viewport::target(&gpu, (1, 1));
+        let id = renderer.register_native_texture(&gpu.device, &view, wgpu::FilterMode::Linear);
+        Ok(Window_ {
+            window,
+            surface,
+            config,
+            gpu,
+            ubuf,
+            module: None,
+            pipeline: None,
+            vol: None,
+            egui,
+            egui_state,
+            renderer,
+            viewport: Viewport { view, size: (1, 1), id },
+        })
     }
 }
 
@@ -1028,53 +1847,9 @@ impl ApplicationHandler for Viewer {
         if self.win.is_some() {
             return;
         }
-        let name = self.path.file_name().unwrap_or_default().to_string_lossy().to_string();
-        let attrs = Window::default_attributes()
-            .with_title(format!("gen3d — {name}"))
-            .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
-        let result = (|| -> Result<Window_> {
-            let window = Arc::new(el.create_window(attrs)?);
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
-                el.owned_display_handle(),
-            )));
-            let surface = instance.create_surface(window.clone())?;
-            let gpu = crate::gpu::create(instance, Some(&surface), true)?;
-            let caps = surface.get_capabilities(&gpu.adapter);
-            // the shader applies its own gamma; prefer a linear (non-sRGB) swapchain format
-            let format = caps
-                .formats
-                .iter()
-                .copied()
-                .find(|f| !f.is_srgb())
-                .unwrap_or(caps.formats[0]);
-            let size = window.inner_size();
-            let mut config = surface
-                .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
-                .ok_or_else(|| anyhow::anyhow!("surface not supported by the GPU adapter"))?;
-            config.format = format;
-            config.present_mode = wgpu::PresentMode::AutoVsync;
-            surface.configure(&gpu.device, &config);
-            let ubuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("view"),
-                size: std::mem::size_of::<ViewUniforms>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            Ok(Window_ {
-                window,
-                surface,
-                config,
-                gamma: !format.is_srgb(),
-                gpu,
-                ubuf,
-                pipeline: None,
-                vol: None,
-            })
-        })();
-        match result {
+        match self.open_window(el) {
             Ok(w) => {
                 self.win = Some(w);
-                println!("{HELP}");
                 self.reload(true);
                 if !self.loaded {
                     self.reset_camera();
@@ -1091,39 +1866,32 @@ impl ApplicationHandler for Viewer {
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(win) = &mut self.win else { return };
+        let _ = win.egui_state.on_window_event(&win.window, &event);
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(size) => {
-                if let Some(win) = &mut self.win {
-                    win.config.width = size.width.max(1);
-                    win.config.height = size.height.max(1);
-                    win.surface.configure(&win.gpu.device, &win.config);
-                }
+                win.config.width = size.width.max(1);
+                win.config.height = size.height.max(1);
+                win.surface.configure(&win.gpu.device, &win.config);
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed && !win.egui.egui_wants_keyboard_input() =>
+            {
                 if let PhysicalKey::Code(code) = event.physical_key {
-                    self.on_key(code, el);
+                    self.on_key(code);
                 }
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                self.drag = (state == ElementState::Pressed).then_some(button);
-            }
-            WindowEvent::CursorMoved { position, .. } => self.on_move(position.x, position.y),
-            WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
-                };
-                self.cam.dist *= 0.9f32.powf(dy);
             }
             WindowEvent::RedrawRequested => {
-                self.render();
-                self.update_title();
+                self.frame();
                 if let Some(w) = &self.win {
                     w.window.request_redraw();
                 }
             }
             _ => {}
+        }
+        if self.quit {
+            el.exit();
         }
     }
 
@@ -1148,15 +1916,24 @@ pub fn view(path: &Path, defines: Vec<(String, f64)>, vopts: VolumeOpts) -> Resu
     let mut app = Viewer {
         shape: Shape::placeholder(&path),
         fields: vec![],
+        params: vec![],
         field_mode: 0,
         start: Instant::now(),
         path,
         defines,
         vopts,
         volume: None,
+        iso_drag: None,
         loaded: false,
+        loaded_at: String::new(),
         mtimes: HashMap::new(),
-        error: false,
+        error: None,
+        param_error: None,
+        notice: None,
+        params_dirty: false,
+        rebuild: None,
+        rebuild_again: false,
+        rebuild_gen: 0,
         cam: Camera {
             yaw: 0.0,
             pitch: 0.0,
@@ -1171,12 +1948,15 @@ pub fn view(path: &Path, defines: Vec<(String, f64)>, vopts: VolumeOpts) -> Resu
             fields: 0,
             time: 0.0,
         },
-        drag: None,
-        cursor: (0.0, 0.0),
-        busy: Arc::new(AtomicBool::new(false)),
+        render_scale: 1.0,
+        view_px: (1, 1),
+        job: Arc::new(Mutex::new(Job::default())),
+        gpu_name: String::new(),
+        quit: false,
         win: None,
         last_poll: Instant::now(),
         frames: 0,
+        fps: 0.0,
         fps_t: Instant::now(),
     };
     event_loop.run_app(&mut app)?;

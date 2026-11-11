@@ -11,6 +11,9 @@ base64 = "0.23.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.7", features = ["derive"] }
+egui = { version = "0.37", features = ["default_fonts"] }
+egui-wgpu = { version = "0.37", default-features = false }
+egui-winit = "0.37"
 flate2 = "1.1.11"
 meshopt = "0.7.0"
 naga = { version = "30.0.1", features = ["wgsl-in"] }

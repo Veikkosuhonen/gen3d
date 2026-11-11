@@ -57,6 +57,7 @@ Directives (`//! key value`, anywhere in the main file):
 | `step 0.6` | raymarch step factor for the viewer; lower it if a non-exact SDF (twist, noise, displacement) shows holes or artifacts |
 | `decimate 0.5` | keep this fraction of triangles after meshing |
 | `slicer ../printers/x.ini` | slicer config(s) for this shape |
+| `range NAME min max` | slider range for parameter `NAME` in the viewer (one line per parameter) |
 
 `#include "file.wgsl"` resolves relative to the shape first, then the built-in library (compiled into the
 binary). Each file is included once. Shapes are validated with [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga)
@@ -65,7 +66,12 @@ and errors are reported as `yourfile.wgsl:LINE:COL` with the offending line.
 **Parameters** are WGSL [pipeline-overridable constants](https://www.w3.org/TR/WGSL/#override-decls):
 declare `override NAME: f32 = default;` and set it with `-D NAME=VALUE` on any command. Values are applied
 when the pipeline is created, so changing them never edits the source. An unknown `-D` name is an error
-that lists the shape's parameters.
+that lists the shape's parameters (the viewer warns and ignores it instead).
+
+In the viewer every parameter gets a slider (a checkbox for `bool`). A trailing `// comment` on the
+declaration becomes its tooltip. The slider covers 0 to twice the default unless you give it a range
+with `//! range NAME min max`; you can still type any value into the number box. Export, slice and open
+from the viewer use the values on screen, and **Copy -D flags** puts them on the clipboard for the CLI.
 
 ### Library (`src/wgsl/sdf.wgsl`)
 
@@ -94,11 +100,26 @@ Distance functions are mostly from [Inigo Quilez](https://iquilezles.org/article
 | `max(v, 0.0)` on a vector | `max(v, vec3f(0.0))` |
 | `c ? a : b` | `select(b, a, c)` |
 
-## Viewer controls
+## Viewer
+
+`gen3d view` opens the preview with a sidebar ([egui](https://github.com/emilk/egui), drawn with the same
+wgpu device as the raymarcher):
+
+- **Parameters:** sliders for the shape's `override` constants (see above). A change rebuilds only the
+  pipeline, on a background thread, so dragging stays smooth while the preview catches up.
+- **View:** camera presets, section view and cut plane, clip to bounds, bounds box, and a resolution
+  slider that raymarches fewer pixels for heavy shapes.
+- **Field overlays:** pick which `field_*` regions to tint, with their colours.
+- **Volume** (for `.vti` files): array, threshold, inside below/above, smooth/blocky, colour by.
+- **Output:** export, slice and open in the slicer, with the job's progress and log.
+- **Errors** appear in a panel under the view (also printed to the terminal); the last version that
+  compiled stays on screen until you fix the file.
+
+The keyboard shortcuts work whenever no text field has focus:
 
 | | |
 |---|---|
-| left drag / right drag / wheel | orbit / pan / zoom |
+| left drag / right drag / wheel | orbit / pan / zoom (double-click resets the camera) |
 | `1` `2` `3` `4` | front / side / top / iso view |
 | `C`, `[` `]` | toggle cross-section, move the cut plane (the section face shows internal distance bands) |
 | `B` / `V` | toggle clipping to export bounds / bounds box |
@@ -247,6 +268,6 @@ cargo clippy --all-targets
 | `src/mesher.rs` | compute-shader sampling harness, grid padding, polygonize + report |
 | `src/mc.rs` | marching cubes with a generated crack-free case table |
 | `src/mesh.rs` | volume / watertight / bodies, decimation, STL/3MF/OBJ/PLY writers |
-| `src/viewer.rs` | raymarching preview harness, winit window, headless PNG render |
+| `src/viewer.rs` | raymarching preview harness, viewer window and egui sidebar, headless PNG render |
 | `src/slicer.rs` | PrusaSlicer / OrcaSlicer discovery and CLI driving |
 | `src/wgsl/sdf.wgsl` | the SDF library |

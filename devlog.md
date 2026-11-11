@@ -3,6 +3,53 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: egui sidebar for the viewer
+
+**What:** the viewer gets a real UI instead of keys plus the window title. A left sidebar has
+parameters, view options, field overlays, the `.vti` volume controls, output jobs, shape info and a key
+reference. Shader errors show in a panel under the view. All keyboard shortcuts still work.
+
+- **Parameter sliders:** `Shape::params()` reads each `override` with naga: its name, type
+  (f32/i32/u32/bool) and default (a literal, possibly negated). A trailing `// comment` becomes the
+  tooltip. The new directive `//! range NAME min max` sets the slider range; otherwise it's 0..2×default.
+  The viewer keeps only values that differ from the defaults, as `-D` pairs, so export file names and
+  **Copy -D flags** stay clean. An unknown `-D` in the viewer is now a dismissible warning, not a dead end.
+- **Cheap rebuilds:** `build_pipeline` is split from `preview_module`, so a parameter change reuses the
+  validated shader module and only recreates the pipeline with new constants. That still costs ~75 ms of
+  driver compile (bracket_domain on an RTX 3080), so it runs on a worker thread (`Gpu` is now in an
+  `Arc`). Changes made meanwhile collapse into one follow-up build, and a generation counter drops
+  builds made stale by a reload. A failed build for a parameter value is reported separately from
+  source errors, so it can't hide one.
+- **Rendering:** the raymarch goes into an offscreen `Rgba8Unorm` texture sized to the central panel
+  (times a resolution slider), registered with `egui_wgpu::Renderer` as a native texture. egui samples
+  textures as gamma-encoded, so the shader's own gamma is applied, as for `render`. Camera input comes
+  from the egui response (drag, wheel, double-click to reset).
+- **Jobs:** export/slice/open still re-run the binary. Its stdout and stderr are now captured (ANSI
+  stripped, `\r` progress collapsed), shown in the Output section with a spinner, status and timing,
+  and still echoed to the terminal.
+
+**Why egui and not gpui:** gpui (0.2.2) renders through its own blade/Vulkan layer on Linux. Its
+`surface` element is macOS-only, so our wgpu raymarch could only reach it via a GPU→CPU→GPU copy every
+frame. egui-wgpu 0.37 is on wgpu 30 and egui-winit on winit 0.30, the same versions we use, so it shares
+our device and plugs into the existing `ApplicationHandler`.
+
+**Gotchas:** egui 0.37 renamed things (`Context::run_ui`, `Panel::left`, `show` instead of
+`show_inside`). Fonts are behind the `default_fonts` feature (without it every glyph is a box). A dropped
+`TexturesDelta` panics in debug builds, so texture uploads are applied before any early return. Symbols
+like ● ⟳ ↺ ✔ aren't in the default fonts, so status dots are painted and buttons use words. Sizing
+sliders from `available_width()` inside a resizable panel feeds back and grows the panel each frame.
+
+**Verified:** clippy clean; 7 tests pass, including a new one for `params()` (types, negative default,
+note, range, slider range). By screenshot on the RTX 3080: knob, bracket_domain (fields + unknown `-D`
+warning), a broken shape (error panel, dark red view, disabled export) and a 0.2M-sample `.vti` (Volume
+panel, colour by `keep`), all at 165 fps. `render` still writes PNGs.
+
+**Open:** slider dragging, the threshold slider and the Output buttons weren't exercised by hand. KDE
+asks for permission before synthetic input, so they need a manual try. The `.vti` threshold slider
+applies on release because the CPU recompute can take a second on big grids. Making parameters uniforms
+instead of override constants would make dragging instant, but overrides can size arrays, so that needs
+a naga-level rewrite.
+
 ## 2026-11-12: View and mesh .vti grids
 
 **What:** `view`, `render`, `export`, `slice`, `open` and `check` accept `.vti` files. The goal is to
