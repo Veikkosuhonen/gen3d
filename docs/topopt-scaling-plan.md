@@ -17,6 +17,10 @@ elements on a 10 GB GPU), with the live preview still working.
 Measured on `bracket_domain` at 1.3 mm (62×19×31, 34k domain elements): **~1000 CG iterations and
 ~1.9 s per optimizer iteration**, about 2 ms per mat-vec. Almost all of the time is the solve.
 
+**Status (2026-11-13):** steps 1–3 are done (see the devlog). CPU MGCG needs 8–12 CG iterations per
+solve from 34k to 1.2M elements, against ~1000–1300 for Jacobi, and gives the same designs. At 1.2M
+elements an iteration takes 7.7 s instead of 76 s. Next is step 4.
+
 ## Why the solver comes before the hardware
 
 - **Jacobi CG doesn't scale.** Its iteration count grows roughly with resolution (and with the 1e6

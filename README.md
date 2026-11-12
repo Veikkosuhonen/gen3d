@@ -391,14 +391,16 @@ watch the design form; **Stop** ends the run and keeps the last iteration.
   0.5 then matches `--volfrac` closely. The cost is about 1.7× the iterations. Because each voxel is now
   fully in or out, the threshold surface follows the voxel staircase; a finer `--voxel` gives a smoother
   part. `--no-projection` gives the faster, softer-edged grey result.
-- **Speed:** the solver is matrix-free conjugate gradient with a Jacobi preconditioner, multithreaded and
-  warm-started. The default voxel keeps the bounds at about 40k elements. On 12 cores, the bracket
-  (34k domain elements) takes about 1–2 s per iteration: 49 iterations and 77 s with projection, 29
-  iterations and 52 s without. Time grows quickly with resolution: halving the voxel is 8× the elements
-  and more solver iterations.
-- **Shortcuts in this first version:**
-  - No multigrid, so fine grids are slow.
-  - One load case.
+- **Speed:** each iteration solves the stiffness system with conjugate gradient preconditioned by
+  geometric multigrid (a V-cycle with Chebyshev smoothing and Galerkin coarse levels; the fine level
+  is matrix-free), multithreaded and warm-started. Solves are looser while the design still moves a
+  lot and reach full accuracy at the final β. CG needs about 8–12 iterations per solve at any grid
+  size. The default voxel keeps the bounds at about 40k elements. On 12 cores the bracket (34k domain
+  elements) runs 50 iterations in 8 s. At 0.4 mm (1.2M domain elements) an iteration takes about
+  7.5 s, against 76 s with the old Jacobi-preconditioned CG (`--solver jacobi`, still available).
+  Grids up to 8M elements are allowed (~1.2 kB of memory per element).
+- **Shortcuts in this version:**
+  - CPU only; a GPU solver is in progress (see `docs/topopt-scaling-plan.md`).
   - No symmetry or overhang (printability) constraints.
 
 ## Mesh quality notes
@@ -419,7 +421,14 @@ watch the design form; **Stop** ends the run and keeps the last iteration.
 cargo test            # marching-cubes table and watertightness, shape loading / error mapping
 cargo clippy --all-targets
 gen3d snapshot shapes/bracket_domain.wgsl --step optimize -o out/ui.png   # the app's window, offscreen
+gen3d bench-topopt [--voxels 1.3,0.8,0.5,0.4] [--iters 5] [--solver mg|jacobi]  # optimizer timing table
 ```
+
+`bench-topopt` (hidden) runs `optimize` on the bracket at several element sizes and prints the mean
+time per iteration, split into preconditioner setup, solve, update (filter + OC) and file output, with
+CG iterations per solve. `optimize` prints the same split on each iteration line. Hidden solver flags
+for experiments: `--smoother chebyshev|jacobi`, `--sweeps`, `--omega`, `--emin`, `--cg-tol`,
+`--fixed-cg-tol`.
 
 `snapshot` draws the app's window into a PNG without opening one (same GPU path), to check the UI
 headlessly. It can open a step (`--step`), the optimized result in Print (`--result`), the Open
@@ -441,5 +450,6 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/slicer.rs` | PrusaSlicer / OrcaSlicer discovery and CLI driving, G-code summary, profiles, opening files |
 | `src/vti.rs` | VTK ImageData reader and writers |
 | `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing |
-| `src/topopt.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
+| `src/topopt/mod.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
+| `src/topopt/mg.rs` | multigrid preconditioner: Galerkin coarse levels, Chebyshev/Jacobi smoothers, banded Cholesky |
 | `src/wgsl/sdf.wgsl` | the SDF library |

@@ -3,6 +3,73 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: Multigrid CG for topology optimization (scaling plan steps 1–3)
+
+**What:** `optimize` now solves K u = f with multigrid-preconditioned CG (MGCG) on the CPU, as the
+reference for the GPU port in `docs/topopt-scaling-plan.md`. Each iteration line shows its time split
+into preconditioner setup, solve, update (filter + OC) and file output. A hidden `bench-topopt` runs the
+bracket at 4 element sizes and prints a table.
+
+**How (`src/topopt/mg.rs`):**
+- The grid coarsens 2× per level; odd sizes round up, so no padding is needed. With trilinear
+  interpolation each fine element lies inside one coarse element, so the Galerkin operator Pᵀ K P is
+  again a sum of 24×24 element matrices (K_E = Σ P_cᵀ K_c P_c over the 8 children).
+- Clamped DOFs are masked out of the fine element matrices before coarsening (D K D), so the coarse
+  levels are exact Galerkin projections of the constrained system. A test checks two levels against an
+  explicit P, K, Pᵀ product.
+- The fine level is matrix-free; coarse levels store element matrices (the CPU's ~1.2 kB/element is
+  mostly level 1, which the GPU version will compute on the fly instead).
+- Smoother: Chebyshev degree 2 on [0.1, 1.1]·λmax(D⁻¹K), with λmax from 12 power iterations per level.
+  Damped Jacobi is the alternative (`--smoother jacobi`); it needs ~35% more CG iterations.
+- Coarsest level: banded Cholesky. Coarsening continues until it costs under 2e7 flops.
+- E_min is now 1e-9 (1e-6 was a concession to Jacobi). `--solver jacobi` keeps the old path.
+
+Step 3 changes that carry over to the GPU:
+- **OC:** `dc` is normalized by the compliance and λ is bracketed around the previous iteration's
+  value. That's 17–19 volume evaluations instead of ~45, so the update is 3× faster.
+- **Adaptive CG tolerance:** 0.05 × the last density change, clamped to [1e-4, 1e-2]; 1e-4 in the
+  final β stage. This halves the CG iterations.
+- One hierarchy per iteration, shared by the load cases. There's a warning when CG hits its limit.
+- `.vti` writes are throttled to stay under ~10% of the run time, and the last iteration is always
+  written.
+- With multigrid the element cap goes up to 8M.
+
+**Measured** (bracket, 12 cores; mean of the first 2 iterations, same settings both ways):
+
+| voxel | domain elements | Jacobi CG its/solve | MG CG its/solve | Jacobi s/iter | MG s/iter |
+|---|---|---|---|---|---|
+| 1.3 | 34k | 1046 | 8.0 | 1.9 | 0.19 |
+| 0.8 | 148k | 643 | 8.5 | 4.2 | 0.86 |
+| 0.5 | 607k | 1179 | 9.0 | 34.5 | 3.4 |
+| 0.4 | 1.19M | 1285 | 11.5 | 75.7 | 7.7 |
+
+At 1.2M elements, MG's time goes 1.3 s to setup, 5.0 s to the solve and 1.4 s to the update. Nearly all
+of the solve is fine-level mat-vecs (~5 per CG iteration). Following the plan, those aren't tuned on
+the CPU.
+
+**Verified:**
+- Full bracket run at 1.3 mm: Jacobi 90.6 s; MG with the same E_min, 16.9 s; MG with E_min 1e-9, 14.9 s.
+  All three take 48 iterations and end at compliance 8.965, with no solid/void flips between the
+  designs. With the OC bracket and adaptive tolerance the run takes 7.9 s and 50 iterations, ends at
+  8.9635, and 19 of 13k solid elements flip.
+- `--no-projection`: 10.356, as before, in 3.8 s (was 52 s).
+- `bracket_editor` (2 load cases): MG ends at 13.289 and Jacobi at 13.253. A Jacobi run at CG tolerance
+  1e-7 also gives 13.289 in 48 iterations. So the difference was the old solver's error at its 1e-4
+  tolerance steering the design. MG at 1e-4 matches the accurate Jacobi design with 0 solid/void
+  flips; old Jacobi at 1e-4 differs from it by 60.
+- Tests: restriction = prolongationᵀ, Galerkin = explicit product on two levels, the Cholesky solves
+  its level, and MGCG reaches the Jacobi-CG solution (40 vs 419 iterations on a strut-in-void design
+  at 1e-9 contrast). An unphysical per-element checkerboard contrast does badly (163 iterations); real
+  designs don't look like that. 29 tests pass; clippy is clean.
+
+**Open / next:** step 4, the wgpu port. Planned shape:
+- fine level matrix-free;
+- level 1 computed on the fly from the fine `ee` and 8 precomputed Pᵀ ke P matrices (per child
+  position and clamped-node mask), so it stores nothing per element;
+- levels ≥ 2 as assembled f32 element matrices;
+- the coarsest level as a dense inverse applied on the GPU, so nothing round-trips inside a V-cycle;
+- CG scalars kept on the GPU, with the residual read back every few iterations.
+
 ## 2026-11-12: New shapes start empty
 
 **What:** the app's **New shape** writes an empty `.wgsl` and opens it, without starting the external

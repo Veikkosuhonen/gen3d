@@ -10,10 +10,11 @@
 //! Load cases: loads in one case act together; separate cases are separate situations. The
 //! objective is the sum of the cases' compliances (each solved separately).
 //!
-//! Each iteration solves K(ρ) u = f with a matrix-free, Jacobi-preconditioned conjugate gradient
-//! (multithreaded, warm-started), computes the compliance sensitivities, applies a density filter
-//! and updates the densities with the optimality-criteria method under a volume constraint. The
-//! current design is written to a .vti after every iteration, so `gen3d view` can watch it live.
+//! Each iteration solves K(ρ) u = f with a conjugate gradient (multithreaded, warm-started,
+//! matrix-free on the fine grid) preconditioned by a geometric multigrid V-cycle (`mg`), or by
+//! Jacobi. It then computes the compliance sensitivities, applies a density filter and updates the
+//! densities with the optimality-criteria method under a volume constraint. The current design is
+//! written to a .vti as it runs, so `gen3d view` can watch it live.
 //!
 //! Units: mm, N, MPa. With the default PLA-like modulus the displacements are real millimetres.
 
@@ -29,6 +30,17 @@ use rayon::prelude::*;
 use crate::gpu::Gpu;
 use crate::mesher::{Grid, sample_field};
 use crate::shape::Shape;
+
+pub mod mg;
+
+/// Linear solver for K u = f.
+#[derive(Clone, Copy, Debug)]
+pub enum Solver {
+    /// Jacobi-preconditioned CG
+    Jacobi,
+    /// multigrid-preconditioned CG
+    Multigrid(mg::MgSettings),
+}
 
 pub struct Settings {
     /// element size (mm)
@@ -50,6 +62,24 @@ pub struct Settings {
     /// Heaviside projection: final sharpness β (0 = no projection). β starts at 1 and doubles each
     /// time the design converges, up to this.
     pub beta_max: f64,
+    pub solver: Solver,
+    /// stiffness of empty elements, relative to `e0`
+    pub emin: f64,
+    /// relative residual at which CG stops (in the final projection stage)
+    pub cg_tol: f64,
+    /// solve less accurately while the design is still moving a lot: tolerance 0.05 × the last
+    /// density change, between `cg_tol` and 1e-2, and `cg_tol` once β reaches its final value
+    pub adaptive_tol: bool,
+}
+
+impl Settings {
+    /// The usual E_min for a solver: multigrid copes with the 1e9 stiffness contrast, Jacobi doesn't.
+    pub fn default_emin(solver: &Solver) -> f64 {
+        match solver {
+            Solver::Jacobi => 1e-6,
+            Solver::Multigrid(_) => 1e-9,
+        }
+    }
 }
 
 /// A discretized problem. Elements and nodes are indexed x-fastest.
@@ -155,8 +185,13 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     let n = [0, 1, 2].map(|k| ((hi[k] - lo[k]) as f64 / h).ceil().max(1.0) as usize);
     let origin = lo.map(|v| v as f64);
     let ne: usize = n.iter().product();
-    if ne > 3_000_000 {
-        bail!("{ne} elements is too many for this solver; use a larger --voxel");
+    // the CPU multigrid needs ~1.2 kB per element (mostly the level-1 element matrices)
+    let max = match s.solver {
+        Solver::Jacobi => 3_000_000,
+        Solver::Multigrid(_) => 8_000_000,
+    };
+    if ne > max {
+        bail!("{ne} elements is too many for this solver (at most {max}); use a larger --voxel");
     }
     let cells = Grid {
         vol: vec![],
@@ -404,10 +439,17 @@ impl Fem<'_> {
             .collect()
     }
 
-    /// Jacobi-preconditioned conjugate gradient, starting from `u`. Returns the iteration count.
-    fn solve(&self, f: &[f64], u: &mut [f64], tol: f64, maxit: usize) -> usize {
+    /// Preconditioned conjugate gradient, starting from `u`. `precond(r, z)` sets z = M⁻¹ r and must
+    /// keep z zero on non-free DOFs. Returns the iteration count.
+    fn solve(
+        &self,
+        f: &[f64],
+        u: &mut [f64],
+        tol: f64,
+        maxit: usize,
+        precond: &mut dyn FnMut(&[f64], &mut [f64]),
+    ) -> usize {
         let dot = |a: &[f64], b: &[f64]| a.par_iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
-        let inv = self.inv_diag();
         for (i, v) in u.iter_mut().enumerate() {
             if !self.free[i / 3] {
                 *v = 0.0;
@@ -422,18 +464,22 @@ impl Fem<'_> {
         let mut q = vec![0.0; u.len()];
         self.matvec(u, &mut q);
         let mut r: Vec<f64> = fm.iter().zip(&q).map(|(a, b)| a - b).collect();
-        let mut z: Vec<f64> = r.iter().zip(&inv).map(|(a, b)| a * b).collect();
+        if dot(&r, &r).sqrt() <= tol * fnorm {
+            return 0;
+        }
+        let mut z = vec![0.0; u.len()];
+        precond(&r, &mut z);
         let mut p = z.clone();
         let mut rz = dot(&r, &z);
-        for it in 0..maxit {
-            if dot(&r, &r).sqrt() <= tol * fnorm {
-                return it;
-            }
+        for it in 1..=maxit {
             self.matvec(&p, &mut q);
             let alpha = rz / dot(&p, &q);
             u.par_iter_mut().zip(&p).for_each(|(x, y)| *x += alpha * y);
             r.par_iter_mut().zip(&q).for_each(|(x, y)| *x -= alpha * y);
-            z.par_iter_mut().zip(&r).zip(&inv).for_each(|((z, r), d)| *z = r * d);
+            if dot(&r, &r).sqrt() <= tol * fnorm {
+                return it;
+            }
+            precond(&r, &mut z);
             let rz_new = dot(&r, &z);
             let beta = rz_new / rz;
             rz = rz_new;
@@ -587,14 +633,41 @@ impl Projection {
     }
 }
 
+/// Timings (s) and solver work of one optimizer iteration.
+#[derive(Clone, Debug, Default)]
+pub struct IterStats {
+    /// building the preconditioner (multigrid hierarchy or Jacobi diagonal)
+    pub setup: f64,
+    /// CG solves and element energies, all load cases
+    pub solve: f64,
+    /// sensitivities, filter, projection and the OC update
+    pub update: f64,
+    /// writing the .vti
+    pub io: f64,
+    /// CG iterations per load case
+    pub cg: Vec<usize>,
+    /// volume evaluations (filter + projection) in the OC update
+    pub oc_steps: usize,
+    /// CG tolerance used
+    pub cg_tol: f64,
+    pub compliance: f64,
+}
+
 pub struct Outcome {
     pub iterations: usize,
     pub compliance: f64,
     pub max_disp: f64,
+    pub stats: Vec<IterStats>,
 }
 
+const CG_MAXIT: usize = 20_000;
+
+/// z = M⁻¹ r
+type Precond<'a> = dyn FnMut(&[f64], &mut [f64]) + 'a;
+
 /// Run the optimization, writing the design to `out` (cell `density`, cell `energy` in MPa, point
-/// `displacement` in mm) after every iteration.
+/// `displacement` in mm). The file is rewritten as often as keeps writing under ~10% of the run
+/// time (every iteration on small grids), and always after the last iteration.
 pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
     let ke = hex_ke(s.nu);
     let ne = p.domain.len();
@@ -605,7 +678,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
     let active = p.active_nodes();
     let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
     let fs: Vec<Vec<f64>> = p.loads.iter().map(|l| l.iter().flatten().copied().collect()).collect();
-    let emin = s.e0 * 1e-6;
+    let emin = s.e0 * s.emin;
     let filter = Filter::new(p, s.rmin);
     let mut proj = Projection {
         beta: if s.beta_max > 0.0 { 1.0 } else { 0.0 },
@@ -633,6 +706,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
         iterations: 0,
         compliance: 0.0,
         max_disp: 0.0,
+        stats: vec![],
     };
     println!(
         "SIMP: volume fraction {}, penalty {}, filter radius {} voxels, E = {} MPa, nu = {}, {} load case{}, {}",
@@ -653,8 +727,15 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
             "no projection".into()
         }
     );
+    // the last iteration's output, until it is written
+    let mut pending: Option<Snapshot> = None;
+    let mut last_write: Option<(Instant, f64)> = None;
+    // OC's Lagrange multiplier, for the next iteration's bracket
+    let mut lambda = 1.0;
+    let mut last_change = 1.0f64;
     for it in 1..=s.iters {
         let t0 = Instant::now();
+        let mut st = IterStats::default();
         let fem = Fem {
             p,
             ke: &ke,
@@ -669,16 +750,56 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
                 .collect(),
             free: free.clone(),
         };
+        // one preconditioner, shared by the load cases
+        let mut precond: Box<Precond> = match &s.solver {
+            Solver::Jacobi => {
+                let inv = fem.inv_diag();
+                Box::new(move |r: &[f64], z: &mut [f64]| {
+                    z.par_iter_mut().zip(r).zip(&inv).for_each(|((z, r), d)| *z = r * d)
+                })
+            }
+            Solver::Multigrid(ms) => {
+                let mut m = mg::Multigrid::new(&fem, ms);
+                if it == 1 {
+                    let c = m.coarsest();
+                    println!(
+                        "multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
+                        m.levels(),
+                        c[0],
+                        c[1],
+                        c[2],
+                        ms.smoother
+                    );
+                }
+                Box::new(move |r: &[f64], z: &mut [f64]| m.precondition(r, z))
+            }
+        };
+        st.setup = t0.elapsed().as_secs_f64();
         // each load case separately; the objective is their summed compliance
-        let mut cg = 0;
+        let t1 = Instant::now();
         let mut ce = vec![0.0; ne];
+        let final_stage = proj.beta > 0.0 && proj.beta >= s.beta_max;
+        let tol = if !s.adaptive_tol || final_stage {
+            s.cg_tol
+        } else {
+            (0.05 * last_change).clamp(s.cg_tol, 1e-2)
+        };
+        st.cg_tol = tol;
         for (f, u) in fs.iter().zip(us.iter_mut()) {
-            cg += fem.solve(f, u, 1e-4, 20_000);
+            let n = fem.solve(f, u, tol, CG_MAXIT, &mut *precond);
+            if n >= CG_MAXIT {
+                println!("warning: CG did not converge in {CG_MAXIT} iterations");
+            }
+            st.cg.push(n);
             for (a, b) in ce.iter_mut().zip(fem.element_energy(u)) {
                 *a += b;
             }
         }
+        drop(precond);
+        st.solve = t1.elapsed().as_secs_f64();
+        let t2 = Instant::now();
         let compliance: f64 = (0..ne).map(|e| fem.ee[e] * ce[e]).sum();
+        st.compliance = compliance;
         let dc: Vec<f64> = (0..ne)
             .map(|e| {
                 if p.domain[e] && !p.passive[e] {
@@ -695,25 +816,50 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
         let dv = filter.sensitivities(p, &dproj);
         let used_xphys = xphys.clone();
 
-        // optimality criteria: bisect the Lagrange multiplier to meet the volume
+        // optimality criteria: bisect the Lagrange multiplier to meet the volume. With dc scaled by
+        // the compliance, λ is O(1) and moves little between iterations, so the search starts from
+        // a bracket around the previous λ.
         let target = s.volfrac * design.len() as f64;
-        let (mut l1, mut l2, mv) = (0.0f64, 1e9f64, 0.2);
+        let mv = 0.2;
         let mut xnew = x.clone();
-        while (l2 - l1) / (l1 + l2).max(1e-300) > 1e-4 && l2 > 1e-40 {
-            let lmid = 0.5 * (l1 + l2);
+        let cscale = 1.0 / compliance.abs().max(1e-300);
+        let mut volume_at = |lam: f64, xnew: &mut Vec<f64>| {
+            st.oc_steps += 1;
             for &e in &design {
-                let be = (-dc[e]).max(0.0) / (dv[e] * lmid).max(1e-300);
+                let be = (-dc[e] * cscale).max(0.0) / (dv[e] * lam).max(1e-300);
                 xnew[e] = (x[e] * be.sqrt()).clamp((x[e] - mv).max(0.0), (x[e] + mv).min(1.0));
             }
-            let trial = proj.densities(p, &filter.densities(p, &xnew));
-            let vol: f64 = design.iter().map(|&e| trial[e]).sum();
-            if vol > target {
+            let trial = proj.densities(p, &filter.densities(p, xnew));
+            design.iter().map(|&e| trial[e]).sum::<f64>()
+        };
+        // volume falls as λ grows: find l1 < l2 with vol(l1) > target >= vol(l2)
+        let (mut l1, mut l2) = (lambda / 2.0, lambda * 2.0);
+        for _ in 0..60 {
+            if volume_at(l1, &mut xnew) > target {
+                break;
+            }
+            l2 = l1;
+            l1 /= 8.0;
+        }
+        for _ in 0..60 {
+            if volume_at(l2, &mut xnew) <= target {
+                break;
+            }
+            l1 = l2;
+            l2 *= 8.0;
+        }
+        while (l2 - l1) / (l1 + l2) > 1e-4 {
+            let lmid = 0.5 * (l1 + l2);
+            if volume_at(lmid, &mut xnew) > target {
                 l1 = lmid;
             } else {
                 l2 = lmid;
             }
         }
+        lambda = 0.5 * (l1 + l2);
+        volume_at(lambda, &mut xnew);
         let change = design.iter().map(|&e| (xnew[e] - x[e]).abs()).fold(0.0, f64::max);
+        last_change = change;
         xtilde = filter.densities(p, &xnew);
         xphys = proj.densities(p, &xtilde);
         x = xnew;
@@ -728,64 +874,44 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
             .filter(|&&e| used_xphys[e] > 0.1 && used_xphys[e] < 0.9)
             .count() as f64
             / design.len() as f64;
+        st.update = t2.elapsed().as_secs_f64();
+
+        // the densities this solve used, with their energy density and displacements
+        let t3 = Instant::now();
+        pending = Some(Snapshot {
+            density: used_xphys.iter().map(|&v| v as f32).collect(),
+            energy: (0..ne)
+                .map(|e| (0.5 * fem.ee[e] * ce[e] / p.h.powi(3)) as f32)
+                .collect(),
+            disps: us.iter().map(|u| u.iter().map(|&v| v as f32).collect()).collect(),
+            iteration: it,
+        });
+        // keep writing under ~10% of the time
+        let due = last_write.is_none_or(|(t, dur)| t.elapsed().as_secs_f64() >= 10.0 * dur);
+        if due {
+            let bytes = pending.take().unwrap().write(p, out)?;
+            last_write = Some((Instant::now(), t3.elapsed().as_secs_f64()));
+            if it == 1 {
+                println!("wrote {} ({:.1} MB, updated as it runs)", out.display(), bytes as f64 / 1e6);
+            }
+        }
+        st.io = t3.elapsed().as_secs_f64();
+
         let beta = if proj.beta > 0.0 {
             format!(", beta {}", proj.beta)
         } else {
             String::new()
         };
         println!(
-            "it {it:3}: compliance {compliance:.4e} N·mm, max displacement {max_disp:.4} mm, change {change:.3}, grey {:.0}%{beta}, {cg} CG its, {:.1} s",
+            "it {it:3}: compliance {compliance:.4e} N·mm, max displacement {max_disp:.4} mm, change {change:.3}, grey {:.0}%{beta}, {} CG its, {:.1} s [setup {:.2} solve {:.2} update {:.2} io {:.2}]",
             grey * 100.0,
-            t0.elapsed().as_secs_f64()
+            st.cg.iter().sum::<usize>(),
+            t0.elapsed().as_secs_f64(),
+            st.setup,
+            st.solve,
+            st.update,
+            st.io,
         );
-        // the densities this solve used, with their energy density and displacements
-        let density: Vec<f32> = used_xphys.iter().map(|&v| v as f32).collect();
-        let energy: Vec<f32> = (0..ne)
-            .map(|e| (0.5 * fem.ee[e] * ce[e] / p.h.powi(3)) as f32)
-            .collect();
-        let disps: Vec<Vec<f32>> = us.iter().map(|u| u.iter().map(|&v| v as f32).collect()).collect();
-        let names: Vec<String> = p
-            .cases
-            .iter()
-            .enumerate()
-            .map(|(k, c)| {
-                if k == 0 {
-                    "displacement".to_string()
-                } else {
-                    format!("displacement_{c}")
-                }
-            })
-            .collect();
-        let mut arrays = vec![
-            crate::vti::GridArray {
-                name: "density",
-                cell: true,
-                comps: 1,
-                data: &density,
-            },
-            crate::vti::GridArray {
-                name: "energy",
-                cell: true,
-                comps: 1,
-                data: &energy,
-            },
-        ];
-        for (name, data) in names.iter().zip(&disps) {
-            arrays.push(crate::vti::GridArray {
-                name,
-                cell: false,
-                comps: 3,
-                data,
-            });
-        }
-        let bytes = crate::vti::write_grid(out, p.origin, p.h, p.nodes(), &arrays)?;
-        if it == 1 {
-            println!(
-                "wrote {} ({:.1} MB, updated every iteration)",
-                out.display(),
-                bytes as f64 / 1e6
-            );
-        }
         // the max density change often hovers at the move limit while the design no longer
         // improves, so also stop once compliance has stagnated
         let improvement = (result.compliance - compliance) / compliance;
@@ -795,11 +921,10 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
             0
         };
         stage_its += 1;
-        result = Outcome {
-            iterations: it,
-            compliance,
-            max_disp,
-        };
+        result.iterations = it;
+        result.compliance = compliance;
+        result.max_disp = max_disp;
+        result.stats.push(st);
         let converged = change < s.tol || stalled >= 3;
         // continuation: sharpen the projection each time the design settles (or after 25 iterations)
         if proj.beta > 0.0 && proj.beta < s.beta_max && (converged || stage_its >= 25) {
@@ -819,6 +944,9 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
             break;
         }
     }
+    if let Some(snap) = pending {
+        snap.write(p, out)?;
+    }
     println!(
         "done in {:.1} s: {} iterations, compliance {:.4e} N·mm, max displacement {:.4} mm",
         t_start.elapsed().as_secs_f64(),
@@ -828,6 +956,55 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
     );
     println!("wrote {} (iteration {})", out.display(), result.iterations);
     Ok(result)
+}
+
+/// One iteration's output fields.
+struct Snapshot {
+    density: Vec<f32>,
+    energy: Vec<f32>,
+    disps: Vec<Vec<f32>>,
+    #[allow(dead_code)]
+    iteration: usize,
+}
+
+impl Snapshot {
+    fn write(&self, p: &Problem, out: &Path) -> Result<u64> {
+        let names: Vec<String> = p
+            .cases
+            .iter()
+            .enumerate()
+            .map(|(k, c)| {
+                if k == 0 {
+                    "displacement".to_string()
+                } else {
+                    format!("displacement_{c}")
+                }
+            })
+            .collect();
+        let mut arrays = vec![
+            crate::vti::GridArray {
+                name: "density",
+                cell: true,
+                comps: 1,
+                data: &self.density,
+            },
+            crate::vti::GridArray {
+                name: "energy",
+                cell: true,
+                comps: 1,
+                data: &self.energy,
+            },
+        ];
+        for (name, data) in names.iter().zip(&self.disps) {
+            arrays.push(crate::vti::GridArray {
+                name,
+                cell: false,
+                comps: 3,
+                data,
+            });
+        }
+        crate::vti::write_grid(out, p.origin, p.h, p.nodes(), &arrays)
+    }
 }
 
 #[cfg(test)]
@@ -921,6 +1098,10 @@ mod tests {
             nu: 0.3,
             force: 999.0, // only for a script's field_load: unused here
             beta_max: 0.0,
+            solver: Solver::Jacobi,
+            emin: 1e-6,
+            cg_tol: 1e-4,
+            adaptive_tol: false,
         };
         let p = setup(&shape, &s, &gpu).unwrap();
         assert_eq!(p.cases, [1, 2]);
@@ -985,7 +1166,13 @@ mod tests {
         };
         let f: Vec<f64> = p.loads[0].iter().flatten().copied().collect();
         let mut u = vec![0.0; f.len()];
-        fem.solve(&f, &mut u, 1e-12, 1000);
+        let inv = fem.inv_diag();
+        let mut jacobi = |r: &[f64], z: &mut [f64]| {
+            for i in 0..r.len() {
+                z[i] = r[i] * inv[i];
+            }
+        };
+        fem.solve(&f, &mut u, 1e-12, 1000, &mut jacobi);
         let want = force * (4.0 * h) / (e0 * h * h);
         let top = p.node(1, 1, 4);
         assert!(

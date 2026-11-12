@@ -101,6 +101,65 @@ impl Format {
 }
 
 #[derive(Args)]
+struct SolverArgs {
+    /// linear solver: mg (multigrid-preconditioned CG) or jacobi (Jacobi CG: slow on large grids)
+    #[arg(long, value_enum, default_value = "mg")]
+    solver: SolverKind,
+    /// multigrid smoother
+    #[arg(long, value_enum, default_value = "chebyshev", hide = true)]
+    smoother: SmootherKind,
+    /// Chebyshev degree, or Jacobi sweeps
+    #[arg(long, default_value_t = 2, hide = true)]
+    sweeps: usize,
+    /// Jacobi smoother damping, as a multiple of 1 / λmax(D⁻¹K)
+    #[arg(long, default_value_t = 1.2, hide = true)]
+    omega: f64,
+    /// stiffness of empty elements relative to the modulus (default 1e-9; 1e-6 with jacobi)
+    #[arg(long, hide = true)]
+    emin: Option<f64>,
+    /// relative residual at which each linear solve stops
+    #[arg(long, default_value_t = 1e-4, hide = true)]
+    cg_tol: f64,
+    /// always solve to --cg-tol (by default the solves are looser while the design moves a lot)
+    #[arg(long, hide = true)]
+    fixed_cg_tol: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SolverKind {
+    Mg,
+    Jacobi,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SmootherKind {
+    Chebyshev,
+    Jacobi,
+}
+
+impl SolverArgs {
+    fn solver(&self) -> topopt::Solver {
+        match self.solver {
+            SolverKind::Jacobi => topopt::Solver::Jacobi,
+            SolverKind::Mg => topopt::Solver::Multigrid(topopt::mg::MgSettings {
+                smoother: match self.smoother {
+                    SmootherKind::Chebyshev => topopt::mg::Smoother::Chebyshev { degree: self.sweeps },
+                    SmootherKind::Jacobi => topopt::mg::Smoother::Jacobi {
+                        sweeps: self.sweeps,
+                        omega: self.omega,
+                    },
+                },
+                ..Default::default()
+            }),
+        }
+    }
+
+    fn emin(&self) -> f64 {
+        self.emin.unwrap_or_else(|| topopt::Settings::default_emin(&self.solver()))
+    }
+}
+
+#[derive(Args)]
 struct MeshArgs {
     /// voxel size in mm (overrides //! voxel)
     #[arg(long)]
@@ -217,9 +276,25 @@ enum Cmd {
         /// Poisson's ratio
         #[arg(long, default_value_t = 0.35)]
         nu: f64,
-        /// output .vti (default out/NAME_topopt.vti), rewritten every iteration
+        /// output .vti (default out/NAME_topopt.vti), rewritten as it runs
         #[arg(short, long)]
         output: Option<PathBuf>,
+        #[command(flatten)]
+        solver: SolverArgs,
+    },
+    /// time `optimize` on a shape at several element sizes (default: the bracket at 4 sizes)
+    #[command(hide = true)]
+    BenchTopopt {
+        #[arg(default_value = "shapes/bracket_domain.wgsl")]
+        shape: PathBuf,
+        /// element sizes (mm)
+        #[arg(long, value_delimiter = ',', default_values_t = [1.3, 0.8, 0.5, 0.4])]
+        voxels: Vec<f32>,
+        /// optimizer iterations per size
+        #[arg(long, default_value_t = 5)]
+        iters: usize,
+        #[command(flatten)]
+        solver: SolverArgs,
     },
     /// draw the app's window offscreen to a PNG (for checking the UI without a display)
     #[command(hide = true)]
@@ -495,6 +570,7 @@ fn run(cli: Cli) -> Result<()> {
             modulus,
             nu,
             output,
+            solver,
         } => {
             if viewer::is_vti(&s.shape) {
                 bail!("optimize takes a .wgsl problem (design domain + field_fixed/field_load), not a .vti");
@@ -515,11 +591,74 @@ fn run(cli: Cli) -> Result<()> {
                 nu,
                 force,
                 beta_max: if no_projection { 0.0 } else { beta_max.max(1.0) },
+                solver: solver.solver(),
+                emin: solver.emin(),
+                cg_tol: solver.cg_tol,
+                adaptive_tol: !solver.fixed_cg_tol,
             };
             let gpu = gpu::headless()?;
             let problem = topopt::setup(&shape, &settings, &gpu)?;
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
             topopt::optimize(&problem, &settings, &out)?;
+            Ok(())
+        }
+        Cmd::BenchTopopt {
+            shape,
+            voxels,
+            iters,
+            solver,
+        } => {
+            let shape = load_shape(&shape, &[])?;
+            let gpu = gpu::headless()?;
+            let dir = std::env::temp_dir().join(format!("gen3d-bench-{}", std::process::id()));
+            std::fs::create_dir_all(&dir)?;
+            let mut rows = vec![];
+            for &voxel in &voxels {
+                println!("\n=== voxel {voxel} mm ===");
+                let settings = topopt::Settings {
+                    voxel: voxel as f64,
+                    volfrac: 0.3,
+                    penal: 3.0,
+                    rmin: 1.5,
+                    iters,
+                    tol: 0.0,
+                    e0: 3500.0,
+                    nu: 0.35,
+                    force: 100.0,
+                    beta_max: 32.0,
+                    solver: solver.solver(),
+                    emin: solver.emin(),
+                    cg_tol: solver.cg_tol,
+                    adaptive_tol: !solver.fixed_cg_tol,
+                };
+                let problem = topopt::setup(&shape, &settings, &gpu)?;
+                let ne = problem.domain.iter().filter(|d| **d).count();
+                let r = topopt::optimize(&problem, &settings, &dir.join("bench.vti"))?;
+                rows.push((voxel, problem.n, ne, r));
+            }
+            std::fs::remove_dir_all(&dir).ok();
+            println!(
+                "\n{:>6} {:>13} {:>9} {:>7} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>11}",
+                "voxel", "grid", "domain", "CG/sol", "OC/it", "setup s", "solve s", "update s", "io s", "iter s", "compliance"
+            );
+            for (voxel, n, ne, r) in rows {
+                let k = r.stats.len() as f64;
+                let mean = |f: fn(&topopt::IterStats) -> f64| r.stats.iter().map(f).sum::<f64>() / k;
+                let solves: usize = r.stats.iter().map(|s| s.cg.len()).sum();
+                let cg: usize = r.stats.iter().flat_map(|s| &s.cg).sum();
+                println!(
+                    "{voxel:>6} {:>13} {ne:>9} {:>7.1} {:>6.1} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>8.3} {:>11.4e}",
+                    format!("{}x{}x{}", n[0], n[1], n[2]),
+                    cg as f64 / solves as f64,
+                    mean(|s| s.oc_steps as f64),
+                    mean(|s| s.setup),
+                    mean(|s| s.solve),
+                    mean(|s| s.update),
+                    mean(|s| s.io),
+                    mean(|s| s.setup + s.solve + s.update + s.io),
+                    r.compliance,
+                );
+            }
             Ok(())
         }
         Cmd::Check { s } if viewer::is_vti(&s.shape) => {
