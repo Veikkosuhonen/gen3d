@@ -3,9 +3,9 @@
 //! the script's `fn map` to `g3d_script_map` and appends a generated `map` (see [`wgsl`]), so every
 //! consumer (preview, mesher, optimizer, VTI export, the CLI) sees the combined shape.
 //!
-//! Each primitive's numbers are WGSL `override` constants, like shape parameters: moving or resizing
-//! one only rebuilds the pipeline, while adding, removing, hiding or changing its kind regenerates
-//! the source.
+//! The primitives' numbers live in one `array<vec4f>` named `g3d_ed`: a uniform buffer in the preview,
+//! so moving or resizing one is a buffer write (no shader compile), and a `const` everywhere else.
+//! Adding, removing, hiding or changing a kind regenerates the source.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -377,54 +377,56 @@ fn g3d_ed_union(a: f32, b: f32, k: f32) -> f32 {
 }
 ";
 
-/// The override constants of primitive `i`, in the order `wgsl` declares them.
-fn values(p: &Prim) -> [(&'static str, f32); 11] {
-    [
-        ("px", p.pos[0]),
-        ("py", p.pos[1]),
-        ("pz", p.pos[2]),
-        ("rx", p.rot[0]),
-        ("ry", p.rot[1]),
-        ("rz", p.rot[2]),
-        ("a", p.dims[0]),
-        ("b", p.dims[1]),
-        ("c", p.dims[2]),
-        ("round", p.round),
-        ("blend", p.blend),
-    ]
+/// Index of primitive `i`'s first vec4 in `g3d_ed` (element 0 holds the selection).
+fn base(i: usize) -> usize {
+    1 + 3 * i
 }
 
-/// Name of the override that selects which primitive the preview highlights (-1 = none).
-pub const SELECT: &str = "g3d_ed_sel";
-
-/// Values for every override `wgsl` declares (hidden primitives have none).
-pub fn constants(prims: &[Prim]) -> Vec<(String, f64)> {
-    let mut out = vec![];
-    for (i, p) in prims.iter().enumerate().filter(|(_, p)| !p.hidden) {
-        for (k, v) in values(p) {
-            out.push((format!("g3d_e{i}_{k}"), v as f64));
-        }
+/// The values `wgsl` reads from `g3d_ed`: element 0 = (selected index or -1, 0, 0, 0), then three
+/// vec4s per primitive (hidden ones too, so indices stay put): (pos, blend), (rot, round), (dims, 0).
+pub fn data(prims: &[Prim], selected: Option<usize>) -> Vec<[f32; 4]> {
+    let sel = selected.filter(|&i| prims.get(i).is_some_and(|p| !p.hidden));
+    let mut out = vec![[sel.map_or(-1.0, |i| i as f32), 0.0, 0.0, 0.0]];
+    for p in prims {
+        let [x, y, z] = p.pos;
+        let [rx, ry, rz] = p.rot;
+        let [a, b, c] = p.dims;
+        out.extend([[x, y, z, p.blend], [rx, ry, rz, p.round], [a, b, c, 0.0]]);
     }
     out
 }
 
-/// Generated WGSL: the primitives as functions of `override` constants (defaults = current values),
-/// `map` = the script's map (if `script_map`) unioned with them, and `g3d_ed_selected`, the distance
-/// to the primitive picked by `g3d_ed_sel`, for the preview's highlight.
+/// `g3d_ed` as a uniform buffer (the preview: moving a primitive is a buffer write, no recompile).
+pub fn decl_uniform(len: usize) -> String {
+    format!("@group(1) @binding(0) var<uniform> g3d_ed: array<vec4f, {len}>;\n")
+}
+
+/// `g3d_ed` as a constant (meshing, export, optimization: compiled once with the values baked in).
+pub fn decl_const(data: &[[f32; 4]]) -> String {
+    let items: Vec<String> = data
+        .iter()
+        .map(|v| format!("vec4f({:?}, {:?}, {:?}, {:?})", v[0], v[1], v[2], v[3]))
+        .collect();
+    format!("const g3d_ed = array<vec4f, {}>({});\n", data.len(), items.join(", "))
+}
+
+/// Generated WGSL: the primitives as functions reading their numbers from `g3d_ed` (declared by the
+/// caller with `decl_uniform` or `decl_const`), `map` = the script's map (if `script_map`) unioned
+/// with them, and `g3d_ed_selected`, the distance to the selected primitive, for the preview's highlight.
 pub fn wgsl(prims: &[Prim], script_map: bool) -> String {
     let mut s = String::from(LIBRARY);
-    let _ = writeln!(s, "override {SELECT}: i32 = -1;");
     let visible: Vec<_> = prims.iter().enumerate().filter(|(_, p)| !p.hidden).collect();
     for &(i, p) in &visible {
+        let b = base(i);
         let _ = writeln!(s, "// {} ({})", p.name.replace(['\n', '\r'], " "), p.kind.name());
-        for (k, v) in values(p) {
-            let _ = writeln!(s, "override g3d_e{i}_{k}: f32 = {v:?};");
-        }
         let _ = writeln!(
             s,
             "fn g3d_e{i}(p: vec3f) -> f32 {{\n    \
-             let q = g3d_ed_local(p, vec3f(g3d_e{i}_px, g3d_e{i}_py, g3d_e{i}_pz), vec3f(g3d_e{i}_rx, g3d_e{i}_ry, g3d_e{i}_rz));\n    \
-             return g3d_ed_{kind}(q, vec3f(g3d_e{i}_a, g3d_e{i}_b, g3d_e{i}_c), g3d_e{i}_round);\n}}",
+             let q = g3d_ed_local(p, g3d_ed[{b}].xyz, g3d_ed[{}].xyz);\n    \
+             return g3d_ed_{kind}(q, g3d_ed[{}].xyz, g3d_ed[{}].w);\n}}",
+            b + 1,
+            b + 2,
+            b + 1,
             kind = p.kind.name()
         );
     }
@@ -435,10 +437,10 @@ pub fn wgsl(prims: &[Prim], script_map: bool) -> String {
         "    var d = 1e10;\n"
     };
     for &(i, _) in &visible {
-        let _ = writeln!(s, "    d = g3d_ed_union(d, g3d_e{i}(p), g3d_e{i}_blend);");
+        let _ = writeln!(s, "    d = g3d_ed_union(d, g3d_e{i}(p), g3d_ed[{}].w);", base(i));
     }
     s += "    return d;\n}\n";
-    s += &format!("fn g3d_ed_selected(p: vec3f) -> f32 {{\n    switch ({SELECT}) {{\n");
+    s += "fn g3d_ed_selected(p: vec3f) -> f32 {\n    switch (i32(g3d_ed[0].x)) {\n";
     for &(i, _) in &visible {
         let _ = writeln!(s, "        case {i}: {{ return g3d_e{i}(p); }}");
     }
@@ -536,17 +538,19 @@ mod tests {
         assert!(s.bounds.1[0] > 42.0 && s.base_bounds.1[0] == 10.0, "{:?}", s.bounds);
         let names: Vec<_> = s.params().unwrap().into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["R"]);
-        let c = s.preview_constants(Some(2));
-        assert!(c.contains(&("R".into(), 6.0)) && c.contains(&(SELECT.into(), 2.0)));
-        assert!(
-            !c.iter().any(|(k, _)| k.starts_with("g3d_e3_")),
-            "hidden primitive has no constants"
+        let d = data(&s.prims, Some(2));
+        assert_eq!((d.len(), d[0][0], d[base(1) + 1][3]), (1 + 3 * 6, 2.0, 0.5));
+        assert_eq!(
+            data(&s.prims, Some(3))[0][0],
+            -1.0,
+            "hidden primitives can't be selected"
         );
-        assert_eq!(s.preview_constants(Some(3)).last().unwrap().1, -1.0);
         s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
         s.compile(&crate::mesher::compute_harness("field_keep", 1)).unwrap();
-        s.compile(&crate::viewer::preview_harness(&s.fields().unwrap(), true))
-            .unwrap();
+        let preview = crate::viewer::preview_harness(&s.fields().unwrap(), true);
+        s.compile(&preview).unwrap();
+        let c = s.compile_preview(&preview).unwrap();
+        assert!(c.source.contains("var<uniform> g3d_ed") && c.constants == [("R".to_string(), 6.0)]);
 
         // errors in the script still point at the script's lines
         std::fs::write(&p, "fn map(p: vec3f) -> f32 {\n  return oops;\n}\n").unwrap();
@@ -566,7 +570,7 @@ mod tests {
         save(&sidecar(&p), &[]).unwrap();
         load_shape(&p, &[])
             .unwrap()
-            .compile(&crate::viewer::preview_harness(&[], true))
+            .compile_preview(&crate::viewer::preview_harness(&[], true))
             .unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }

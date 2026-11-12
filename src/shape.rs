@@ -108,29 +108,45 @@ impl Shape {
         self.bounds = prims::grow_bounds(base, prims, margin).unwrap_or(self.base_bounds);
     }
 
-    /// Values for the module's override constants: the `-D` parameters and the primitives.
-    pub fn constants(&self) -> Vec<(String, f64)> {
-        let mut c = self.defines.clone();
-        if self.editor {
-            c.extend(prims::constants(&self.prims));
-        }
-        c
-    }
-
-    /// `constants` plus which primitive the preview highlights.
-    pub fn preview_constants(&self, selected: Option<usize>) -> Vec<(String, f64)> {
-        let mut c = self.constants();
-        if self.editor {
-            let sel = selected.filter(|&i| self.prims.get(i).is_some_and(|p| !p.hidden));
-            c.push((prims::SELECT.to_string(), sel.map_or(-1.0, |i| i as f64)));
-        }
-        c
+    /// The primitives' values for the preview's `g3d_ed` uniform buffer (None without the editor).
+    pub fn editor_data(&self, selected: Option<usize>) -> Option<Vec<[f32; 4]>> {
+        self.editor.then(|| prims::data(&self.prims, selected))
     }
 
     /// Append gen3d's harness (entry points, uniforms) to the shape and validate it with naga.
-    /// Errors point at `file:line:col` in the user's files.
+    /// Errors point at `file:line:col` in the user's files. The editor's primitives are baked in.
     pub fn compile(&self, harness: &str) -> Result<Compiled> {
-        let source = format!("{}\n{}", self.source, harness);
+        let decl = match self.editor {
+            true => prims::decl_const(&prims::data(&self.prims, None)),
+            false => String::new(),
+        };
+        self.compile_with(harness, &decl)
+    }
+
+    /// Like `compile`, but the primitives' values come from a uniform buffer at group 1, binding 0
+    /// (`editor_data`), so the preview can move them without compiling.
+    pub fn compile_preview(&self, harness: &str) -> Result<Compiled> {
+        let decl = match self.editor {
+            true => prims::decl_uniform(1 + 3 * self.prims.len()),
+            false => String::new(),
+        };
+        self.compile_with(harness, &decl)
+    }
+
+    /// The source with `g3d_ed` declared (as a constant), for parsing it on its own.
+    fn with_editor_decl(&self) -> String {
+        match self.editor {
+            true => format!(
+                "{}\n{}",
+                self.source,
+                prims::decl_const(&prims::data(&self.prims, None))
+            ),
+            false => self.source.clone(),
+        }
+    }
+
+    fn compile_with(&self, harness: &str, decl: &str) -> Result<Compiled> {
+        let source = format!("{}\n{}{}", self.source, decl, harness);
         let module = self.parse(&source)?;
         let mut validator =
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all());
@@ -163,7 +179,7 @@ impl Shape {
         }
         Ok(Compiled {
             source,
-            constants: self.constants(),
+            constants: self.defines.clone(),
         })
     }
 
@@ -178,7 +194,7 @@ impl Shape {
     /// The shape's extra fields: every `fn field_<name>(p: vec3f) -> f32` (or `-> vec3f`), in
     /// declaration order. They are sampled alongside the SDF by `export --format vti`.
     pub fn fields(&self) -> Result<Vec<Field>> {
-        let module = self.parse(&self.source)?;
+        let module = self.parse(&self.with_editor_decl())?;
         let mut out = vec![];
         for (_, f) in module.functions.iter() {
             let Some(func) = f.name.as_deref() else { continue };
@@ -214,7 +230,7 @@ impl Shape {
     /// `// comment` on the declaration becomes its note, and `//! range NAME min max` sets the range
     /// the viewer's slider covers.
     pub fn params(&self) -> Result<Vec<Param>> {
-        let module = self.parse(&self.source)?;
+        let module = self.parse(&self.with_editor_decl())?;
         let mut out = vec![];
         for (_, o) in module.overrides.iter() {
             let Some(name) = o.name.clone() else { continue };

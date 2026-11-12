@@ -258,6 +258,8 @@ struct Win {
     module: Option<wgpu::ShaderModule>,
     pipeline: Option<Pipeline>,
     vol: Option<VolGpu>,
+    /// the editor primitives' `g3d_ed` buffer of the current pipeline
+    ed: Option<wgpu::Buffer>,
     egui: egui::Context,
     renderer: egui_wgpu::Renderer,
     viewport: Viewport,
@@ -287,6 +289,7 @@ impl Win {
             module: None,
             pipeline: None,
             vol: None,
+            ed: None,
             egui,
             renderer,
             viewport: Viewport { view, size: (1, 1), id },
@@ -342,6 +345,8 @@ struct App {
     rebuild_again: bool,
     /// Bumped on every reload so stale background builds are dropped.
     rebuild_gen: u64,
+    /// Background pipeline builds started (for tests).
+    rebuilds: u32,
     cam: Camera,
     opts: Options,
     /// Fraction of the viewport's pixels that are raymarched (lower = faster).
@@ -639,6 +644,7 @@ impl App {
             rebuild: None,
             rebuild_again: false,
             rebuild_gen: 0,
+            rebuilds: 0,
             cam: Camera {
                 yaw: 0.0,
                 pitch: 0.0,
@@ -855,14 +861,23 @@ impl App {
                 self.edit.sel = None;
             }
         }
-        let constants = src.shape.preview_constants(self.edit.sel);
+        let ed_data = src.shape.editor_data(self.edit.sel);
         let Some(win) = &mut self.win else { return };
+        let ed = ed_data.map(|d| crate::viewer::editor_buffer(&win.gpu, &d));
         let vol = match src.volume.as_ref().map(|v| VolGpu::new(&win.gpu, v)).transpose() {
             Ok(v) => v,
             Err(e) => return self.fail(&format!("{e:#}")),
         };
         let built = preview_module(&win.gpu, &src).and_then(|m| {
-            let p = build_pipeline(&win.gpu, &m, &constants, VIEW_FORMAT, &win.ubuf, vol.as_ref())?;
+            let p = build_pipeline(
+                &win.gpu,
+                &m,
+                &src.shape.defines,
+                VIEW_FORMAT,
+                &win.ubuf,
+                vol.as_ref(),
+                ed.as_ref(),
+            )?;
             Ok((m, p))
         });
         match built {
@@ -870,6 +885,7 @@ impl App {
                 win.module = Some(m);
                 win.pipeline = Some(p);
                 win.vol = vol;
+                win.ed = ed;
                 self.rebuild_gen += 1;
                 self.param_error = None;
             }
@@ -957,10 +973,11 @@ impl App {
             self.defines.clone(),
             self.rebuild_gen,
         );
-        let constants = self.shape.preview_constants(self.edit.sel);
+        let ed = win.ed.clone();
+        self.rebuilds += 1;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = build_pipeline(&gpu, &module, &constants, VIEW_FORMAT, &ubuf, None);
+            let result = build_pipeline(&gpu, &module, &defines, VIEW_FORMAT, &ubuf, None, ed.as_ref());
             let _ = tx.send((generation, defines, result));
         });
         self.rebuild = Some(rx);
@@ -1019,7 +1036,17 @@ impl App {
     fn select(&mut self, sel: Option<usize>) {
         if sel != self.edit.sel {
             self.edit.sel = sel;
-            self.params_dirty = true; // the highlight is an override constant
+            self.upload_prims();
+        }
+    }
+
+    /// Write the primitives' values and the selection into the preview's `g3d_ed` buffer.
+    fn upload_prims(&self) {
+        if let (Some(win), Some(data)) = (&self.win, self.shape.editor_data(self.edit.sel))
+            && let Some(buf) = &win.ed
+            && buf.size() == (data.len() * 16) as u64
+        {
+            win.gpu.queue.write_buffer(buf, 0, bytemuck::cast_slice(&data));
         }
     }
 
@@ -1070,7 +1097,7 @@ impl App {
             if let Some(s) = &mut self.design_shape {
                 s.set_prims(new);
             }
-            self.params_dirty = true;
+            self.upload_prims();
         }
     }
 
@@ -1118,7 +1145,6 @@ impl App {
         prims.remove(i);
         self.edit.sel = None;
         self.set_prims(prims);
-        self.params_dirty = true;
     }
 
     /// Editor shortcuts (only while no text field has focus).
@@ -3214,6 +3240,7 @@ mod tests {
 
         // drag the X arrow: only x changes, the camera stays put
         let yaw = app.cam.yaw;
+        let rebuilds = app.rebuilds;
         let g = app.gizmo(app.view_rect).unwrap();
         let tip = g.tips[0];
         let along = (g.tips[0] - g.centre).normalized();
@@ -3228,6 +3255,10 @@ mod tests {
         let p = app.prims()[0].clone();
         assert!(p.pos[0] > 13.0 && p.pos[1] == 0.0 && p.pos[2] == 10.0, "{:?}", p.pos);
         assert_eq!(app.cam.yaw, yaw);
+        assert_eq!(
+            app.rebuilds, rebuilds,
+            "moving and selecting write a buffer, no pipeline build"
+        );
         assert_eq!(prims::load(&sidecar).unwrap()[0].pos, p.pos, "saved");
         assert_eq!(app.design_shape.as_ref().unwrap().prims[0].pos, p.pos);
 

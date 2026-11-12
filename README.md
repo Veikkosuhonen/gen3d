@@ -80,7 +80,7 @@ and are **unioned** with the script: when that file exists, gen3d renames the sc
 ```wgsl
 fn map(p: vec3f) -> f32 {
     var d = g3d_script_map(p);                        // your script (or nothing, if it has no map)
-    d = g3d_ed_union(d, g3d_e0(p), g3d_e0_blend);     // each visible primitive, in list order
+    d = g3d_ed_union(d, g3d_e0(p), g3d_ed[1].w);      // each visible primitive, in list order
     ...
     return d;
 }
@@ -89,9 +89,10 @@ fn map(p: vec3f) -> f32 {
 so every command (`render`, `export`, `optimize`, `slice`) and the app see the combined shape. Other
 functions that call `map(p)` (e.g. a `field_keep`) get the combined shape too. The bounds grow to fit the
 primitives. A shape can be primitives only: a `.wgsl` without `fn map` works when its `.prims.json`
-exists. Each primitive's numbers are `override` constants, so moving or resizing one only rebuilds the
-pipeline; adding, removing, hiding or changing a kind regenerates the source. Only union for now (no
-subtraction or intersection).
+exists. The primitives' numbers live in one `array<vec4f>` (`g3d_ed`): in the preview it's a uniform
+buffer, so moving or resizing a primitive (or selecting one) is a buffer write with no shader compile;
+in `render`, `export`, `optimize` etc. it's a `const`, baked in. Adding, removing, hiding or changing a
+kind regenerates the source. Only union for now (no subtraction or intersection).
 
 ### Library (`src/wgsl/sdf.wgsl`)
 

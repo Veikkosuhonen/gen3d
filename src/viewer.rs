@@ -365,6 +365,17 @@ pub fn uniforms(shape: &Shape, cam: &Camera, o: &Options, size: (u32, u32), gamm
 pub struct Pipeline {
     pipeline: wgpu::RenderPipeline,
     bind: wgpu::BindGroup,
+    /// the editor's primitives (`g3d_ed`), if the shape has them
+    bind_ed: Option<wgpu::BindGroup>,
+}
+
+/// The preview's `g3d_ed` buffer for a shape with editor primitives (see `Shape::editor_data`).
+pub fn editor_buffer(gpu: &Gpu, data: &[[f32; 4]]) -> wgpu::Buffer {
+    gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("editor primitives"),
+        contents: bytemuck::cast_slice(data),
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+    })
 }
 
 /// What the viewer shows: a .wgsl shape, or a .vti grid turned into a shape by `volume.rs`.
@@ -467,7 +478,7 @@ impl VolGpu {
 
 /// Validate the source with its preview harness and create the shader module.
 pub fn preview_module(gpu: &Gpu, src: &Source) -> Result<wgpu::ShaderModule> {
-    let compiled = src.shape.compile(&src.harness)?;
+    let compiled = src.shape.compile_preview(&src.harness)?;
     gpu.shader(&compiled, "preview")
 }
 
@@ -480,6 +491,7 @@ pub fn build_pipeline(
     format: wgpu::TextureFormat,
     ubuf: &wgpu::Buffer,
     vol: Option<&VolGpu>,
+    ed: Option<&wgpu::Buffer>,
 ) -> Result<Pipeline> {
     let constants: Vec<(&str, f64)> = constants.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let options = || wgpu::PipelineCompilationOptions {
@@ -528,7 +540,25 @@ pub fn build_pipeline(
             entries: &entries,
         })
     })?;
-    Ok(Pipeline { pipeline, bind })
+    let bind_ed = ed
+        .map(|b| {
+            gpu.scoped(|| {
+                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("editor primitives"),
+                    layout: &pipeline.get_bind_group_layout(1),
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: b.as_entire_binding(),
+                    }],
+                })
+            })
+        })
+        .transpose()?;
+    Ok(Pipeline {
+        pipeline,
+        bind,
+        bind_ed,
+    })
 }
 
 /// Raymarch the preview into `view`; without a pipeline (nothing compiled yet) fill it dark red.
@@ -560,6 +590,9 @@ pub fn draw(gpu: &Gpu, p: Option<&Pipeline>, view: &wgpu::TextureView) -> wgpu::
         if let Some(p) = p {
             pass.set_pipeline(&p.pipeline);
             pass.set_bind_group(0, &p.bind, &[]);
+            if let Some(b) = &p.bind_ed {
+                pass.set_bind_group(1, b, &[]);
+            }
             pass.draw(0..3, 0..1);
         }
     }
@@ -616,7 +649,16 @@ pub fn render_png(
     });
     let vol = src.volume.as_ref().map(|v| VolGpu::new(&gpu, v)).transpose()?;
     let module = preview_module(&gpu, &src)?;
-    let pipeline = build_pipeline(&gpu, &module, &src.shape.constants(), format, &ubuf, vol.as_ref())?;
+    let ed = src.shape.editor_data(None).map(|d| editor_buffer(&gpu, &d));
+    let pipeline = build_pipeline(
+        &gpu,
+        &module,
+        &src.shape.defines,
+        format,
+        &ubuf,
+        vol.as_ref(),
+        ed.as_ref(),
+    )?;
     let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("render"),
         size: wgpu::Extent3d {

@@ -3,6 +3,28 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: Moving a primitive no longer compiles a shader
+
+**What:** dragging a primitive showed "compiling…" and the frame rate dropped. Its numbers were WGSL
+`override` constants, and overrides are applied when the *pipeline* is created, so every drag step
+re-ran the driver's shader compile (~100 ms, on the background thread). Now the numbers (and the
+selection index) live in one `array<vec4f, 1 + 3n>` named `g3d_ed`. The generated code reads
+`g3d_ed[1 + 3i ..]`: (pos, blend), (rot, round), (dims, -), element 0 = selection.
+
+- **Preview:** `Shape::compile_preview` declares `g3d_ed` as a uniform buffer at `@group(1)
+  @binding(0)`. The app keeps the buffer next to the pipeline (`Win::ed`), and a move, resize or
+  selection change is a `queue.write_buffer`. Structural changes (add/delete/hide/kind) still
+  regenerate the source; a new buffer size comes with that.
+- **Everything else** (`Shape::compile`: mesher, optimizer, VTI export, `render`) declares it as a WGSL
+  `const` with the current values, so batch shaders stay fully constant-folded.
+- `params()`/`fields()` parse the source with the const declaration added. Parameter overrides are
+  unchanged and still rebuild the pipeline (they can change control flow, e.g. loop counts).
+
+**Verified:** `cargo test` (20 pass). The app test now asserts a click-select plus a full gizmo drag
+start **zero** pipeline builds (`App::rebuilds`). GPU/CPU SDF agreement still holds through the const
+path. The snapshot and the exported STL are unchanged (47.28 × 32.40 × 19.99 mm, 9.34 cm³). clippy
+clean.
+
 ## 2026-11-12: Primitive editor in the Design step (union with the script)
 
 **What:** the Design step has a **Primitives** section: add a sphere, box, cylinder, capsule, torus or
@@ -27,6 +49,7 @@ deselect (Esc), undo/redo (Ctrl+Z / Ctrl+Shift+Z; a drag is one step). Only unio
 - **Numbers are `override` constants** (`g3d_e{i}_px` …, hidden from the parameter sliders). Dragging
   goes through the same async pipeline rebuild as parameter sliders; only add/delete/hide/kind change
   regenerates the source. `Shape::constants()` now returns `-D` values plus the primitives' values.
+  *(Replaced the same day by a uniform buffer; see the entry above.)*
 - **Selection highlight:** `override g3d_ed_sel` and a generated `g3d_ed_selected(p)`; the preview
   harness tints surface points on the selected primitive in striped blue.
 - **Bounds grow** to fit the primitives: a rotated local AABB plus the blend bulge plus 2 voxels. A
