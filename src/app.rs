@@ -31,8 +31,8 @@ use crate::prims::{self, Kind, Prim};
 use crate::shape::{Field, Param, ParamKind, Shape};
 use crate::slicer;
 use crate::viewer::{
-    Camera, Options, Pipeline, Source, VolGpu, all_fields, build_pipeline, draw, field_color, is_vti, load_source,
-    preview_module, uniforms, volume_source,
+    Bindings, Camera, Options, Pipeline, Source, VolGpu, all_fields, build_pipeline, compiled_defines, draw,
+    field_color, is_vti, load_source, preview_module, uniform_buffer, uniforms, volume_source,
 };
 use crate::volume::{Volume, VolumeOpts};
 
@@ -260,6 +260,9 @@ struct Win {
     vol: Option<VolGpu>,
     /// the editor primitives' `g3d_ed` buffer of the current pipeline
     ed: Option<wgpu::Buffer>,
+    /// the live (`f32`) parameters' buffer, and their names in buffer order
+    par: Option<wgpu::Buffer>,
+    live: Vec<String>,
     egui: egui::Context,
     renderer: egui_wgpu::Renderer,
     viewport: Viewport,
@@ -290,6 +293,8 @@ impl Win {
             pipeline: None,
             vol: None,
             ed: None,
+            par: None,
+            live: vec![],
             egui,
             renderer,
             viewport: Viewport { view, size: (1, 1), id },
@@ -347,6 +352,8 @@ struct App {
     rebuild_gen: u64,
     /// Background pipeline builds started (for tests).
     rebuilds: u32,
+    /// The `override` parameter values the current (or pending) pipeline is built with.
+    built_defines: Vec<(String, f64)>,
     cam: Camera,
     opts: Options,
     /// Fraction of the viewport's pixels that are raymarched (lower = faster).
@@ -645,6 +652,7 @@ impl App {
             rebuild_again: false,
             rebuild_gen: 0,
             rebuilds: 0,
+            built_defines: vec![],
             cam: Camera {
                 yaw: 0.0,
                 pitch: 0.0,
@@ -862,30 +870,35 @@ impl App {
             }
         }
         let ed_data = src.shape.editor_data(self.edit.sel);
+        let defines = self.defines.clone();
         let Some(win) = &mut self.win else { return };
-        let ed = ed_data.map(|d| crate::viewer::editor_buffer(&win.gpu, &d));
         let vol = match src.volume.as_ref().map(|v| VolGpu::new(&win.gpu, v)).transpose() {
             Ok(v) => v,
             Err(e) => return self.fail(&format!("{e:#}")),
         };
-        let built = preview_module(&win.gpu, &src).and_then(|m| {
-            let p = build_pipeline(
-                &win.gpu,
-                &m,
-                &src.shape.defines,
-                VIEW_FORMAT,
-                &win.ubuf,
-                vol.as_ref(),
-                ed.as_ref(),
-            )?;
-            Ok((m, p))
+        let built = preview_module(&win.gpu, &src).and_then(|(m, live)| {
+            let bindings = Bindings {
+                ubuf: win.ubuf.clone(),
+                vol,
+                par: (!live.is_empty()).then(|| {
+                    let data = crate::shape::param_data(&live, &params, &defines);
+                    uniform_buffer(&win.gpu, "parameters", &data)
+                }),
+                ed: ed_data.map(|d| uniform_buffer(&win.gpu, "editor primitives", &d)),
+            };
+            let constants = compiled_defines(&src.shape.defines, &live);
+            let p = build_pipeline(&win.gpu, &m, &constants, VIEW_FORMAT, &bindings)?;
+            Ok((m, p, bindings, live, constants))
         });
         match built {
-            Ok((m, p)) => {
+            Ok((m, p, b, live, constants)) => {
                 win.module = Some(m);
                 win.pipeline = Some(p);
-                win.vol = vol;
-                win.ed = ed;
+                win.vol = b.vol;
+                win.ed = b.ed;
+                win.par = b.par;
+                win.live = live;
+                self.built_defines = constants;
                 self.rebuild_gen += 1;
                 self.param_error = None;
             }
@@ -973,14 +986,38 @@ impl App {
             self.defines.clone(),
             self.rebuild_gen,
         );
-        let ed = win.ed.clone();
+        let bindings = Bindings {
+            ubuf,
+            vol: None,
+            par: win.par.clone(),
+            ed: win.ed.clone(),
+        };
+        let constants = compiled_defines(&defines, &win.live);
+        self.built_defines = constants.clone();
         self.rebuilds += 1;
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = build_pipeline(&gpu, &module, &defines, VIEW_FORMAT, &ubuf, None, ed.as_ref());
+            let result = build_pipeline(&gpu, &module, &constants, VIEW_FORMAT, &bindings);
             let _ = tx.send((generation, defines, result));
         });
         self.rebuild = Some(rx);
+    }
+
+    /// Show the current parameter values: live (`f32`) ones are written to their uniform buffer;
+    /// the pipeline is rebuilt only if an `override` one (`i32`/`u32`/`bool`) changed.
+    fn sync_params(&mut self) {
+        self.shape.defines = self.defines.clone();
+        if self.volume.is_some() {
+            return; // the result is shown; the design rebuilds when it's shown again
+        }
+        let Some(win) = &self.win else { return };
+        if let Some(buf) = &win.par {
+            let data = crate::shape::param_data(&win.live, &self.params, &self.defines);
+            win.gpu.queue.write_buffer(buf, 0, bytemuck::cast_slice(&data));
+        }
+        if compiled_defines(&self.defines, &win.live) != self.built_defines {
+            self.request_rebuild();
+        }
     }
 
     fn poll_rebuild(&mut self) {
@@ -2069,6 +2106,7 @@ impl App {
         }
         ui.spacing_mut().slider_width = 150.0;
         let params = self.params.clone();
+        let live = self.win.as_ref().map(|w| w.live.clone()).unwrap_or_default();
         egui::Grid::new("params").num_columns(3).show(ui, |ui| {
             for p in &params {
                 let cur = self.param_value(p);
@@ -2077,7 +2115,13 @@ impl App {
                     tip.push('\n');
                 }
                 tip += &format!("default {}", fmt_num(p.default));
-                ui.label(&p.name).on_hover_text(tip);
+                let compiled = !live.contains(&p.name);
+                if compiled {
+                    tip += "\nchanging it compiles the shader (only f32 parameters update live)";
+                }
+                let name = egui::RichText::new(&p.name);
+                ui.label(if compiled { name.italics() } else { name })
+                    .on_hover_text(tip);
                 let mut v = cur;
                 let changed = match p.kind {
                     ParamKind::Bool => {
@@ -2797,7 +2841,7 @@ impl App {
         let tex = win.viewport.id;
         let out = ctx.run_ui(raw, |ui| self.ui(ui, tex));
         if std::mem::take(&mut self.params_dirty) {
-            self.request_rebuild();
+            self.sync_params();
         }
         self.poll_rebuild();
         self.opts.time = self.start.elapsed().as_secs_f32();
@@ -3271,6 +3315,54 @@ mod tests {
         assert!(app.prims().is_empty() && app.loaded);
         app.undo(false);
         assert_eq!(app.prims().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// f32 parameters update through a uniform buffer; i32 ones rebuild the pipeline.
+    #[test]
+    fn float_params_are_live() {
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("gen3d-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.wgsl");
+        std::fs::write(
+            &path,
+            "//! bounds -20 -20 0 20 20 20\noverride R: f32 = 3.0;\noverride N: i32 = 2;\n\
+             fn map(p: vec3f) -> f32 {\n  var d = 1e9;\n  for (var i = 0; i < N; i++) {\n    \
+             d = min(d, length(p - vec3f(f32(i) * 8.0, 0, 10)) - R);\n  }\n  return d;\n}\n",
+        )
+        .unwrap();
+        let mut app = App::new(dir.clone());
+        app.win = Some(Win::new(Arc::new(gpu), VIEW_FORMAT, None));
+        app.open_design(&path, vec![]);
+        assert!(app.loaded, "{:?}", app.error);
+        assert_eq!(app.win.as_ref().unwrap().live, ["R"]);
+        let settle = |app: &mut App| {
+            app.sync_params();
+            while app.rebuild.is_some() {
+                std::thread::sleep(Duration::from_millis(5));
+                app.poll_rebuild();
+            }
+            assert!(app.param_error.is_none(), "{:?}", app.param_error);
+        };
+        let (r, n) = (app.params[0].clone(), app.params[1].clone());
+        let before = app.rebuilds;
+        for v in [3.5, 4.0, 5.0] {
+            app.set_param(&r, v);
+            settle(&mut app);
+        }
+        assert_eq!(app.rebuilds, before, "f32 parameters don't rebuild");
+        app.set_param(&n, 3.0);
+        settle(&mut app);
+        assert_eq!(app.rebuilds, before + 1, "i32 parameters do");
+        app.set_param(&r, 2.0);
+        settle(&mut app);
+        assert_eq!(app.rebuilds, before + 1);
+        // the window title / jobs still see every value
+        assert_eq!(app.shape.defines.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 

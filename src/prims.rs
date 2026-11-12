@@ -550,7 +550,8 @@ mod tests {
         let preview = crate::viewer::preview_harness(&s.fields().unwrap(), true);
         s.compile(&preview).unwrap();
         let c = s.compile_preview(&preview).unwrap();
-        assert!(c.source.contains("var<uniform> g3d_ed") && c.constants == [("R".to_string(), 6.0)]);
+        assert!(c.source.contains("var<uniform> g3d_ed"));
+        assert!(c.constants.is_empty() && c.live == ["R"], "R is an f32: live in the preview");
 
         // errors in the script still point at the script's lines
         std::fs::write(&p, "fn map(p: vec3f) -> f32 {\n  return oops;\n}\n").unwrap();

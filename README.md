@@ -69,6 +69,19 @@ declaration becomes its tooltip. The slider covers 0 to twice the default unless
 with `//! range NAME min max`; you can still type any value into the number box. Optimize and Print use
 the values on screen.
 
+**Live vs. compiled parameters.** The type decides what a slider costs:
+
+| type | in the preview | dragging the slider |
+|---|---|---|
+| `f32` | read from a uniform buffer (the `override` becomes a `var<private>` of the same name, set when the fragment shader starts) | instant: a buffer write |
+| `i32`, `u32`, `bool` | stays an `override` constant the compiler sees | recompiles the shader (~100 ms, in the background) |
+
+So use `f32` for sizes and offsets, and `i32`/`u32` for things the compiler should know: loop counts
+(`for (var i = 0; i < N; i++)` can then be unrolled), array sizes, switch selectors. Compiled parameters
+are shown in *italics* in the app. `render`, `export`, `optimize` etc. compile once, so there every
+parameter is an `override`. If the preview can't make an `f32` live (one used where WGSL needs a constant,
+e.g. `override B: f32 = A * 2.0;`), all of that shape's parameters stay compiled.
+
 ### Primitives from the app (`NAME.prims.json`)
 
 The Design step can also add **primitives**: sphere, box, cylinder, capsule, torus and cone, each with
@@ -135,8 +148,9 @@ camera presets, section view, bounds box, clipping and render resolution.
   desktop's default app. The preview reloads whenever the file or an include is saved; errors show in a
   panel under the view, and the last version that compiled stays on screen.
 - **1 Design:** sliders for the shape's [parameters](#writing-shapes), [primitives](#primitives-from-the-app-nameprimsjson),
-  `field_*` overlay selection, and shape details. A parameter change rebuilds only the pipeline, on a
-  background thread, so dragging stays smooth. **Primitives:** *Add* puts one at the centre of the view;
+  `field_*` overlay selection, and shape details. `f32` parameters update live; `i32`/`u32`/`bool`
+  ones (in *italics*) rebuild the pipeline on a background thread (see
+  [live vs. compiled](#writing-shapes)). **Primitives:** *Add* puts one at the centre of the view;
   click one in the view (or the list) to select it. It is tinted blue and gets arrows: drag an arrow to
   move along X/Y/Z, the centre to move in the view plane, `Ctrl` snaps to whole mm. The sidebar edits
   its numbers; `Del` deletes, `Ctrl+D` duplicates, `Esc` deselects, `Ctrl+Z` / `Ctrl+Shift+Z` undo and

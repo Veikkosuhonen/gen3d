@@ -114,23 +114,61 @@ impl Shape {
     }
 
     /// Append gen3d's harness (entry points, uniforms) to the shape and validate it with naga.
-    /// Errors point at `file:line:col` in the user's files. The editor's primitives are baked in.
+    /// Errors point at `file:line:col` in the user's files. Parameters are `override` constants and
+    /// the editor's primitives are baked in: for meshing, export and optimization (compiled once).
     pub fn compile(&self, harness: &str) -> Result<Compiled> {
-        let decl = match self.editor {
+        let mut decl = match self.editor {
             true => prims::decl_const(&prims::data(&self.prims, None)),
             false => String::new(),
         };
-        self.compile_with(harness, &decl)
+        decl += NO_LIVE_PARAMS;
+        self.compile_with(&self.source, harness, &decl, &self.defines)
     }
 
-    /// Like `compile`, but the primitives' values come from a uniform buffer at group 1, binding 0
-    /// (`editor_data`), so the preview can move them without compiling.
+    /// For the preview: like `compile`, but values that change while you drag come from uniform
+    /// buffers, so changing them needs no shader compile:
+    /// - the editor's primitives (group 1, binding 0; `editor_data`),
+    /// - `f32` parameters ("live"; group 0, binding 5; `param_data`): their `override` becomes a
+    ///   `var<private>` of the same name, set from the buffer at the start of the fragment shader.
+    ///
+    /// `i32`, `u32` and `bool` parameters stay `override`s (they can be loop counts or switch
+    /// selectors the compiler should see), so changing them rebuilds the pipeline. If the live form
+    /// doesn't compile (an `f32` parameter used where WGSL needs a constant, e.g. in another
+    /// override's initializer), every parameter stays an `override`.
     pub fn compile_preview(&self, harness: &str) -> Result<Compiled> {
-        let decl = match self.editor {
+        let ed = match self.editor {
             true => prims::decl_uniform(1 + 3 * self.prims.len()),
             false => String::new(),
         };
-        self.compile_with(harness, &decl)
+        if let Some((source, live)) = self.live_source() {
+            let defines: Vec<_> = self
+                .defines
+                .iter()
+                .filter(|(k, _)| !live.contains(k))
+                .cloned()
+                .collect();
+            let decl = format!("{ed}{}", live_params_decl(&live));
+            if let Ok(mut c) = self.compile_with(&source, harness, &decl, &defines) {
+                c.live = live;
+                return Ok(c);
+            }
+        }
+        self.compile_with(&self.source, harness, &format!("{ed}{NO_LIVE_PARAMS}"), &self.defines)
+    }
+
+    /// The source with each `f32` parameter's `override` turned into `var<private>` (same line
+    /// structure), and those parameters' names. None if there are none.
+    fn live_source(&self) -> Option<(String, Vec<String>)> {
+        let params = self.params().ok()?;
+        let mut source = self.source.clone();
+        let mut live = vec![];
+        for p in params.iter().filter(|p| p.kind == ParamKind::Float) {
+            if let Some(at) = find_override(&source, &p.name) {
+                source.replace_range(at..at + "override".len(), "var<private>");
+                live.push(p.name.clone());
+            }
+        }
+        (!live.is_empty()).then_some((source, live))
     }
 
     /// The source with `g3d_ed` declared (as a constant), for parsing it on its own.
@@ -145,8 +183,8 @@ impl Shape {
         }
     }
 
-    fn compile_with(&self, harness: &str, decl: &str) -> Result<Compiled> {
-        let source = format!("{}\n{}{}", self.source, decl, harness);
+    fn compile_with(&self, body: &str, harness: &str, decl: &str, defines: &[(String, f64)]) -> Result<Compiled> {
+        let source = format!("{body}\n{decl}{harness}");
         let module = self.parse(&source)?;
         let mut validator =
             naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all());
@@ -164,7 +202,7 @@ impl Shape {
             bail!("{}: no `fn map(p: vec3f) -> f32` found", self.path.display());
         }
         let declared: Vec<String> = module.overrides.iter().filter_map(|(_, o)| o.name.clone()).collect();
-        for (name, _) in &self.defines {
+        for (name, _) in defines {
             if !declared.contains(name) {
                 let hint = if declared.is_empty() {
                     "the shape declares no parameters".to_string()
@@ -179,7 +217,8 @@ impl Shape {
         }
         Ok(Compiled {
             source,
-            constants: self.defines.clone(),
+            constants: defines.to_vec(),
+            live: vec![],
         })
     }
 
@@ -399,7 +438,67 @@ fn const_value(module: &naga::Module, h: naga::Handle<naga::Expression>) -> Opti
 #[derive(Debug)]
 pub struct Compiled {
     pub source: String,
+    /// values for the `override` constants that remain
     pub constants: Vec<(String, f64)>,
+    /// parameters read from the preview's uniform buffer instead, in buffer order (`param_data`)
+    pub live: Vec<String>,
+}
+
+/// Every harness calls `g3d_load_params()`; without live parameters it does nothing.
+const NO_LIVE_PARAMS: &str = "fn g3d_load_params() {}\n";
+
+/// The live parameters' uniform buffer (four per vec4) and the function that copies them into
+/// their `var<private>`s.
+fn live_params_decl(live: &[String]) -> String {
+    let mut s = format!(
+        "@group(0) @binding(5) var<uniform> g3d_par: array<vec4f, {}>;\nfn g3d_load_params() {{\n",
+        live.len().div_ceil(4)
+    );
+    for (i, name) in live.iter().enumerate() {
+        let _ = writeln!(s, "    {name} = g3d_par[{}].{};", i / 4, ["x", "y", "z", "w"][i % 4]);
+    }
+    s + "}\n"
+}
+
+/// Contents of the live parameters' buffer: each value from `defines`, else its default.
+pub fn param_data(live: &[String], params: &[Param], defines: &[(String, f64)]) -> Vec<[f32; 4]> {
+    let mut out = vec![[0.0; 4]; live.len().div_ceil(4)];
+    for (i, name) in live.iter().enumerate() {
+        let v = defines
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| *v)
+            .or_else(|| params.iter().find(|p| &p.name == name).map(|p| p.default))
+            .unwrap_or(0.0);
+        out[i / 4][i % 4] = v as f32;
+    }
+    out
+}
+
+/// Byte offset of the `override` keyword declaring `name` (outside `//` comments).
+fn find_override(source: &str, name: &str) -> Option<usize> {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut offset = 0;
+    for line in source.split_inclusive('\n') {
+        let code = line.split("//").next().unwrap_or("");
+        let mut from = 0;
+        while let Some(i) = code[from..].find("override") {
+            let at = from + i;
+            let before_ok = at == 0 || !ident(code.as_bytes()[at - 1]);
+            let rest = &code[at + "override".len()..];
+            let trimmed = rest.trim_start();
+            if before_ok
+                && trimmed.len() < rest.len()
+                && let Some(tail) = trimmed.strip_prefix(name)
+                && !tail.bytes().next().is_some_and(ident)
+            {
+                return Some(offset + at);
+            }
+            from = at + "override".len();
+        }
+        offset += line.len();
+    }
+    None
 }
 
 impl Compiled {
@@ -707,6 +806,31 @@ mod tests {
         )
         .unwrap();
         assert!(load_shape(&p, &[]).unwrap().fields().is_err());
+
+        // f32 parameters are live in the preview; ints and bools stay overrides
+        std::fs::write(
+            &p,
+            "override R: f32 = 1.0;  // radius\noverride N: i32 = 3;\noverride OFF: f32 = 0.5;\n\
+             fn map(p: vec3f) -> f32 { var d = length(p) - R; for (var i = 0; i < N; i++) { d += OFF * 0.0; } return d; }\n",
+        )
+        .unwrap();
+        let s = load_shape(&p, &[("R".into(), 2.0), ("N".into(), 4.0)]).unwrap();
+        let h = crate::viewer::preview_harness(&[], false);
+        let c = s.compile_preview(&h).unwrap();
+        assert_eq!(c.live, ["R", "OFF"]);
+        assert_eq!(c.constants, [("N".to_string(), 4.0)]);
+        assert!(c.source.contains("var<private> R: f32 = 1.0;  // radius"));
+        let ps = s.params().unwrap();
+        assert_eq!(param_data(&c.live, &ps, &s.defines), [[2.0, 0.5, 0.0, 0.0]]);
+        assert!(s.compile(&h).unwrap().live.is_empty());
+        // an f32 parameter in another override's initializer must stay constant: all overrides
+        std::fs::write(
+            &p,
+            "override A: f32 = 1.0;\noverride B: f32 = A * 2.0;\nfn map(p: vec3f) -> f32 { return length(p) - B; }\n",
+        )
+        .unwrap();
+        let c = load_shape(&p, &[]).unwrap().compile_preview(&h).unwrap();
+        assert!(c.live.is_empty() && c.source.contains("override A"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

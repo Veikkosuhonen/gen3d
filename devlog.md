@@ -3,6 +3,35 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: Live f32 parameters; ints and bools are the compiled ones
+
+**What:** parameter sliders used to rebuild the pipeline on every change (overrides are applied at
+pipeline creation; ~100 ms driver compile). Now the parameter's type decides: **`f32` parameters are
+live** in the preview (a buffer write per change), while **`i32` / `u32` / `bool` stay `override`s** and
+recompile. Those are the ones that can be loop counts, array sizes or switch selectors the compiler
+should see. The app shows compiled parameters in italics, with a tooltip.
+
+**How:** `Shape::compile_preview` rewrites each `f32` parameter's `override` keyword to `var<private>`
+(same name, same line, so the script's code and error lines are untouched) and appends
+`@group(0) @binding(5) var<uniform> g3d_par: array<vec4f, ⌈n/4⌉>` plus `g3d_load_params()`, which copies
+the values into the privates. The preview's `g3d_fs` calls it first. Every other compile defines an
+empty `g3d_load_params`, and batch paths (mesher, optimizer, export, `render`'s constants) keep all
+parameters as overrides, fully constant-folded. If the live form fails to compile (an `f32` used in a
+constant context, e.g. another override's initializer), the preview silently uses the all-override form,
+so nothing that compiled before breaks. In the app, `sync_params` writes the buffer and only requests a
+rebuild when the *override* values differ from what the pipeline was built with (`built_defines`).
+`build_pipeline` now takes a `Bindings` struct (view, volume, params, editor buffers).
+
+**Trade-off:** live values can't be constant-folded by the driver, so a shape whose `f32` parameter
+feeds heavy math may raymarch slightly slower in the preview. Declare it `i32` (or derive an int) if
+that matters.
+
+**Verified:** `cargo test` (21 pass). New app test: three `f32` changes start zero pipeline builds, an
+`i32` change starts exactly one. The shape test checks the rewrite (`R`, `OFF` live; `N` stays an override
+with its `-D` value), the buffer layout, and the fallback for `override B: f32 = A * 2.0`. `gen3d render
+knob -D DIAM=36` (live path) fills the bounds as expected; the exported STL is 35.99 mm across. All
+bundled shapes check (all their parameters are `f32`, so all become live). clippy clean.
+
 ## 2026-11-12: Moving a primitive no longer compiles a shader
 
 **What:** dragging a primitive showed "compiling…" and the frame rate dropped. Its numbers were WGSL

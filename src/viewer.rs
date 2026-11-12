@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use wgpu::util::DeviceExt;
 
 use crate::gpu::Gpu;
-use crate::shape::{Field, Shape, load_shape};
+use crate::shape::{Field, Shape, load_shape, param_data};
 use crate::volume::{Volume, VolumeOpts};
 
 pub const PREVIEW_HARNESS: &str = r#"
@@ -105,6 +105,7 @@ fn g3d_edgeLines(p: vec3f, lo: vec3f, hi: vec3f, w: f32) -> f32 {
 
 @fragment
 fn g3d_fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
+    g3d_load_params();
     let res = g3d_v.res;
     let fc = vec2f(frag.x, res.y - frag.y);
     let uv = (fc - 0.5 * res) / res.y;
@@ -369,13 +370,27 @@ pub struct Pipeline {
     bind_ed: Option<wgpu::BindGroup>,
 }
 
-/// The preview's `g3d_ed` buffer for a shape with editor primitives (see `Shape::editor_data`).
-pub fn editor_buffer(gpu: &Gpu, data: &[[f32; 4]]) -> wgpu::Buffer {
+/// A uniform buffer the preview reads values from that change without compiling: the editor's
+/// primitives (`Shape::editor_data`) or the live parameters (`shape::param_data`).
+pub fn uniform_buffer(gpu: &Gpu, label: &str, data: &[[f32; 4]]) -> wgpu::Buffer {
     gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("editor primitives"),
+        label: Some(label),
         contents: bytemuck::cast_slice(data),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     })
+}
+
+/// The buffers a preview pipeline binds.
+#[derive(Clone)]
+pub struct Bindings {
+    /// view uniforms (group 0, binding 0)
+    pub ubuf: wgpu::Buffer,
+    /// a .vti grid's fields (group 0, bindings 1-4)
+    pub vol: Option<VolGpu>,
+    /// live parameters (group 0, binding 5)
+    pub par: Option<wgpu::Buffer>,
+    /// editor primitives (group 1, binding 0)
+    pub ed: Option<wgpu::Buffer>,
 }
 
 /// What the viewer shows: a .wgsl shape, or a .vti grid turned into a shape by `volume.rs`.
@@ -476,10 +491,16 @@ impl VolGpu {
     }
 }
 
-/// Validate the source with its preview harness and create the shader module.
-pub fn preview_module(gpu: &Gpu, src: &Source) -> Result<wgpu::ShaderModule> {
+/// Validate the source with its preview harness and create the shader module. Also returns the
+/// live parameters (read from a uniform buffer; see `Shape::compile_preview`).
+pub fn preview_module(gpu: &Gpu, src: &Source) -> Result<(wgpu::ShaderModule, Vec<String>)> {
     let compiled = src.shape.compile_preview(&src.harness)?;
-    gpu.shader(&compiled, "preview")
+    Ok((gpu.shader(&compiled, "preview")?, compiled.live))
+}
+
+/// The parameter values to apply as `override` constants: all but the live ones.
+pub fn compiled_defines(defines: &[(String, f64)], live: &[String]) -> Vec<(String, f64)> {
+    defines.iter().filter(|(k, _)| !live.contains(k)).cloned().collect()
 }
 
 /// Build the preview pipeline with the given parameter values (`override` constants). Cheap
@@ -489,9 +510,7 @@ pub fn build_pipeline(
     module: &wgpu::ShaderModule,
     constants: &[(String, f64)],
     format: wgpu::TextureFormat,
-    ubuf: &wgpu::Buffer,
-    vol: Option<&VolGpu>,
-    ed: Option<&wgpu::Buffer>,
+    b: &Bindings,
 ) -> Result<Pipeline> {
     let constants: Vec<(&str, f64)> = constants.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let options = || wgpu::PipelineCompilationOptions {
@@ -521,15 +540,17 @@ pub fn build_pipeline(
             cache: None,
         })
     })?;
-    let mut buffers = vec![ubuf];
-    if let Some(v) = vol {
-        buffers.extend([&v.uni, &v.sd, &v.blk, &v.col]);
+    let mut buffers = vec![(0, &b.ubuf)];
+    if let Some(v) = &b.vol {
+        buffers.extend([(1, &v.uni), (2, &v.sd), (3, &v.blk), (4, &v.col)]);
+    }
+    if let Some(p) = &b.par {
+        buffers.push((5, p));
     }
     let entries: Vec<_> = buffers
         .iter()
-        .enumerate()
         .map(|(i, b)| wgpu::BindGroupEntry {
-            binding: i as u32,
+            binding: *i,
             resource: b.as_entire_binding(),
         })
         .collect();
@@ -540,20 +561,21 @@ pub fn build_pipeline(
             entries: &entries,
         })
     })?;
-    let bind_ed = ed
-        .map(|b| {
-            gpu.scoped(|| {
-                gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("editor primitives"),
-                    layout: &pipeline.get_bind_group_layout(1),
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: b.as_entire_binding(),
-                    }],
+    let bind_ed =
+        b.ed.as_ref()
+            .map(|b| {
+                gpu.scoped(|| {
+                    gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("editor primitives"),
+                        layout: &pipeline.get_bind_group_layout(1),
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: b.as_entire_binding(),
+                        }],
+                    })
                 })
             })
-        })
-        .transpose()?;
+            .transpose()?;
     Ok(Pipeline {
         pipeline,
         bind,
@@ -648,17 +670,20 @@ pub fn render_png(
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let vol = src.volume.as_ref().map(|v| VolGpu::new(&gpu, v)).transpose()?;
-    let module = preview_module(&gpu, &src)?;
-    let ed = src.shape.editor_data(None).map(|d| editor_buffer(&gpu, &d));
-    let pipeline = build_pipeline(
-        &gpu,
-        &module,
-        &src.shape.defines,
-        format,
-        &ubuf,
-        vol.as_ref(),
-        ed.as_ref(),
-    )?;
+    let (module, live) = preview_module(&gpu, &src)?;
+    let params = if live.is_empty() { vec![] } else { src.shape.params()? };
+    let bindings = Bindings {
+        ubuf,
+        vol,
+        par: (!live.is_empty())
+            .then(|| uniform_buffer(&gpu, "parameters", &param_data(&live, &params, &src.shape.defines))),
+        ed: src
+            .shape
+            .editor_data(None)
+            .map(|d| uniform_buffer(&gpu, "editor primitives", &d)),
+    };
+    let constants = compiled_defines(&src.shape.defines, &live);
+    let pipeline = build_pipeline(&gpu, &module, &constants, format, &bindings)?;
     let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("render"),
         size: wgpu::Extent3d {
