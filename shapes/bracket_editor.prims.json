@@ -1,0 +1,11 @@
+{
+  "note": "gen3d primitives, edited in the Design step; unioned with the shape's map()",
+  "prims": [
+    { "kind": "box", "name": "domain", "pos": [0, 0, 20], "dims": [80, 24, 40] },
+    { "kind": "box", "name": "plate", "pos": [-37, 0, 20], "dims": [6, 24, 40], "role": "keep" },
+    { "kind": "cylinder", "op": "subtract", "name": "bolt 1", "pos": [-37, 0, 8], "rot": [0, 90, 0], "dims": [2.75, 6.02, 0], "role": "fixed" },
+    { "kind": "cylinder", "op": "subtract", "name": "bolt 2", "pos": [-37, 0, 32], "rot": [0, 90, 0], "dims": [2.75, 6.02, 0], "role": "fixed" },
+    { "kind": "cylinder", "op": "subtract", "name": "pin", "pos": [32, 0, 20], "rot": [90, 0, 0], "dims": [3, 24.02, 0], "role": "load", "load": [0, 0, -1], "force": 100, "case": 1 },
+    { "kind": "cylinder", "op": "region", "name": "pin side", "pos": [32, 0, 20], "rot": [90, 0, 0], "dims": [3, 24.02, 0], "role": "load", "load": [0, 1, 0], "force": 50, "case": 2 }
+  ]
+}

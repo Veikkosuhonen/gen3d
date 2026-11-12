@@ -319,6 +319,7 @@ compliance), with the SIMP method on a voxel grid. The problem is a shape file w
 | | |
 |---|---|
 | `map` | the design domain: where material may go |
+| (primitives) | supports, loads (with load cases) and kept regions can also come from primitives, see [below](#supports-and-loads-from-primitives) |
 | `field_fixed` (f32) | `< 0` where the part is clamped (all three displacement components are held) |
 | `field_load` (vec3f) | load direction where it is non-zero; the total `--force` is spread over these nodes so the magnitudes add up to it |
 | `field_keep` (f32, optional) | `< 0`: forced solid (mounting plates, bosses, faces you need) |
@@ -329,6 +330,37 @@ gen3d optimize shapes/bracket_domain.wgsl --volfrac 0.3    # -> out/bracket_doma
 gen3d view out/bracket_domain_topopt.vti                     # opens on `density`, threshold 0.5
 gen3d export out/bracket_domain_topopt.vti                   # -> out/bracket_domain_topopt.stl
 ```
+
+### Supports and loads from primitives
+
+Instead of (or as well as) writing the fields, mark [primitives](#primitives-from-the-app-nameprimsjson)
+in the Design step with **Optimize as**:
+
+| role | effect |
+|---|---|
+| *design* (default) | part of the shape like any other: optimized |
+| *keep solid* | its inside is forced solid (a mounting plate, a boss) |
+| *fixed* | clamped: nodes inside it **or within a thin shell around it** don't move |
+| *load* | its region (same rule) carries **force** N along **direction**, in **load case** N |
+
+The shell is 1.5 elements thick (`g3d_reach`, set from the optimizer's element size). It makes the
+natural thing work: a **subtracted** cylinder (a bolt hole) marked *fixed* clamps the hole's wall, and a
+subtracted pin hole marked *load* loads its wall. Fixed and loaded regions are also kept solid, since a
+bolt or pin needs material around it. A primitive whose operation is **region** marks a spot without
+changing the shape, e.g. a box over the face that rests against a wall.
+
+**Load cases:** loads with the same case number act together. Different cases are separate situations
+(a bracket pulled down *or* pushed sideways), and the part is optimized for all of them: the objective
+is the sum of their compliances, each case solved on its own. Each load primitive's force is spread over
+its own nodes. A script's `field_load` is load case 1 and uses `--force` (the app's "script load").
+The result has `displacement` for the first case and `displacement_<case>` for the others.
+
+Script and primitives combine: when primitives use a role, the script's own `field_fixed`,
+`field_load` or `field_keep` (if any) is renamed and wrapped, so the field is the script's region plus
+the primitives'. Overlays, `export --format vti` and the Optimize step see the combined fields.
+`shapes/bracket_editor.wgsl` is the bracket built this way: a domain box, a kept plate, two fixed bolt
+holes, and the pin hole loaded down (case 1) and sideways (case 2). For both cases the optimizer finds a
+hollow, closed box section; a closed section is what stands up to the sideways load's twist.
 
 In the app, the **Optimize** step runs the same thing in the background and shows the result in the
 viewport while it is still running. The file is rewritten after every iteration, atomically, so you

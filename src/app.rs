@@ -27,7 +27,7 @@ use winit::window::{Window, WindowId};
 use crate::browser::{Browser, Pick, ago};
 use crate::gpu::Gpu;
 use crate::jobs::{Job, Slot, mesh_report, opt_progress};
-use crate::prims::{self, Kind, Op, Prim};
+use crate::prims::{self, Kind, Op, Prim, Role};
 use crate::shape::{Field, Param, ParamKind, Shape};
 use crate::slicer;
 use crate::viewer::{
@@ -1117,7 +1117,7 @@ impl App {
             || new
                 .iter()
                 .zip(&old)
-                .any(|(a, b)| a.kind != b.kind || a.hidden != b.hidden);
+                .any(|(a, b)| a.kind != b.kind || a.hidden != b.hidden || a.role != b.role);
         if let Err(e) = prims::save(&path, &new) {
             self.notice = Some(format!("{e:#}"));
             return;
@@ -1387,12 +1387,11 @@ impl App {
                 if ui.checkbox(&mut shown, "").on_hover_text("show / hide").changed() {
                     p.hidden = !shown;
                 }
-                let sign = match p.op {
-                    Op::Union => "+",
-                    Op::Subtract => "-",
-                    Op::Intersect => "&",
+                let role = match p.role {
+                    Role::Design => String::new(),
+                    r => format!("  [{}]", r.name()),
                 };
-                let text = egui::RichText::new(format!("{sign}  {}  ·  {}", p.name, p.kind.name()));
+                let text = egui::RichText::new(format!("{}  {}  ·  {}{role}", p.op.sign(), p.name, p.kind.name()));
                 let text = if p.hidden { text.weak() } else { text };
                 if ui.selectable_label(sel == Some(i), text).clicked() {
                     sel = if sel == Some(i) { None } else { Some(i) };
@@ -1417,6 +1416,55 @@ impl App {
                     }
                 });
                 ui.end_row();
+                ui.label("optimize as").on_hover_text(
+                    "its meaning for Optimize: fixed and load apply to its inside plus a thin shell around \
+                     it (so a fixed subtracted cylinder clamps its hole's wall), and keep those spots solid",
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for r in Role::ALL {
+                        if ui.selectable_label(p.role == r, r.name()).clicked() && p.role != r {
+                            p.role = r;
+                            new_step = true;
+                        }
+                    }
+                });
+                ui.end_row();
+                if p.role == Role::Load {
+                    ui.label("load force");
+                    ui.add(
+                        egui::DragValue::new(&mut p.force)
+                            .speed(1.0)
+                            .range(0.0..=1e6)
+                            .max_decimals(1)
+                            .suffix(" N"),
+                    );
+                    ui.end_row();
+                    ui.label("direction").on_hover_text("normalized when used");
+                    ui.vertical(|ui| {
+                        drag3(ui, &mut p.load, 0.02, "");
+                        ui.horizontal(|ui| {
+                            for (label, d) in [
+                                ("-Z", [0.0, 0.0, -1.0]),
+                                ("+Z", [0.0, 0.0, 1.0]),
+                                ("-X", [-1.0, 0.0, 0.0]),
+                                ("+X", [1.0, 0.0, 0.0]),
+                                ("-Y", [0.0, -1.0, 0.0]),
+                                ("+Y", [0.0, 1.0, 0.0]),
+                            ] {
+                                if ui.small_button(label).clicked() {
+                                    p.load = d;
+                                }
+                            }
+                        });
+                    });
+                    ui.end_row();
+                    ui.label("load case").on_hover_text(
+                        "loads in the same case act together; different cases are separate situations \
+                         the part must handle (optimized for all of them)",
+                    );
+                    ui.add(egui::DragValue::new(&mut p.case).range(1..=16).speed(0.05));
+                    ui.end_row();
+                }
                 ui.label("kind");
                 let mut kind = p.kind;
                 egui::ComboBox::from_id_salt("prim kind")
@@ -2458,15 +2506,16 @@ impl App {
     fn optimize_ui(&mut self, ui: &mut egui::Ui) {
         ui.weak(
             "Optional. Finds the stiffest part that uses a given share of the design domain (the \
-             shape), held where field_fixed < 0 and loaded along field_load.",
+             shape), held at its supports and carrying its loads.",
         );
         if !self.optimizable() {
             ui.add_space(6.0);
             ui.label(
-                "This shape isn't set up as an optimization problem. Add \
-                 `fn field_fixed(p: vec3f) -> f32` (< 0 where the part is clamped) and \
-                 `fn field_load(p: vec3f) -> vec3f` (the load direction); optional field_keep / \
-                 field_void force material / empty space. See shapes/bracket_domain.wgsl.",
+                "This shape needs supports and loads first. In Design, select a primitive (e.g. a \
+                 subtracted bolt hole) and set Optimize as: fixed; then one as load, with a force and \
+                 direction. Primitives set to region mark a spot without changing the shape. Or, in the \
+                 script: `fn field_fixed(p: vec3f) -> f32` (< 0 where clamped) and \
+                 `fn field_load(p: vec3f) -> vec3f` (load direction); see shapes/bracket_domain.wgsl.",
             );
             self.next_button(ui, "Skip to Print", Step::Print);
             return;
@@ -2474,6 +2523,39 @@ impl App {
         let Some(shape) = self.design_shape.clone() else { return };
         if !self.defines.is_empty() {
             ui.weak(format!("for {}", define_list(&self.defines)));
+        }
+        if shape.editor {
+            let fixed: Vec<_> = shape
+                .prims
+                .iter()
+                .filter(|p| !p.hidden && p.role == Role::Fixed)
+                .map(|p| p.name.as_str())
+                .collect();
+            let loads = prims::load_specs(&shape.prims);
+            if !fixed.is_empty() || !loads.is_empty() {
+                section(ui, "Supports & loads");
+                egui::Grid::new("bcs").num_columns(2).show(ui, |ui| {
+                    if !fixed.is_empty() {
+                        ui.label("fixed");
+                        ui.label(fixed.join(", "));
+                        ui.end_row();
+                    }
+                    for l in &loads {
+                        let d = l.dir.unwrap_or_default();
+                        ui.label(format!("case {}", l.case));
+                        ui.label(format!(
+                            "{}: {} N along ({}, {}, {})",
+                            l.name,
+                            fmt_num(l.force.unwrap_or(0.0)),
+                            fmt_num(d[0] as f64),
+                            fmt_num(d[1] as f64),
+                            fmt_num(d[2] as f64)
+                        ));
+                        ui.end_row();
+                    }
+                });
+                ui.weak("Set in Design (select a primitive: Optimize as).");
+            }
         }
         let result = self.result_path();
         let job = self.opt_job.get();
@@ -2493,15 +2575,20 @@ impl App {
                 )
                 .on_hover_text("share of the design domain to fill with material");
                 ui.end_row();
-                ui.label("load");
-                ui.add(
-                    egui::DragValue::new(&mut o.force)
-                        .speed(1.0)
-                        .range(0.0..=1e6)
-                        .suffix(" N"),
-                )
-                .on_hover_text("total force over the field_load region; only scales the displacements");
-                ui.end_row();
+                if shape.script_load.is_some() {
+                    ui.label("script load");
+                    ui.add(
+                        egui::DragValue::new(&mut o.force)
+                            .speed(1.0)
+                            .range(0.0..=1e6)
+                            .suffix(" N"),
+                    )
+                    .on_hover_text(
+                        "total force over the script's field_load region (load case 1); only scales the \
+                         displacements",
+                    );
+                    ui.end_row();
+                }
                 ui.label("element size");
                 ui.horizontal(|ui| {
                     let mut v = o.voxel.unwrap_or(auto);

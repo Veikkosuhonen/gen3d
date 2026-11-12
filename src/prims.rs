@@ -87,16 +87,29 @@ pub enum Op {
     Union,
     Subtract,
     Intersect,
+    /// Doesn't change the shape; only marks a region (for an optimization role).
+    Region,
 }
 
 impl Op {
-    pub const ALL: [Op; 3] = [Op::Union, Op::Subtract, Op::Intersect];
+    pub const ALL: [Op; 4] = [Op::Union, Op::Subtract, Op::Intersect, Op::Region];
 
     pub fn name(self) -> &'static str {
         match self {
             Op::Union => "add",
             Op::Subtract => "subtract",
             Op::Intersect => "intersect",
+            Op::Region => "region",
+        }
+    }
+
+    /// The mark in the primitive list.
+    pub fn sign(self) -> &'static str {
+        match self {
+            Op::Union => "+",
+            Op::Subtract => "-",
+            Op::Intersect => "&",
+            Op::Region => "o",
         }
     }
 
@@ -106,6 +119,7 @@ impl Op {
             Op::Union => 0.0,
             Op::Subtract => 1.0,
             Op::Intersect => 2.0,
+            Op::Region => 3.0,
         }
     }
 
@@ -114,6 +128,7 @@ impl Op {
     pub fn apply(self, a: f32, b: f32, k: f32) -> f32 {
         let mix = |x: f32, y: f32, h: f32| x + (y - x) * h;
         match self {
+            Op::Region => a,
             Op::Union if k <= 0.0 => a.min(b),
             Op::Union => {
                 let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
@@ -133,7 +148,42 @@ impl Op {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+/// What a primitive means to topology optimization (`gen3d optimize`). The role's region is the
+/// primitive's inside plus a shell `g3d_reach` thick around it (about 1.5 elements; the optimizer sets
+/// it), so a fixed *subtracted* cylinder clamps the wall of its hole.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// Optimized like the rest of the design domain.
+    #[default]
+    Design,
+    /// Kept solid (non-design): its inside, where it's in the domain.
+    Keep,
+    /// Clamped: nodes in its region don't move. Kept solid there.
+    Fixed,
+    /// Loaded: its region carries `force` N along `load`. Kept solid there.
+    Load,
+}
+
+impl Role {
+    pub const ALL: [Role; 4] = [Role::Design, Role::Keep, Role::Fixed, Role::Load];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Design => "design",
+            Role::Keep => "keep solid",
+            Role::Fixed => "fixed",
+            Role::Load => "load",
+        }
+    }
+
+    /// A boundary condition (the region includes the shell around the primitive).
+    pub fn is_bc(self) -> bool {
+        matches!(self, Role::Fixed | Role::Load)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prim {
     pub kind: Kind,
@@ -151,6 +201,48 @@ pub struct Prim {
     /// Smoothing radius of the operation with everything before it (0 = sharp).
     pub blend: f32,
     pub hidden: bool,
+    /// Meaning for topology optimization.
+    pub role: Role,
+    /// Load direction (`Role::Load`); normalized when used.
+    pub load: [f32; 3],
+    /// Load magnitude in N, spread over the region's nodes (`Role::Load`).
+    pub force: f32,
+    /// Load case (`Role::Load`): loads in one case act together; separate cases are separate
+    /// situations the part must survive (the optimizer minimizes their summed compliance).
+    pub case: u32,
+}
+
+impl Default for Prim {
+    fn default() -> Prim {
+        Prim {
+            kind: Kind::default(),
+            op: Op::default(),
+            name: String::new(),
+            pos: [0.0; 3],
+            rot: [0.0; 3],
+            dims: [0.0; 3],
+            round: 0.0,
+            blend: 0.0,
+            hidden: false,
+            role: Role::Design,
+            load: [0.0, 0.0, -1.0],
+            force: 100.0,
+            case: 1,
+        }
+    }
+}
+
+/// A load for the optimizer: the script's `field_load` (vector field, scaled to `--force`) or a
+/// primitive with the load role (region < 0, with its own direction and force).
+#[derive(Clone, Debug)]
+pub struct LoadSpec {
+    pub name: String,
+    /// `fn(p) -> vec3f` if `dir` is None, else `fn(p) -> f32` (< 0 inside the region)
+    pub func: String,
+    pub dir: Option<[f32; 3]>,
+    /// N; None = the optimizer's `--force`
+    pub force: Option<f64>,
+    pub case: u32,
 }
 
 /// The sidecar file.
@@ -182,6 +274,15 @@ pub fn load(path: &Path) -> Result<Vec<Prim>> {
                 *v = 0.0;
             }
         }
+        for v in p.load.iter_mut() {
+            if !v.is_finite() {
+                *v = 0.0;
+            }
+        }
+        if !p.force.is_finite() {
+            p.force = 0.0;
+        }
+        p.case = p.case.max(1);
         for v in [&mut p.round, &mut p.blend] {
             if !v.is_finite() {
                 *v = 0.0;
@@ -428,8 +529,10 @@ fn g3d_ed_cone(p: vec3f, d: vec3f, r: f32) -> f32 {
     let s = select(1.0, -1.0, cb.x < 0.0 && ca.y < 0.0);
     return s * sqrt(min(dot(ca, ca), dot(cb, cb)));
 }
-// a combined with b: op 0 = union, 1 = subtract (a minus b), 2 = intersect; k = smoothing radius
+// a combined with b: op 0 = union, 1 = subtract (a minus b), 2 = intersect, 3 = none (a region
+// marker); k = smoothing radius
 fn g3d_ed_combine(a: f32, b: f32, k: f32, op: f32) -> f32 {
+    if (op > 2.5) { return a; } // region only
     if (op > 1.5) {
         if (k <= 0.0) { return max(a, b); }
         let h = clamp(0.5 - 0.5 * (b - a) / k, 0.0, 1.0);
@@ -480,11 +583,17 @@ pub const NO_OVERLAY: &str =
 
 /// Index of primitive `i`'s first vec4 in `g3d_ed` (element 0 holds the selection).
 fn base(i: usize) -> usize {
-    1 + 3 * i
+    1 + 4 * i
 }
 
-/// The values `wgsl` reads from `g3d_ed`: element 0 = (selected index or -1, 0, 0, 0), then three
-/// vec4s per primitive (hidden ones too, so indices stay put): (pos, blend), (rot, round), (dims, op).
+/// Length of `g3d_ed` for `n` primitives.
+pub fn data_len(n: usize) -> usize {
+    1 + 4 * n
+}
+
+/// The values `wgsl` reads from `g3d_ed`: element 0 = (selected index or -1, 0, 0, 0), then four
+/// vec4s per primitive (hidden ones too, so indices stay put): (pos, blend), (rot, round), (dims, op),
+/// (load direction, force).
 pub fn data(prims: &[Prim], selected: Option<usize>) -> Vec<[f32; 4]> {
     let sel = selected.filter(|&i| prims.get(i).is_some_and(|p| !p.hidden));
     let mut out = vec![[sel.map_or(-1.0, |i| i as f32), 0.0, 0.0, 0.0]];
@@ -492,7 +601,13 @@ pub fn data(prims: &[Prim], selected: Option<usize>) -> Vec<[f32; 4]> {
         let [x, y, z] = p.pos;
         let [rx, ry, rz] = p.rot;
         let [a, b, c] = p.dims;
-        out.extend([[x, y, z, p.blend], [rx, ry, rz, p.round], [a, b, c, p.op.code()]]);
+        let [lx, ly, lz] = p.load;
+        out.extend([
+            [x, y, z, p.blend],
+            [rx, ry, rz, p.round],
+            [a, b, c, p.op.code()],
+            [lx, ly, lz, p.force],
+        ]);
     }
     out
 }
@@ -511,10 +626,32 @@ pub fn decl_const(data: &[[f32; 4]]) -> String {
     format!("const g3d_ed = array<vec4f, {}>({});\n", data.len(), items.join(", "))
 }
 
+/// Which of its own functions the script defines that the generated code wraps (each renamed to
+/// `g3d_script_<name>`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Script {
+    pub map: bool,
+    pub fixed: bool,
+    pub load: bool,
+    pub keep: bool,
+}
+
+/// Which optimization fields the visible primitives' roles add to: (field_fixed, field_load,
+/// field_keep). Fixed and loaded regions are kept solid too.
+pub fn role_fields(prims: &[Prim]) -> (bool, bool, bool) {
+    let has = |r: Role| prims.iter().any(|p| !p.hidden && p.role == r);
+    let (f, l, k) = (has(Role::Fixed), has(Role::Load), has(Role::Keep));
+    (f, l, f || l || k)
+}
+
 /// Generated WGSL: the primitives as functions reading their numbers from `g3d_ed` (declared by the
-/// caller with `decl_uniform` or `decl_const`), `map` = the script's map (if `script_map`) unioned
-/// with them, and `g3d_ed_selected`, the distance to the selected primitive, for the preview's highlight.
-pub fn wgsl(prims: &[Prim], script_map: bool) -> String {
+/// caller with `decl_uniform` or `decl_const`), `map` = the script's map (if it has one) combined
+/// with them, `g3d_ed_selected` (the distance to the selected primitive, for the preview's
+/// highlight), and for primitives with optimization roles `field_fixed` / `field_load` /
+/// `field_keep` (the script's own, if any, plus the primitives' regions; `reach` = default shell
+/// thickness around boundary-condition primitives, `g3d_reach`).
+pub fn wgsl(prims: &[Prim], script: Script, reach: f32) -> String {
+    let script_map = script.map;
     let mut s = String::from(LIBRARY);
     let visible: Vec<_> = prims.iter().enumerate().filter(|(_, p)| !p.hidden).collect();
     for &(i, p) in &visible {
@@ -551,12 +688,86 @@ pub fn wgsl(prims: &[Prim], script_map: bool) -> String {
         let _ = writeln!(s, "        case {i}: {{ return g3d_e{i}(p); }}");
     }
     s += "        default: { return 1e10; }\n    }\n}\n";
+
+    // optimization roles
+    let (gen_fixed, gen_load, gen_keep) = role_fields(prims);
+    if gen_fixed || gen_load || gen_keep {
+        let _ = writeln!(s, "override g3d_reach: f32 = {reach:?};");
+    }
+    let with = |r: Role| visible.iter().filter(move |(_, p)| p.role == r).map(|(i, _)| *i);
+    let bc: Vec<usize> = visible
+        .iter()
+        .filter(|(_, p)| p.role.is_bc())
+        .map(|(i, _)| *i)
+        .collect();
+    for &i in &bc {
+        let _ = writeln!(s, "fn g3d_bc{i}(p: vec3f) -> f32 {{ return g3d_e{i}(p) - g3d_reach; }}");
+    }
+    if gen_fixed {
+        s += "fn field_fixed(p: vec3f) -> f32 {\n";
+        s += if script.fixed {
+            "    var d = g3d_script_field_fixed(p);\n"
+        } else {
+            "    var d = 1e10;\n"
+        };
+        for i in with(Role::Fixed) {
+            let _ = writeln!(s, "    d = min(d, g3d_bc{i}(p));");
+        }
+        s += "    return d;\n}\n";
+    }
+    if gen_load {
+        s += "fn field_load(p: vec3f) -> vec3f {\n";
+        s += if script.load {
+            "    var v = g3d_script_field_load(p);\n"
+        } else {
+            "    var v = vec3f(0.0);\n"
+        };
+        for i in with(Role::Load) {
+            let _ = writeln!(
+                s,
+                "    if (g3d_bc{i}(p) < 0.0) {{\n        let dir = g3d_ed[{}].xyz;\n        \
+                 if (dot(dir, dir) > 0.0) {{ v += normalize(dir); }}\n    }}",
+                base(i) + 3
+            );
+        }
+        s += "    return v;\n}\n";
+    }
+    if gen_keep {
+        s += "fn field_keep(p: vec3f) -> f32 {\n";
+        s += if script.keep {
+            "    var d = g3d_script_field_keep(p);\n"
+        } else {
+            "    var d = 1e10;\n"
+        };
+        for i in with(Role::Keep) {
+            let _ = writeln!(s, "    d = min(d, g3d_e{i}(p));");
+        }
+        for &i in &bc {
+            let _ = writeln!(s, "    d = min(d, g3d_bc{i}(p));");
+        }
+        s += "    return d;\n}\n";
+    }
     s
 }
 
-/// Find the script's `fn map(` definition (ignoring `//` comments) and rename it in place, keeping
-/// the line structure so error locations still map back. Returns whether there was one.
-pub fn rename_script_map(source: &mut String) -> Result<bool> {
+/// The loads of the visible primitives with the load role.
+pub fn load_specs(prims: &[Prim]) -> Vec<LoadSpec> {
+    prims
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.hidden && p.role == Role::Load)
+        .map(|(i, p)| LoadSpec {
+            name: p.name.clone(),
+            func: format!("g3d_bc{i}"),
+            dir: Some(p.load),
+            force: Some(p.force as f64),
+            case: p.case.max(1),
+        })
+        .collect()
+}
+
+/// Byte offset of the name in the script's `fn <name>(` definition (ignoring `//` comments), if any.
+pub fn find_fn(source: &str, name: &str) -> Result<Option<usize>> {
     let mut found = None;
     let mut offset = 0;
     for line in source.split_inclusive('\n') {
@@ -570,11 +781,11 @@ pub fn rename_script_map(source: &mut String) -> Result<bool> {
             let ws = after.len() - trimmed.len();
             if before_ok
                 && ws > 0
-                && let Some(tail) = trimmed.strip_prefix("map")
+                && let Some(tail) = trimmed.strip_prefix(name)
                 && !tail.bytes().next().is_some_and(is_ident)
             {
                 if found.is_some() {
-                    bail!("more than one `fn map` in the shape");
+                    bail!("more than one `fn {name}` in the shape");
                 }
                 found = Some(offset + base + i + 2 + ws);
             }
@@ -583,10 +794,18 @@ pub fn rename_script_map(source: &mut String) -> Result<bool> {
         }
         offset += line.len();
     }
-    if let Some(at) = found {
-        source.replace_range(at..at + 3, "g3d_script_map");
+    Ok(found)
+}
+
+/// Rename the script's `fn <name>` definition to `g3d_script_<name>` in place, keeping the line
+/// structure so error locations still map back (calls elsewhere then reach the generated wrapper).
+/// Returns whether there was one.
+pub fn rename_script_fn(source: &mut String, name: &str) -> Result<bool> {
+    let at = find_fn(source, name)?;
+    if let Some(at) = at {
+        source.replace_range(at..at + name.len(), &format!("g3d_script_{name}"));
     }
-    Ok(found.is_some())
+    Ok(at.is_some())
 }
 
 fn is_ident(b: u8) -> bool {
@@ -597,16 +816,69 @@ fn is_ident(b: u8) -> bool {
 mod tests {
     use super::*;
 
+    /// The script's own optimization fields are kept and extended by the primitives' roles.
+    #[test]
+    fn roles_extend_script_fields() {
+        use crate::shape::load_shape;
+        let dir = std::env::temp_dir().join(format!("gen3d-roles-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.wgsl");
+        std::fs::write(
+            &p,
+            "fn map(p: vec3f) -> f32 { return length(p) - 10.0; }\n\
+             fn field_fixed(p: vec3f) -> f32 { return p.z + 9.0; }\n\
+             fn field_load(p: vec3f) -> vec3f { return select(vec3f(0.0), vec3f(1.0, 0.0, 0.0), p.x > 9.0); }\n",
+        )
+        .unwrap();
+        // only a load primitive: the script's field_fixed stays as is, field_load is wrapped
+        let push = Prim {
+            role: Role::Load,
+            case: 2,
+            ..Prim::new(Kind::Sphere, "push".into(), [0.0, 0.0, 9.0], 4.0)
+        };
+        save(&sidecar(&p), std::slice::from_ref(&push)).unwrap();
+        let s = load_shape(&p, &[]).unwrap();
+        assert!(
+            s.source
+                .contains("fn field_fixed(p: vec3f) -> f32 { return p.z + 9.0; }")
+        );
+        assert!(
+            s.source.contains("fn g3d_script_field_load(") && s.source.contains("var v = g3d_script_field_load(p);")
+        );
+        let specs = s.load_specs();
+        let got: Vec<_> = specs.iter().map(|l| (l.func.as_str(), l.case, l.force)).collect();
+        assert_eq!(got, [("g3d_script_field_load", 1, None), ("g3d_bc0", 2, Some(100.0))]);
+        let names: Vec<_> = s.fields().unwrap().into_iter().map(|f| f.name).collect();
+        assert_eq!(names, ["fixed", "load", "keep"]);
+        let h = crate::viewer::preview_harness(&s.fields().unwrap(), true);
+        s.compile_preview(&h).unwrap();
+        s.compile(&crate::mesher::compute_harness("field_load", 3)).unwrap();
+        // hidden: back to the script's fields only
+        let mut hidden = push;
+        hidden.hidden = true;
+        save(&sidecar(&p), &[hidden]).unwrap();
+        let s = load_shape(&p, &[]).unwrap();
+        assert!(!s.bc && s.source.contains("fn field_load(") && s.load_specs().len() == 1);
+        // old sidecars (no role fields) load with sensible defaults
+        std::fs::write(sidecar(&p), r#"{"prims":[{"kind":"box","dims":[1,1,1]}]}"#).unwrap();
+        let old = load(&sidecar(&p)).unwrap();
+        assert_eq!(
+            (old[0].role, old[0].op, old[0].case, old[0].force),
+            (Role::Design, Op::Union, 1, 100.0)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn rename_finds_the_definition_only() {
         let mut s = "// fn map(p) old\nfn helper() -> f32 { return map(vec3f(0)); }\nfn  map (p: vec3f) -> f32 { return 1.0; }\nfn mapper() {}\n".to_string();
-        assert!(rename_script_map(&mut s).unwrap());
+        assert!(rename_script_fn(&mut s, "map").unwrap());
         assert!(s.contains("fn  g3d_script_map (p: vec3f)"), "{s}");
         assert!(s.contains("return map(vec3f(0))"));
         assert!(s.contains("// fn map(p) old"));
         assert!(s.contains("fn mapper()"));
         let mut none = "fn mapper() {}\n".to_string();
-        assert!(!rename_script_map(&mut none).unwrap());
+        assert!(!rename_script_fn(&mut none, "map").unwrap());
     }
 
     #[test]
@@ -645,7 +917,7 @@ mod tests {
         let names: Vec<_> = s.params().unwrap().into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["R"]);
         let d = data(&s.prims, Some(2));
-        assert_eq!((d.len(), d[0][0], d[base(1) + 1][3]), (1 + 3 * 6, 2.0, 0.5));
+        assert_eq!((d.len(), d[0][0], d[base(1) + 1][3]), (data_len(6), 2.0, 0.5));
         assert_eq!(
             data(&s.prims, Some(3))[0][0],
             -1.0,

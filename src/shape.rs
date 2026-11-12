@@ -39,6 +39,11 @@ pub struct Shape {
     pub script_map: bool,
     /// The bounds the file declares (`bounds` grows from these to fit the primitives).
     pub base_bounds: ([f32; 3], [f32; 3]),
+    /// The script's own `field_load`, under the name it has in `source` (it is renamed when
+    /// primitives add loads).
+    pub script_load: Option<String>,
+    /// Whether primitives have boundary-condition roles (so `g3d_reach` is declared).
+    pub bc: bool,
 }
 
 impl Shape {
@@ -85,6 +90,8 @@ impl Shape {
             editor: false,
             script_map: true,
             base_bounds: ([-50.0, -50.0, 0.0], [50.0, 50.0, 100.0]),
+            script_load: None,
+            bc: false,
         }
     }
 
@@ -106,6 +113,25 @@ impl Shape {
         let margin = 2.0 * self.voxel;
         let prims = if self.editor { &self.prims[..] } else { &[] };
         self.bounds = prims::grow_bounds(base, prims, margin).unwrap_or(self.base_bounds);
+    }
+
+    /// The loads for `gen3d optimize`: the script's `field_load` (case 1, scaled to `--force`) and
+    /// each primitive with the load role.
+    pub fn load_specs(&self) -> Vec<prims::LoadSpec> {
+        let mut out = vec![];
+        if let Some(func) = &self.script_load {
+            out.push(prims::LoadSpec {
+                name: "field_load".into(),
+                func: func.clone(),
+                dir: None,
+                force: None,
+                case: 1,
+            });
+        }
+        if self.editor {
+            out.extend(prims::load_specs(&self.prims));
+        }
+        out
     }
 
     /// The primitives' values for the preview's `g3d_ed` uniform buffer (None without the editor).
@@ -138,7 +164,7 @@ impl Shape {
     /// override's initializer), every parameter stays an `override`.
     pub fn compile_preview(&self, harness: &str) -> Result<Compiled> {
         let ed = match self.editor {
-            true => prims::decl_uniform(1 + 3 * self.prims.len()) + prims::OVERLAY,
+            true => prims::decl_uniform(prims::data_len(self.prims.len())) + prims::OVERLAY,
             false => prims::NO_OVERLAY.to_string(),
         };
         if let Some((source, live)) = self.live_source() {
@@ -675,21 +701,41 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
     }
     shape.base_bounds = shape.bounds;
 
-    // the editor's primitives: rename the script's map and append the generated union
+    if prims::find_fn(&shape.source, "field_load")?.is_some() {
+        shape.script_load = Some("field_load".into());
+    }
+
+    // the editor's primitives: rename the script's map (and the optimization fields the primitives'
+    // roles add to) and append the generated code that combines them
     let sidecar = prims::sidecar(&path);
     if sidecar.exists() {
         shape.prims = prims::load(&sidecar)?;
         shape.editor = true;
-        shape.script_map = prims::rename_script_map(&mut shape.source)?;
+        shape.update_bounds();
+        let (fixed, load, keep) = prims::role_fields(&shape.prims);
+        let mut wrap =
+            |name: &str, on: bool| -> Result<bool> { Ok(on && prims::rename_script_fn(&mut shape.source, name)?) };
+        let script = prims::Script {
+            map: wrap("map", true)?,
+            fixed: wrap("field_fixed", fixed)?,
+            load: wrap("field_load", load)?,
+            keep: wrap("field_keep", keep)?,
+        };
+        shape.script_map = script.map;
+        if script.load {
+            shape.script_load = Some("g3d_script_field_load".into());
+        }
+        shape.bc = fixed || load || keep;
+        // the optimizer sets g3d_reach from its element size; this default is for the preview
+        let reach = 1.5 * crate::topopt::auto_voxel(&shape, 40_000.0);
         shape.files.push(sidecar);
         let idx = shape.files.len();
         shape.files.push(library_path("editor.wgsl"));
-        for (i, line) in prims::wgsl(&shape.prims, shape.script_map).lines().enumerate() {
+        for (i, line) in prims::wgsl(&shape.prims, script, reach).lines().enumerate() {
             shape.source.push_str(line);
             shape.source.push('\n');
             shape.origins.push(Origin { file: idx, line: i + 1 });
         }
-        shape.update_bounds();
     }
     Ok(shape)
 }

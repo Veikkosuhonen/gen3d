@@ -3,7 +3,12 @@
 //!
 //! The problem comes from a shape file: `map` is the design domain, `field_fixed` (< 0) clamps nodes,
 //! `field_load` (vec3f) gives the load direction where it is non-zero, and the optional `field_keep`
-//! / `field_void` (< 0) force elements solid / empty. Each voxel is a trilinear 8-node hex element.
+//! / `field_void` (< 0) force elements solid / empty. Primitives from the editor add to these with
+//! their roles (`prims::Role`); each load primitive has its own force and load case. Each voxel is a
+//! trilinear 8-node hex element.
+//!
+//! Load cases: loads in one case act together; separate cases are separate situations. The
+//! objective is the sum of the cases' compliances (each solved separately).
 //!
 //! Each iteration solves K(ρ) u = f with a matrix-free, Jacobi-preconditioned conjugate gradient
 //! (multithreaded, warm-started), computes the compliance sensitivities, applies a density filter
@@ -59,8 +64,10 @@ pub struct Problem {
     pub passive: Vec<bool>,
     /// per node: clamped (only nodes of domain elements)
     pub fixed: Vec<bool>,
-    /// per node: force (N)
-    pub load: Vec<[f64; 3]>,
+    /// per load case, per node: force (N)
+    pub loads: Vec<Vec<[f64; 3]>>,
+    /// the load cases' numbers, in the order of `loads`
+    pub cases: Vec<u32>,
 }
 
 impl Problem {
@@ -119,17 +126,30 @@ fn x_fastest(v: &[f32], d: [usize; 3], comps: usize) -> Vec<f32> {
 
 /// Sample the shape's domain and boundary-condition fields on the element grid.
 pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
-    let fields = shape.fields()?;
-    let field = |name: &str, comps: usize| fields.iter().find(|f| f.name == name && f.comps == comps);
-    let Some(fixed_f) = field("fixed", 1) else {
-        bail!("optimize needs `fn field_fixed(p: vec3f) -> f32`, < 0 where the part is clamped");
-    };
-    let Some(load_f) = field("load", 3) else {
-        bail!("optimize needs `fn field_load(p: vec3f) -> vec3f`, the load direction where it is applied");
-    };
     let h = s.voxel;
     if h <= 0.0 {
         bail!("voxel size must be positive");
+    }
+    // boundary-condition primitives reach 1.5 elements past their surface (so a hole's wall is clamped)
+    let mut shape = shape.clone();
+    if shape.bc {
+        shape.defines.push(("g3d_reach".into(), 1.5 * h));
+    }
+    let shape = &shape;
+    let fields = shape.fields()?;
+    let field = |name: &str, comps: usize| fields.iter().find(|f| f.name == name && f.comps == comps);
+    let Some(fixed_f) = field("fixed", 1) else {
+        bail!(
+            "optimize needs supports: `fn field_fixed(p: vec3f) -> f32` (< 0 where the part is clamped), \
+             or a primitive with the fixed role"
+        );
+    };
+    let specs = shape.load_specs();
+    if specs.is_empty() {
+        bail!(
+            "optimize needs loads: `fn field_load(p: vec3f) -> vec3f` (the load direction where it is \
+             applied), or a primitive with the load role"
+        );
     }
     let (lo, hi) = shape.bounds;
     let n = [0, 1, 2].map(|k| ((hi[k] - lo[k]) as f64 / h).ceil().max(1.0) as usize);
@@ -157,7 +177,6 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     let keep = field("keep", 1).map(|f| at_cells(&f.func)).transpose()?;
     let void = field("void", 1).map(|f| at_cells(&f.func)).transpose()?;
     let fixed = x_fastest(&sample_field(shape, &nodes, &fixed_f.func, 1, gpu)?, pts, 1);
-    let load = x_fastest(&sample_field(shape, &nodes, &load_f.func, 3, gpu)?, pts, 3);
 
     let domain: Vec<bool> = (0..ne)
         .map(|e| sdf[e] < 0.0 && void.as_ref().is_none_or(|v| v[e] >= 0.0))
@@ -172,47 +191,88 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         domain,
         passive,
         fixed: vec![],
-        load: vec![],
+        loads: vec![],
+        cases: vec![],
     };
     let active = p.active_nodes();
     p.fixed = (0..active.len()).map(|i| active[i] && fixed[i] < 0.0).collect();
-    let raw: Vec<[f64; 3]> = (0..active.len())
-        .map(|i| {
-            let v = [0, 1, 2].map(|c| load[3 * i + c] as f64);
-            if active[i] && !p.fixed[i] && v.iter().all(|x| x.is_finite()) {
-                v
-            } else {
-                [0.0; 3]
-            }
-        })
-        .collect();
-    let total: f64 = raw
-        .iter()
-        .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
-        .sum();
     let nfixed = p.fixed.iter().filter(|b| **b).count();
-    let nload = raw.iter().filter(|v| v.iter().any(|x| *x != 0.0)).count();
     if nfixed == 0 {
         bail!(
-            "no clamped nodes: field_fixed is never < 0 at a node of the design domain (try a smaller --voxel or a thicker region)"
+            "no clamped nodes: the fixed region (field_fixed < 0, or a fixed primitive) reaches no node of \
+             the design domain (try a smaller --voxel, a thicker region, or move it onto the part)"
         );
     }
-    if nload == 0 {
-        bail!(
-            "no loaded nodes: field_load is zero at every free node of the design domain (try a smaller --voxel or a thicker region)"
-        );
+    // each load is spread over its own nodes so its magnitudes sum to its force
+    let nn = active.len();
+    let mut cases: std::collections::BTreeMap<u32, Vec<[f64; 3]>> = Default::default();
+    let mut loaded = vec![false; nn];
+    for spec in &specs {
+        let raw: Vec<[f64; 3]> = match spec.dir {
+            None => {
+                let v = x_fastest(&sample_field(shape, &nodes, &spec.func, 3, gpu)?, pts, 3);
+                (0..nn).map(|i| [0, 1, 2].map(|c| v[3 * i + c] as f64)).collect()
+            }
+            Some(d) => {
+                let r = x_fastest(&sample_field(shape, &nodes, &spec.func, 1, gpu)?, pts, 1);
+                let d = d.map(|c| c as f64);
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                if l == 0.0 {
+                    bail!("load `{}` has no direction", spec.name);
+                }
+                (0..nn)
+                    .map(|i| if r[i] < 0.0 { d.map(|c| c / l) } else { [0.0; 3] })
+                    .collect()
+            }
+        };
+        let raw: Vec<[f64; 3]> = raw
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                if active[i] && !p.fixed[i] && v.iter().all(|x| x.is_finite()) {
+                    v
+                } else {
+                    [0.0; 3]
+                }
+            })
+            .collect();
+        let total: f64 = raw
+            .iter()
+            .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
+            .sum();
+        if total == 0.0 {
+            bail!(
+                "no loaded nodes for load `{}`: its region reaches no free node of the design domain \
+                 (try a smaller --voxel, a thicker region, or move it onto the part)",
+                spec.name
+            );
+        }
+        let force = spec.force.unwrap_or(s.force);
+        println!("load `{}`: {force} N, case {}", spec.name, spec.case);
+        let case = cases.entry(spec.case).or_insert_with(|| vec![[0.0; 3]; nn]);
+        for (i, v) in raw.iter().enumerate() {
+            if v.iter().any(|x| *x != 0.0) {
+                loaded[i] = true;
+                for c in 0..3 {
+                    case[i][c] += v[c] * force / total;
+                }
+            }
+        }
     }
-    // spread the total force so the load magnitudes sum to `force`
-    p.load = raw.iter().map(|v| v.map(|x| x * s.force / total)).collect();
+    let nload = loaded.iter().filter(|b| **b).count();
+    p.cases = cases.keys().copied().collect();
+    p.loads = cases.into_values().collect();
     let ndomain = p.domain.iter().filter(|b| **b).count();
     let npassive = p.passive.iter().filter(|b| **b).count();
     println!(
-        "grid {}x{}x{} @ {} mm: {ndomain} domain elements ({} design, {npassive} kept solid), {nfixed} clamped nodes, {nload} loaded nodes",
+        "grid {}x{}x{} @ {} mm: {ndomain} domain elements ({} design, {npassive} kept solid), {nfixed} clamped nodes, {nload} loaded nodes, {} load case{}",
         n[0],
         n[1],
         n[2],
         h as f32,
-        ndomain - npassive
+        ndomain - npassive,
+        p.loads.len(),
+        if p.loads.len() == 1 { "" } else { "s" }
     );
     Ok(p)
 }
@@ -544,7 +604,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
     }
     let active = p.active_nodes();
     let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
-    let f: Vec<f64> = p.load.iter().flatten().copied().collect();
+    let fs: Vec<Vec<f64>> = p.loads.iter().map(|l| l.iter().flatten().copied().collect()).collect();
     let emin = s.e0 * 1e-6;
     let filter = Filter::new(p, s.rmin);
     let mut proj = Projection {
@@ -565,7 +625,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
         .collect();
     let mut xtilde = filter.densities(p, &x);
     let mut xphys = proj.densities(p, &xtilde);
-    let mut u = vec![0.0; f.len()];
+    let mut us: Vec<Vec<f64>> = fs.iter().map(|f| vec![0.0; f.len()]).collect();
     let t_start = Instant::now();
     let mut stalled = 0;
     let mut stage_its = 0;
@@ -575,13 +635,18 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
         max_disp: 0.0,
     };
     println!(
-        "SIMP: volume fraction {}, penalty {}, filter radius {} voxels, E = {} MPa, nu = {}, load {} N, {}",
+        "SIMP: volume fraction {}, penalty {}, filter radius {} voxels, E = {} MPa, nu = {}, {} load case{}, {}",
         s.volfrac,
         s.penal,
         s.rmin,
         s.e0,
         s.nu,
-        s.force,
+        p.loads.len(),
+        if p.loads.len() == 1 {
+            ""
+        } else {
+            "s (summed compliance)"
+        },
         if s.beta_max > 0.0 {
             format!("Heaviside projection up to beta {}", s.beta_max)
         } else {
@@ -604,8 +669,15 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
                 .collect(),
             free: free.clone(),
         };
-        let cg = fem.solve(&f, &mut u, 1e-4, 20_000);
-        let ce = fem.element_energy(&u);
+        // each load case separately; the objective is their summed compliance
+        let mut cg = 0;
+        let mut ce = vec![0.0; ne];
+        for (f, u) in fs.iter().zip(us.iter_mut()) {
+            cg += fem.solve(f, u, 1e-4, 20_000);
+            for (a, b) in ce.iter_mut().zip(fem.element_energy(u)) {
+                *a += b;
+            }
+        }
         let compliance: f64 = (0..ne).map(|e| fem.ee[e] * ce[e]).sum();
         let dc: Vec<f64> = (0..ne)
             .map(|e| {
@@ -646,10 +718,9 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
         xphys = proj.densities(p, &xtilde);
         x = xnew;
 
-        let max_disp = u
-            .as_chunks::<3>()
-            .0
+        let max_disp = us
             .iter()
+            .flat_map(|u| u.as_chunks::<3>().0.iter())
             .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
             .fold(0.0, f64::max);
         let grey = design
@@ -672,8 +743,20 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
         let energy: Vec<f32> = (0..ne)
             .map(|e| (0.5 * fem.ee[e] * ce[e] / p.h.powi(3)) as f32)
             .collect();
-        let disp: Vec<f32> = u.iter().map(|&v| v as f32).collect();
-        let arrays = [
+        let disps: Vec<Vec<f32>> = us.iter().map(|u| u.iter().map(|&v| v as f32).collect()).collect();
+        let names: Vec<String> = p
+            .cases
+            .iter()
+            .enumerate()
+            .map(|(k, c)| {
+                if k == 0 {
+                    "displacement".to_string()
+                } else {
+                    format!("displacement_{c}")
+                }
+            })
+            .collect();
+        let mut arrays = vec![
             crate::vti::GridArray {
                 name: "density",
                 cell: true,
@@ -686,13 +769,15 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
                 comps: 1,
                 data: &energy,
             },
-            crate::vti::GridArray {
-                name: "displacement",
+        ];
+        for (name, data) in names.iter().zip(&disps) {
+            arrays.push(crate::vti::GridArray {
+                name,
                 cell: false,
                 comps: 3,
-                data: &disp,
-            },
-        ];
+                data,
+            });
+        }
         let bytes = crate::vti::write_grid(out, p.origin, p.h, p.nodes(), &arrays)?;
         if it == 1 {
             println!(
@@ -783,6 +868,91 @@ mod tests {
     }
 
     /// A 1x1x4 column, clamped at the bottom and pulled at the top, with nu = 0: the trilinear hex
+    /// Supports and loads from editor primitives: a fixed subtracted bolt hole, a pin hole loaded
+    /// down (case 1) and a region at the pin loaded sideways (case 2). Skipped without a GPU.
+    #[test]
+    fn primitives_set_up_supports_and_load_cases() {
+        use crate::prims::{Kind, Op, Prim, Role, save, sidecar};
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("gen3d-bc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bar.wgsl");
+        std::fs::write(
+            &path,
+            "//! bounds -20 -6 0 20 6 20\nfn map(p: vec3f) -> f32 {\n  \
+             let q = abs(p - vec3f(0, 0, 10)) - vec3f(20, 6, 10);\n  \
+             return length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);\n}\n",
+        )
+        .unwrap();
+        let hole = |name: &str, x: f32, role| Prim {
+            op: Op::Subtract,
+            rot: [90.0, 0.0, 0.0],
+            role,
+            ..Prim::new(Kind::Cylinder, name.into(), [x, 0.0, 10.0], 5.0)
+        };
+        let bolt = hole("bolt", -15.0, Role::Fixed);
+        let mut pin = hole("pin", 15.0, Role::Load);
+        pin.dims = [2.5, 14.0, 0.0];
+        pin.force = 50.0;
+        let side = Prim {
+            op: Op::Region,
+            role: Role::Load,
+            load: [0.0, 2.0, 0.0], // normalized when used
+            force: 30.0,
+            case: 2,
+            ..Prim::new(Kind::Sphere, "side".into(), [15.0, 0.0, 10.0], 8.0)
+        };
+        save(&sidecar(&path), &[bolt, pin, side]).unwrap();
+        let shape = crate::shape::load_shape(&path, &[]).unwrap();
+        assert!(shape.bc && shape.script_load.is_none());
+        let names: Vec<_> = shape.fields().unwrap().into_iter().map(|f| f.name).collect();
+        assert_eq!(names, ["fixed", "load", "keep"]);
+        let s = Settings {
+            voxel: 1.0,
+            volfrac: 0.3,
+            penal: 3.0,
+            rmin: 1.5,
+            iters: 1,
+            tol: 0.01,
+            e0: 3500.0,
+            nu: 0.3,
+            force: 999.0, // only for a script's field_load: unused here
+            beta_max: 0.0,
+        };
+        let p = setup(&shape, &s, &gpu).unwrap();
+        assert_eq!(p.cases, [1, 2]);
+        let mag = |v: &[f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        let total = |l: &Vec<[f64; 3]>| l.iter().map(mag).sum::<f64>();
+        assert!((total(&p.loads[0]) - 50.0).abs() < 1e-6, "{}", total(&p.loads[0]));
+        assert!((total(&p.loads[1]) - 30.0).abs() < 1e-6, "{}", total(&p.loads[1]));
+        assert!(p.loads[0].iter().all(|v| v[0] == 0.0 && v[1] == 0.0 && v[2] <= 0.0));
+        assert!(p.loads[1].iter().all(|v| v[0] == 0.0 && v[2] == 0.0 && v[1] >= 0.0));
+        // clamped nodes: on the bolt hole's wall (radius 2.5 + reach 1.5), nowhere else
+        let [nx, ny, _] = p.nodes();
+        let pos = |i: usize| {
+            let (x, y, z) = (i % nx, (i / nx) % ny, i / (nx * ny));
+            [x, y, z]
+                .map(|c| c as f64)
+                .iter()
+                .zip(p.origin)
+                .map(|(c, o)| o + c * p.h)
+                .collect::<Vec<_>>()
+        };
+        let clamped: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i]).collect();
+        assert!(clamped.len() > 20, "{}", clamped.len());
+        for &i in &clamped {
+            let q = pos(i);
+            let r = ((q[0] + 15.0).powi(2) + (q[2] - 10.0).powi(2)).sqrt();
+            assert!(r < 4.0 + 1e-6, "clamped node {q:?} is {r} from the bolt axis");
+        }
+        // the shells around the holes are kept solid
+        assert!(p.passive.iter().filter(|b| **b).count() > 50);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// reproduces uniaxial tension exactly, so the top moves F L / (E A).
     #[test]
     fn column_in_tension() {
@@ -795,14 +965,15 @@ mod tests {
             domain: vec![true; 4],
             passive: vec![false; 4],
             fixed: vec![false; 2 * 2 * 5],
-            load: vec![[0.0; 3]; 2 * 2 * 5],
+            loads: vec![vec![[0.0; 3]; 2 * 2 * 5]],
+            cases: vec![1],
         };
         for j in 0..2 {
             for i in 0..2 {
                 let b = p.node(i, j, 0);
                 p.fixed[b] = true;
                 let t = p.node(i, j, 4);
-                p.load[t] = [0.0, 0.0, force / 4.0];
+                p.loads[0][t] = [0.0, 0.0, force / 4.0];
             }
         }
         let ke = hex_ke(0.0);
@@ -812,7 +983,7 @@ mod tests {
             ee: vec![e0 * h; 4],
             free: p.fixed.iter().map(|f| !f).collect(),
         };
-        let f: Vec<f64> = p.load.iter().flatten().copied().collect();
+        let f: Vec<f64> = p.loads[0].iter().flatten().copied().collect();
         let mut u = vec![0.0; f.len()];
         fem.solve(&f, &mut u, 1e-12, 1000);
         let want = force * (4.0 * h) / (e0 * h * h);

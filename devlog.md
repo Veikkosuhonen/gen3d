@@ -3,6 +3,56 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: Supports, loads and load cases from editor primitives
+
+**What:** a primitive has an **Optimize as** role: design (default), keep solid, fixed or load. Load
+primitives have a force (N), a direction and a **load case**. A new operation, **region**, marks a
+spot without changing the shape. The Optimize step lists the supports and loads; it is available as
+soon as primitives give a fixed and a load region. `shapes/bracket_editor.wgsl` (+ `.prims.json`) is the
+bracket set up this way, with two load cases.
+
+**Design decisions** (aiming at "mark the feature, the way CAD does it")
+- **Constraints go on features.** You fix *the bolt hole* and load *the pin hole*. So a role's region
+  is the primitive's inside **plus a shell** `g3d_reach` thick around its surface. For a subtracted
+  cylinder that is exactly its hole's wall, which is what `bracket_domain.wgsl` writes by hand
+  (`max(bolts - WALL, -bolts)`). For an added box it is the box. `g3d_reach` is an override set by
+  `topopt::setup` to 1.5 × the element size (≥ 1 layer of nodes at any voxel). The preview default is
+  1.5 × the auto element size.
+- **Region operation** for marking without geometry: a box over a face, a sphere on a spot. Invisible
+  like a cutter, with the ghost when selected.
+- **Supports and loads are kept solid** (the BC shells go into `field_keep`): a load on near-void
+  elements gives degenerate SIMP results, and a printed bolt hole needs a boss. The bracket script does
+  the same with its own keep regions.
+- **Per-load force in N.** The old single `--force` spread over all of `field_load` can't express "100 N
+  here, 50 N there", so each load primitive's force is spread over its own nodes. A script's
+  `field_load` keeps `--force`.
+- **Load cases** are real multi-load optimization: each case is solved separately per iteration
+  (`K u_c = f_c`). The objective is Σ compliance, so the sensitivities sum the element energies. That is
+  the standard formulation, and it differs from adding the loads (a down load and a sideways load
+  shouldn't cancel or combine into one diagonal). Cost: one solve per case per iteration.
+- **Script + editor combine** like `map`: a role used by primitives renames the script's `field_fixed`
+  / `field_load` / `field_keep` to `g3d_script_*` and generates the union. Overlays, VTI export and the
+  "optimizable" check then work unchanged. `Shape::load_specs()` gives the optimizer the loads: the
+  script's field (vector, case 1) plus one per load primitive (region < 0, direction, force, case).
+- Data per primitive grew to 4 vec4s (the 4th = load direction, force), so editing a load's direction
+  updates the preview's load overlay without compiling. Role changes regenerate the source (they change
+  which functions exist). Old `.prims.json` files load with role design, force 100 N, −Z, case 1.
+
+**Verified:** `cargo test` (24 pass).
+- `topopt::setup` on a bar with a fixed subtracted bolt hole, a loaded subtracted pin hole (50 N, −Z,
+  case 1) and a region sphere (30 N, +Y, case 2) gives two cases summing to exactly 50 and 30 N, in the
+  right directions. Every clamped node is on the bolt hole's wall (≤ r + reach from its axis), and the
+  shells are kept solid.
+- Script fields + a load primitive: the script's `field_fixed` is untouched, its `field_load` is wrapped
+  (both loads present, case 1 and 2). Hiding the primitive restores the plain script. Old sidecars get
+  the defaults.
+- `gen3d optimize shapes/bracket_editor.wgsl`: 449 clamped / 646 loaded nodes, 2 load cases, converged
+  in 48 iterations (82 s). The result is a hollow box section from plate to pin eye (section view).
+
+**Open:** per-case weights; a load as a pressure on a face (a region's surface only); showing the load
+direction as an arrow in the viewport; distributing a load by area instead of by node count (node
+spreading slightly favours thicker regions).
+
 ## 2026-11-12: Subtract and intersect for editor primitives
 
 **What:** every primitive has an **operation**: add (union), subtract or intersect, each smoothed by its
