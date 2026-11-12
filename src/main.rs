@@ -1,6 +1,9 @@
 //! gen3d: procedural SDF modelling workbench. WGSL shapes -> live preview -> mesh -> G-code.
 
+mod app;
+mod browser;
 mod gpu;
+mod jobs;
 mod mc;
 mod mesh;
 mod mesher;
@@ -18,29 +21,13 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use shape::{Shape, load_shape, parse_defines};
 
-const TEMPLATE: &str = "// {name}.wgsl — gen3d shape. Units: mm, +Z up, build plate at z = 0.
-// Export region (xmin ymin zmin  xmax ymax zmax) and mesh resolution in mm:
-//! bounds -30 -30 0  30 30 50
-//! voxel 0.2
-#include <sdf.wgsl>
-
-// parameters: override with -D R=15
-override R: f32 = 12.0;
-
-fn map(p: vec3f) -> f32 {
-    let body = sdRoundBox(p - vec3f(0, 0, 15), vec3f(20, 20, 15), 3.0);
-    let hole = sdCylinder(rotX(p - vec3f(0, 0, 13), deg(90.0)), 7.0, 25.0);  // through-hole along Y
-    let ball = sdSphere(p - vec3f(0, 0, 30), R);
-    return opSmoothUnion(opSmoothSubtract(body, hole, 2.0), ball, 4.0);
-}
-";
-
 #[derive(Parser)]
 #[command(name = "gen3d", about = "Procedural SDF modelling workbench", version)]
-#[command(after_help = "slice: arguments after `--` are passed to the slicer, e.g. -- --layer-height 0.2")]
+#[command(after_help = "Run `gen3d` without a command to open the app.\n\
+                        slice: arguments after `--` are passed to the slicer, e.g. -- --layer-height 0.2")]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Args)]
@@ -128,10 +115,13 @@ struct MeshArgs {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// live preview window with hot reload
+    /// open the app (design -> optimize -> print), optionally with a .wgsl shape or .vti grid
     View {
-        #[command(flatten)]
-        s: ShapeArgs,
+        /// .wgsl shape or .vti grid to open
+        file: Option<PathBuf>,
+        /// set a shape parameter, e.g. -D RADIUS=12
+        #[arg(short = 'D', long = "define", value_name = "NAME=VALUE")]
+        define: Vec<String>,
     },
     /// mesh the SDF and write STL/3MF/OBJ/PLY, or the raw SDF grid as VTI
     Export {
@@ -230,6 +220,28 @@ enum Cmd {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    /// draw the app's window offscreen to a PNG (for checking the UI without a display)
+    #[command(hide = true)]
+    Snapshot {
+        file: Option<PathBuf>,
+        #[arg(short = 'D', long = "define", value_name = "NAME=VALUE")]
+        define: Vec<String>,
+        /// design, optimize or print
+        #[arg(long, default_value = "design")]
+        step: String,
+        /// in the Print step, print the optimization result
+        #[arg(long)]
+        result: bool,
+        /// show the Open dialog
+        #[arg(long)]
+        browser: bool,
+        #[arg(long)]
+        section: bool,
+        #[arg(long, num_args = 2, value_names = ["W", "H"], default_values_t = [1440u32, 900])]
+        size: Vec<u32>,
+        #[arg(short, long, default_value = "out/snapshot.png")]
+        output: PathBuf,
+    },
     /// compile a shape and report errors
     Check {
         #[command(flatten)]
@@ -244,6 +256,15 @@ fn default_out(shape_path: &Path, ext: &str, defines: &[(String, f64)]) -> PathB
         .unwrap_or_default()
         .join("out")
         .join(format!("{stem}{suffix}{ext}"))
+}
+
+/// Where `optimize` writes its result for a design and parameter values: out/NAME[_K-V]_topopt.vti.
+fn topopt_out(shape_path: &Path, defines: &[(String, f64)]) -> PathBuf {
+    let p = default_out(shape_path, ".vti", defines);
+    p.with_file_name(format!(
+        "{}_topopt.vti",
+        p.file_stem().unwrap_or_default().to_string_lossy()
+    ))
 }
 
 fn resolve_configs(configs: &[PathBuf], shape: &Shape) -> Vec<PathBuf> {
@@ -360,8 +381,37 @@ fn export_volume(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option
 }
 
 fn run(cli: Cli) -> Result<()> {
-    match cli.cmd {
-        Cmd::View { s } => viewer::view(&s.shape, parse_defines(&s.define)?, s.volume_opts()),
+    let Some(cmd) = cli.cmd else {
+        return app::run(None, vec![]);
+    };
+    match cmd {
+        Cmd::View { file, define } => app::run(file.as_deref(), parse_defines(&define)?),
+        Cmd::Snapshot {
+            file,
+            define,
+            step,
+            result,
+            browser,
+            section,
+            size,
+            output,
+        } => {
+            let setup = app::SnapshotSetup {
+                step,
+                print_result: result,
+                browser,
+                section,
+            };
+            app::snapshot(
+                file.as_deref(),
+                parse_defines(&define)?,
+                &setup,
+                (size[0], size[1]),
+                &output,
+            )?;
+            println!("wrote {}", output.display());
+            Ok(())
+        }
         Cmd::Export { s, m, output } => export(&s, &m, output.as_deref(), None).map(|_| ()),
         Cmd::Slice {
             s,
@@ -390,18 +440,17 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::New { name } => {
-            let mut path = PathBuf::from(&name);
-            if path.extension().is_none_or(|e| e != "wgsl") {
-                path = Path::new("shapes").join(format!("{name}.wgsl"));
-            }
-            if path.exists() {
-                bail!("{} already exists", path.display());
-            }
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-            std::fs::write(&path, TEMPLATE.replace("{name}", &stem))?;
+            let given = PathBuf::from(&name);
+            let path = if given.extension().is_some_and(|e| e == "wgsl") {
+                let dir = given
+                    .parent()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                let file = given.file_name().unwrap_or_default().to_string_lossy();
+                shape::create_from_template(dir, &file)?
+            } else {
+                shape::create_from_template(Path::new("shapes"), &name)?
+            };
             println!("created {}\nrun: gen3d view {}", path.display(), path.display());
             Ok(())
         }
@@ -463,18 +512,8 @@ fn run(cli: Cli) -> Result<()> {
             };
             let gpu = gpu::headless()?;
             let problem = topopt::setup(&shape, &settings, &gpu)?;
-            let out = output.unwrap_or_else(|| {
-                let p = default_out(&shape.path, ".vti", &defines);
-                p.with_file_name(format!(
-                    "{}_topopt.vti",
-                    p.file_stem().unwrap_or_default().to_string_lossy()
-                ))
-            });
+            let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
             topopt::optimize(&problem, &settings, &out)?;
-            println!(
-                "view it: gen3d view {} (threshold the density, then Export mesh)",
-                out.display()
-            );
             Ok(())
         }
         Cmd::Check { s } if viewer::is_vti(&s.shape) => {

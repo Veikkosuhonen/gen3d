@@ -1,0 +1,2622 @@
+//! The gen3d app: one window that takes a shape from design to G-code in three steps.
+//!
+//! 1. **Design**: open (or create) a .wgsl shape, edit it in your editor (the preview reloads on
+//!    save), tune its parameters with sliders.
+//! 2. **Optimize** (optional): topology optimization of the shape as a design domain. The result
+//!    grows live in the same viewport; pick its threshold.
+//! 3. **Print**: mesh the design or the optimized result, pick a printer profile, slice to G-code
+//!    or open it in the slicer.
+//!
+//! Every output has a fixed place in `out/` derived from the design and its parameter values, so the
+//! app finds earlier results again when you reopen a shape. Long steps run as `gen3d` subprocesses
+//! (`jobs.rs`).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
+
+use anyhow::{Context, Result};
+use winit::application::ApplicationHandler;
+use winit::event::{ElementState, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Window, WindowId};
+
+use crate::browser::{Browser, Pick, ago};
+use crate::gpu::Gpu;
+use crate::jobs::{Job, Slot, mesh_report, opt_progress};
+use crate::shape::{Field, Param, ParamKind, Shape};
+use crate::slicer;
+use crate::viewer::{
+    Camera, Options, Pipeline, Source, VolGpu, all_fields, build_pipeline, draw, field_color, is_vti, load_source,
+    preview_module, uniforms, volume_source,
+};
+use crate::volume::{Volume, VolumeOpts};
+
+const KEYS: &[(&str, &str)] = &[
+    ("Ctrl+O", "open a shape"),
+    ("left-drag", "orbit"),
+    ("right/middle-drag", "pan"),
+    ("wheel", "zoom"),
+    ("double-click", "reset camera"),
+    ("1 2 3 4", "front / side / top / iso"),
+    ("R", "reset camera"),
+    ("C", "section view"),
+    ("[  ]", "move section plane"),
+    ("B", "clip to bounds"),
+    ("V", "bounds box"),
+    ("F", "cycle field overlays (grids: colour by array)"),
+    ("-  =", "grids: lower / raise threshold"),
+    ("M", "grids: smooth / blocky"),
+    ("I", "grids: flip inside"),
+    ("A", "grids: next array"),
+    ("F5", "force reload"),
+];
+
+/// Format of the offscreen texture the preview is raymarched into. egui samples textures as
+/// gamma-encoded, so the shader applies gamma itself (as for `render_png`).
+const VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(90, 190, 100);
+/// The preview's surface orange, for "inside" in the threshold histogram.
+const SURFACE_ORANGE: egui::Color32 = egui::Color32::from_rgb(242, 165, 80);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Step {
+    Design,
+    Optimize,
+    Print,
+}
+
+/// Settings of the Optimize step (`gen3d optimize` flags).
+struct OptUi {
+    volfrac: f64,
+    iters: usize,
+    /// None = `topopt::auto_voxel`
+    voxel: Option<f32>,
+    force: f64,
+    rmin: f64,
+    /// Heaviside projection (crisp 0/1 designs)
+    projection: bool,
+}
+
+impl Default for OptUi {
+    fn default() -> Self {
+        OptUi {
+            volfrac: 0.3,
+            iters: 150,
+            voxel: None,
+            force: 100.0,
+            rmin: 1.5,
+            projection: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Supports {
+    /// whatever the profile says
+    Profile,
+    Off,
+    Everywhere,
+    BuildPlate,
+}
+
+/// Settings of the Print step.
+struct PrintUi {
+    /// mesh voxel for a .wgsl design; None = the shape's `//! voxel`
+    voxel: Option<f32>,
+    /// keep this fraction of triangles; None = the shape's `//! decimate` (or all)
+    decimate: Option<f32>,
+    three_mf: bool,
+    /// None = automatic (the shape's `//! slicer`, else printers/default.ini, else slicer defaults)
+    profile: Option<PathBuf>,
+    profiles: Vec<PathBuf>,
+    /// PrusaSlicer overrides on top of the profile; None = keep the profile's value
+    layer: Option<f32>,
+    infill: Option<u32>,
+    supports: Supports,
+}
+
+impl Default for PrintUi {
+    fn default() -> Self {
+        PrintUi {
+            voxel: None,
+            decimate: None,
+            three_mf: false,
+            profile: None,
+            profiles: vec![],
+            layer: None,
+            infill: None,
+            supports: Supports::Profile,
+        }
+    }
+}
+
+/// Offscreen target for the preview, shown as an image in the central panel.
+struct Viewport {
+    view: wgpu::TextureView,
+    size: (u32, u32),
+    id: egui::TextureId,
+}
+
+impl Viewport {
+    fn target(gpu: &Gpu, size: (u32, u32)) -> wgpu::TextureView {
+        gpu.device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("viewport"),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: VIEW_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&Default::default())
+    }
+}
+
+/// The OS window and its swapchain; absent when the app draws offscreen (`snapshot`).
+struct OsWindow {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    config: wgpu::SurfaceConfiguration,
+    egui_state: egui_winit::State,
+}
+
+struct Win {
+    os: Option<OsWindow>,
+    gpu: Arc<Gpu>,
+    ubuf: wgpu::Buffer,
+    /// The shown shape's preview shader; kept so parameter changes only rebuild the pipeline.
+    module: Option<wgpu::ShaderModule>,
+    pipeline: Option<Pipeline>,
+    vol: Option<VolGpu>,
+    egui: egui::Context,
+    renderer: egui_wgpu::Renderer,
+    viewport: Viewport,
+    title: String,
+}
+
+impl Win {
+    /// GPU state for the preview and egui, drawing into targets of `format`.
+    fn new(gpu: Arc<Gpu>, format: wgpu::TextureFormat, os: Option<OsWindow>) -> Win {
+        let ubuf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("view"),
+            size: std::mem::size_of::<crate::viewer::ViewUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut renderer = egui_wgpu::Renderer::new(&gpu.device, format, Default::default());
+        let view = Viewport::target(&gpu, (1, 1));
+        let id = renderer.register_native_texture(&gpu.device, &view, wgpu::FilterMode::Linear);
+        let egui = match &os {
+            Some(o) => o.egui_state.egui_ctx().clone(),
+            None => egui::Context::default(),
+        };
+        Win {
+            os,
+            gpu,
+            ubuf,
+            module: None,
+            pipeline: None,
+            vol: None,
+            egui,
+            renderer,
+            viewport: Viewport { view, size: (1, 1), id },
+            title: String::new(),
+        }
+    }
+}
+
+type Rebuild = std::sync::mpsc::Receiver<(u64, Vec<(String, f64)>, Result<Pipeline>)>;
+/// A G-code file's summary as (label, value) rows.
+type Summary = Vec<(String, String)>;
+
+struct App {
+    /// The opened file: a .wgsl design, or a .vti grid opened directly. None until one is opened.
+    design: Option<PathBuf>,
+    /// The file the viewport shows: the design, or its optimization result.
+    shown: PathBuf,
+    step: Step,
+    /// In the Print step: print the optimization result instead of the design.
+    print_result: bool,
+    /// Parameter values that differ from the design's defaults.
+    defines: Vec<(String, f64)>,
+    /// How to show a grid the next time one loads (kept while the design is shown instead).
+    vopts: VolumeOpts,
+    volume: Option<Volume>,
+    /// Threshold being dragged; applied on release (recomputing is CPU work).
+    iso_drag: Option<f32>,
+    /// The .wgsl design, its fields and parameters; kept while the result is shown.
+    design_shape: Option<Shape>,
+    design_fields: Vec<Field>,
+    params: Vec<Param>,
+    opt: OptUi,
+    print: PrintUi,
+    slicer: Option<(slicer::Kind, PathBuf)>,
+    browser: Browser,
+    /// What the viewport shows (the design's shape, or a grid's generated shape).
+    shape: Shape,
+    fields: Vec<Field>,
+    /// overlay mode: 0 = all fields, 1..=n = only field n-1, n+1 = none
+    field_mode: usize,
+    start: Instant,
+    loaded: bool,
+    loaded_at: String,
+    mtimes: HashMap<PathBuf, Option<SystemTime>>,
+    error: Option<String>,
+    /// Pipeline build failure for the current parameter values (the source itself is fine).
+    param_error: Option<String>,
+    notice: Option<String>,
+    params_dirty: bool,
+    /// In-flight background pipeline build (see `request_rebuild`).
+    rebuild: Option<Rebuild>,
+    rebuild_again: bool,
+    /// Bumped on every reload so stale background builds are dropped.
+    rebuild_gen: u64,
+    cam: Camera,
+    opts: Options,
+    /// Fraction of the viewport's pixels that are raymarched (lower = faster).
+    render_scale: f32,
+    /// Viewport size wanted by this frame's layout, in physical pixels.
+    view_px: (u32, u32),
+    /// `gen3d optimize` runs
+    opt_job: Slot,
+    /// export / slice / open runs
+    out_job: Slot,
+    gcode_cache: HashMap<PathBuf, (Option<SystemTime>, Summary)>,
+    gpu_name: String,
+    win: Option<Win>,
+    last_poll: Instant,
+    frames: u32,
+    fps: f32,
+    fps_t: Instant,
+}
+
+fn mtime(p: &Path) -> Option<SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+fn stamp() -> String {
+    chrono::Local::now().format("%H:%M:%S").to_string()
+}
+
+fn fmt_num(v: f64) -> String {
+    let s = format!("{v:.4}");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+fn file_name(p: &Path) -> String {
+    p.file_name().unwrap_or_default().to_string_lossy().to_string()
+}
+
+fn define_list(defines: &[(String, f64)]) -> String {
+    defines
+        .iter()
+        .map(|(k, v)| format!("{k} = {}", fmt_num(*v)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Viridis colour map (same polynomial as the shader), as sRGB.
+fn viridis(t: f32) -> egui::Color32 {
+    const C: [[f32; 3]; 7] = [
+        [0.277_727_3, 0.005_407_345, 0.334_099_8],
+        [0.105_093_04, 1.404_613_5, 1.384_590_2],
+        [-0.330_861_83, 0.214_847_56, 0.095_095_16],
+        [-4.634_230_5, -5.799_101, -19.332_441],
+        [6.228_27, 14.179_933, 56.690_55],
+        [4.776_385, -13.745_145, -65.353_035],
+        [-5.435_456, 4.645_852_6, 26.312_435],
+    ];
+    let t = t.clamp(0.0, 1.0);
+    let ch = |k: usize| {
+        let v = C.iter().rev().fold(0.0, |acc, c| acc * t + c[k]);
+        (v.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    egui::Color32::from_rgb(ch(0), ch(1), ch(2))
+}
+
+/// Histogram of a volume's array (log-scaled counts) with the threshold marked; bars on the inside
+/// side are drawn in the surface colour. Returns the response and the value under the pointer.
+fn histogram(ui: &mut egui::Ui, hist: &[u32], range: (f32, f32), iso: f32, below: bool) -> (egui::Response, f32) {
+    let (lo, hi) = range;
+    let width = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 64.0), egui::Sense::click_and_drag());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 3.0, ui.visuals().extreme_bg_color);
+    let span = (hi - lo).max(f32::MIN_POSITIVE);
+    let x_of = |v: f32| rect.left() + ((v - lo) / span).clamp(0.0, 1.0) * rect.width();
+    let max = hist.iter().copied().max().unwrap_or(0) as f32;
+    let n = hist.len().max(1) as f32;
+    let bw = rect.width() / n;
+    let weak = ui.visuals().weak_text_color().gamma_multiply(0.6);
+    for (i, &c) in hist.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let h = (1.0 + c as f32).ln() / (1.0 + max).ln() * (rect.height() - 6.0);
+        let centre = lo + (i as f32 + 0.5) / n * span;
+        let inside = if below { centre < iso } else { centre > iso };
+        let x0 = rect.left() + i as f32 * bw;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x0 + 0.5, rect.bottom() - 2.0 - h),
+            egui::pos2((x0 + bw - 0.5).max(x0 + 1.0), rect.bottom() - 2.0),
+        );
+        p.rect_filled(bar, 0.0, if inside { SURFACE_ORANGE } else { weak });
+    }
+    let xi = x_of(iso);
+    p.line_segment(
+        [egui::pos2(xi, rect.top()), egui::pos2(xi, rect.bottom())],
+        egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+    );
+    let value_at = |x: f32| lo + ((x - rect.left()) / rect.width()).clamp(0.0, 1.0) * span;
+    let hover = resp.hover_pos().map(|p| value_at(p.x));
+    let resp = resp.on_hover_text(match hover {
+        Some(v) => format!("{}  ·  click or drag to set the threshold", fmt_num(v as f64)),
+        None => "click or drag to set the threshold".into(),
+    });
+    let picked = resp.interact_pointer_pos().map_or(f32::NAN, |p| value_at(p.x));
+    ui.horizontal(|ui| {
+        ui.weak(fmt_num(lo as f64));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak(fmt_num(hi as f64));
+        });
+    });
+    (resp, picked)
+}
+
+/// A horizontal viridis bar with the range's ends written under it.
+fn colour_bar(ui: &mut egui::Ui, range: (f32, f32)) {
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 12.0), egui::Sense::hover());
+    let p = ui.painter_at(rect);
+    let n = 48;
+    for i in 0..n {
+        let x0 = rect.left() + rect.width() * i as f32 / n as f32;
+        let x1 = rect.left() + rect.width() * (i + 1) as f32 / n as f32;
+        let r = egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1 + 0.5, rect.bottom()));
+        p.rect_filled(r, 0.0, viridis((i as f32 + 0.5) / n as f32));
+    }
+    ui.horizontal(|ui| {
+        ui.weak(fmt_num(range.0 as f64));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.weak(fmt_num(range.1 as f64));
+        });
+    });
+}
+
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+    ui.painter().circle_filled(r.center(), 4.0, color);
+}
+
+fn rgb_gamma(c: [f32; 3]) -> egui::Color32 {
+    let [r, g, b] = c.map(|c| (c.powf(1.0 / 2.2) * 255.0) as u8);
+    egui::Color32::from_rgb(r, g, b)
+}
+
+fn section(ui: &mut egui::Ui, title: &str) {
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(title).strong().size(15.0));
+    ui.add_space(2.0);
+}
+
+/// A primary action button (filled with the selection colour).
+fn primary(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+    let fill = ui.visuals().selection.bg_fill;
+    ui.add_enabled(
+        enabled,
+        egui::Button::new(egui::RichText::new(text).strong().color(egui::Color32::WHITE))
+            .fill(fill)
+            .min_size(egui::vec2(0.0, 26.0)),
+    )
+}
+
+/// Readable names for the G-code comments `slicer::gcode_summary` picks out.
+fn pretty_summary(lines: &[String]) -> Vec<(String, String)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            let (k, v) = l.split_once(" = ")?;
+            let v = v.trim();
+            Some(match k.trim() {
+                "estimated printing time (normal mode)" => ("print time".into(), v.into()),
+                "filament used [g]" => ("filament".into(), format!("{v} g")),
+                "filament used [mm]" => (
+                    "filament length".into(),
+                    v.parse::<f64>().map_or(v.into(), |mm| format!("{:.2} m", mm / 1000.0)),
+                ),
+                "layer_height" => ("layer height".into(), format!("{v} mm")),
+                "fill_density" => ("infill".into(), v.into()),
+                "support_material" => ("supports".into(), if v == "1" { "on" } else { "off" }.into()),
+                "nozzle_diameter" => ("nozzle".into(), format!("{v} mm")),
+                "printer_model" if !v.is_empty() => ("printer".into(), v.into()),
+                _ => return None,
+            })
+        })
+        .collect()
+}
+
+/// Show a job's status line (with Stop while it runs) and its log.
+fn job_ui(ui: &mut egui::Ui, slot: &Slot, j: &Job) {
+    ui.horizontal_wrapped(|ui| {
+        if j.running {
+            ui.spinner();
+            ui.label(format!("{} running… {:.1} s", j.cmd, j.elapsed()));
+            if ui
+                .small_button("Stop")
+                .on_hover_text("stop the job (keeps what it wrote)")
+                .clicked()
+            {
+                slot.stop();
+            }
+        } else if j.stopped {
+            status_dot(ui, ui.visuals().warn_fg_color);
+            ui.label(format!("{} stopped after {:.1} s", j.cmd, j.elapsed()));
+        } else if j.ok == Some(true) {
+            status_dot(ui, OK_GREEN);
+            ui.label(format!("{} finished in {:.1} s", j.cmd, j.elapsed()));
+        } else {
+            status_dot(ui, ui.visuals().error_fg_color);
+            ui.colored_label(ui.visuals().error_fg_color, format!("{} failed", j.cmd));
+        }
+    });
+    if j.log.is_empty() {
+        return;
+    }
+    egui::CollapsingHeader::new("Log")
+        .id_salt(("log", &j.cmd))
+        .default_open(j.ok == Some(false) && !j.stopped)
+        .show(ui, |ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!("gen3d {} {}", j.cmd, j.args))
+                        .weak()
+                        .small(),
+                )
+                .wrap(),
+            );
+            egui::ScrollArea::vertical()
+                .max_height(180.0)
+                .stick_to_bottom(true)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(j.log.trim_end()).monospace().small()).selectable(true),
+                    );
+                });
+        });
+}
+
+/// One line about an output file: name, size, age, whether it's older than its inputs, and a
+/// button to show it in the file manager. Returns whether the file exists.
+fn file_line(ui: &mut egui::Ui, path: &Path, inputs: &[PathBuf], notice: &mut Option<String>) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        ui.weak(format!("{} not made yet", file_name(path)));
+        return false;
+    };
+    let t = meta.modified().ok();
+    let stale = inputs.iter().any(|i| mtime(i) > t);
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .small_button("Show")
+            .on_hover_text("open the folder in your file manager")
+            .clicked()
+            && let Err(e) = slicer::open_with_desktop(path.parent().unwrap_or(Path::new(".")))
+        {
+            *notice = Some(format!("{e:#}"));
+        }
+        ui.monospace(file_name(path)).on_hover_text(path.display().to_string());
+        ui.weak(format!("{:.1} MB · {}", meta.len() as f64 / 1e6, ago(t)));
+    });
+    if stale {
+        ui.colored_label(ui.visuals().warn_fg_color, "older than its source: make it again");
+    }
+    true
+}
+
+impl App {
+    fn new(cwd: PathBuf) -> App {
+        App {
+            design: None,
+            shown: cwd.clone(),
+            step: Step::Design,
+            print_result: false,
+            defines: vec![],
+            vopts: VolumeOpts::default(),
+            volume: None,
+            iso_drag: None,
+            design_shape: None,
+            design_fields: vec![],
+            params: vec![],
+            opt: OptUi::default(),
+            print: PrintUi::default(),
+            slicer: slicer::find_slicer(None),
+            browser: Browser::new(cwd.clone()),
+            shape: Shape::placeholder(&cwd),
+            fields: vec![],
+            field_mode: 0,
+            start: Instant::now(),
+            loaded: false,
+            loaded_at: String::new(),
+            mtimes: HashMap::new(),
+            error: None,
+            param_error: None,
+            notice: None,
+            params_dirty: false,
+            rebuild: None,
+            rebuild_again: false,
+            rebuild_gen: 0,
+            cam: Camera {
+                yaw: 0.0,
+                pitch: 0.0,
+                dist: 1.0,
+                target: [0.0; 3],
+            },
+            opts: Options {
+                clip: true,
+                section: false,
+                cut: 0.0,
+                show_bounds: true,
+                fields: 0,
+                time: 0.0,
+            },
+            render_scale: 1.0,
+            view_px: (1, 1),
+            opt_job: Slot::default(),
+            out_job: Slot::default(),
+            gcode_cache: HashMap::new(),
+            gpu_name: String::new(),
+            win: None,
+            last_poll: Instant::now(),
+            frames: 0,
+            fps: 0.0,
+            fps_t: Instant::now(),
+        }
+    }
+
+    // ------------------------------------------------------------------------------ files & state
+
+    /// Switch to another design file; everything tied to the old one is reset.
+    fn open_design(&mut self, path: &Path, defines: Vec<(String, f64)>) {
+        let path = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                self.notice = Some(format!("cannot open {}: {e}", path.display()));
+                return;
+            }
+        };
+        if let Some(dir) = path.parent() {
+            self.browser.dir = dir.to_path_buf();
+        }
+        self.design = Some(path.clone());
+        self.shown = path;
+        self.step = Step::Design;
+        self.print_result = false;
+        self.defines = defines;
+        self.vopts = VolumeOpts::default();
+        self.volume = None;
+        self.design_shape = None;
+        self.design_fields.clear();
+        self.params.clear();
+        self.fields.clear();
+        self.field_mode = 0;
+        self.loaded = false;
+        self.error = None;
+        self.param_error = None;
+        self.notice = None;
+        self.opt.voxel = None;
+        self.print.voxel = None;
+        self.print.decimate = None;
+        self.print.profile = None;
+        self.mtimes.clear();
+        if let Some(win) = &mut self.win {
+            win.pipeline = None;
+            win.module = None;
+            self.reload(true);
+        }
+    }
+
+    fn design_is_grid(&self) -> bool {
+        self.design.as_deref().is_some_and(is_vti)
+    }
+
+    /// Where the optimization result for the current design and parameter values goes.
+    fn result_path(&self) -> Option<PathBuf> {
+        let d = self.design.as_ref().filter(|d| !is_vti(d))?;
+        Some(crate::topopt_out(d, &self.defines))
+    }
+
+    fn existing_result(&self) -> Option<PathBuf> {
+        self.result_path().filter(|r| r.exists())
+    }
+
+    /// Whether the design defines the fields `gen3d optimize` needs.
+    fn optimizable(&self) -> bool {
+        let has = |n: &str, c: usize| self.design_fields.iter().any(|f| f.name == n && f.comps == c);
+        has("fixed", 1) && has("load", 3)
+    }
+
+    /// The design's files on disk (the .wgsl and its includes).
+    fn design_files(&self) -> Vec<PathBuf> {
+        match &self.design_shape {
+            Some(s) => s.files.iter().filter(|f| f.exists()).cloned().collect(),
+            None => self.design.iter().cloned().collect(),
+        }
+    }
+
+    /// The file the viewport should show for the current step.
+    fn wanted_shown(&self) -> Option<PathBuf> {
+        let design = self.design.clone()?;
+        Some(match (self.step, self.existing_result()) {
+            (Step::Optimize, Some(r)) => r,
+            (Step::Print, Some(r)) if self.print_result => r,
+            _ => design,
+        })
+    }
+
+    fn sync_shown(&mut self) {
+        let Some(want) = self.wanted_shown() else { return };
+        if want != self.shown {
+            if self.volume.is_some() {
+                self.vopts = self.current_vopts();
+            }
+            self.shown = want;
+            self.reload(false);
+        }
+    }
+
+    fn set_step(&mut self, step: Step) {
+        self.step = step;
+        if step == Step::Print {
+            self.print.profiles = slicer::profiles();
+            self.slicer = slicer::find_slicer(None);
+        }
+        self.sync_shown();
+    }
+
+    /// Options that reproduce the current grid view, so a reloaded .vti keeps them.
+    fn current_vopts(&self) -> VolumeOpts {
+        match &self.volume {
+            Some(v) => VolumeOpts {
+                array: Some(v.array_name().to_string()),
+                iso: Some(v.iso),
+                below: Some(v.below),
+                blocky: v.blocky,
+                color: v.color_name().map(str::to_string),
+                color_range: v.color_range,
+            },
+            None => self.vopts.clone(),
+        }
+    }
+
+    fn reload(&mut self, first: bool) {
+        if self.design.is_none() {
+            return;
+        }
+        let path = self.shown.clone();
+        let grid = is_vti(&path);
+        let defines = if grid { vec![] } else { self.defines.clone() };
+        // a grid caught mid-write, or whose remembered array is gone: fall back to the defaults
+        let src = load_source(&path, &defines, &self.current_vopts()).or_else(|e| {
+            if grid {
+                load_source(&path, &[], &VolumeOpts::default())
+            } else {
+                Err(e)
+            }
+        });
+        let src = match src {
+            Ok(s) => s,
+            Err(e) => {
+                self.mtimes = HashMap::from([(path.clone(), mtime(&path))]);
+                if !grid {
+                    self.volume = None;
+                }
+                return self.fail(&format!("{e:#}"));
+            }
+        };
+        self.mtimes = src
+            .shape
+            .files
+            .iter()
+            .filter(|f| f.exists())
+            .map(|f| (f.clone(), mtime(f)))
+            .collect();
+        self.install(src, first);
+    }
+
+    /// Build the GPU pipeline for `src` and switch to it.
+    fn install(&mut self, mut src: Source, first: bool) {
+        let grid = src.volume.is_some();
+        let mut params = vec![];
+        if !grid {
+            params = match src.shape.params() {
+                Ok(p) => p,
+                Err(e) => return self.fail(&e.to_string()),
+            };
+            // values for parameters the shape doesn't (or no longer) declare are dropped
+            let unknown: Vec<String> = self
+                .defines
+                .iter()
+                .filter(|(k, _)| !params.iter().any(|p| &p.name == k))
+                .map(|(k, _)| k.clone())
+                .collect();
+            if !unknown.is_empty() {
+                self.defines.retain(|(k, _)| !unknown.contains(k));
+                let names: Vec<_> = params.iter().map(|p| p.name.as_str()).collect();
+                let msg = format!(
+                    "ignored {}: not a parameter of this shape (parameters: {})",
+                    unknown.join(", "),
+                    if names.is_empty() {
+                        "none".into()
+                    } else {
+                        names.join(", ")
+                    }
+                );
+                println!("[{}] {msg}", stamp());
+                self.notice = Some(msg);
+            }
+            src.shape.defines = self.defines.clone();
+        }
+        let Some(win) = &mut self.win else { return };
+        let vol = match src.volume.as_ref().map(|v| VolGpu::new(&win.gpu, v)).transpose() {
+            Ok(v) => v,
+            Err(e) => return self.fail(&format!("{e:#}")),
+        };
+        let built = preview_module(&win.gpu, &src).and_then(|m| {
+            let p = build_pipeline(&win.gpu, &m, &src.shape.defines, VIEW_FORMAT, &win.ubuf, vol.as_ref())?;
+            Ok((m, p))
+        });
+        match built {
+            Ok((m, p)) => {
+                win.module = Some(m);
+                win.pipeline = Some(p);
+                win.vol = vol;
+                self.rebuild_gen += 1;
+                self.param_error = None;
+            }
+            Err(e) => return self.fail(&e.to_string()),
+        }
+        let Source {
+            shape, fields, volume, ..
+        } = src;
+        // the camera stays put when switching between the design and its result, and when an
+        // optimizer rewrites the result; it reframes when a file's own bounds change
+        let reframe = first || (self.loaded && self.shape.path == shape.path && self.shape.bounds != shape.bounds);
+        if !grid {
+            self.params = params;
+            self.design_shape = Some(shape.clone());
+            self.design_fields = fields.clone();
+        }
+        self.volume = volume;
+        self.shape = shape;
+        let names = |f: &[Field]| f.iter().map(|f| f.name.clone()).collect::<Vec<_>>();
+        if names(&fields) != names(&self.fields) {
+            self.field_mode = 0;
+        }
+        self.fields = fields;
+        self.set_field_mask();
+        self.loaded = true;
+        self.error = None;
+        self.loaded_at = stamp();
+        if reframe {
+            self.reset_camera();
+        }
+        println!("[{}] loaded {}", self.loaded_at, file_name(&self.shown));
+    }
+
+    fn fail(&mut self, msg: &str) {
+        println!("\n[{}] \x1b[31merror\x1b[0m\n{}\n", stamp(), msg.trim());
+        self.error = Some(msg.trim().to_string());
+    }
+
+    /// Apply a change to the grid view: `rebuild` when the array (and so the grid size) changed.
+    fn edit_volume(&mut self, rebuild: bool, f: impl FnOnce(&mut Volume)) {
+        let Some(mut v) = self.volume.take() else { return };
+        f(&mut v);
+        if rebuild {
+            let src = volume_source(&self.shown, v);
+            return self.install(src, false);
+        }
+        if let Some(win) = &self.win
+            && let Some(g) = &win.vol
+        {
+            g.upload(&win.gpu, &v);
+        }
+        self.volume = Some(v);
+    }
+
+    /// Apply a change that only touches the grid's uniforms (smooth/blocky, colour range).
+    fn edit_volume_uniforms(&mut self, f: impl FnOnce(&mut Volume)) {
+        let Some(v) = &mut self.volume else { return };
+        f(v);
+        if let Some(win) = &self.win
+            && let Some(g) = &win.vol
+        {
+            g.upload_uniforms(&win.gpu, v);
+        }
+    }
+
+    /// Rebuild the pipeline with the current parameter values. The driver's shader compile takes
+    /// ~100 ms, so it runs on a worker thread; changes made meanwhile are coalesced into one more
+    /// build, so dragging a slider keeps the UI smooth and the preview follows as fast as it can.
+    fn request_rebuild(&mut self) {
+        self.shape.defines = self.defines.clone();
+        if self.volume.is_some() {
+            return; // the result is shown; the design rebuilds when it's shown again
+        }
+        if self.rebuild.is_some() {
+            self.rebuild_again = true;
+            return;
+        }
+        let Some(win) = &self.win else { return };
+        let Some(module) = win.module.clone() else { return };
+        let (gpu, ubuf, defines, generation) = (
+            win.gpu.clone(),
+            win.ubuf.clone(),
+            self.defines.clone(),
+            self.rebuild_gen,
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = build_pipeline(&gpu, &module, &defines, VIEW_FORMAT, &ubuf, None);
+            let _ = tx.send((generation, defines, result));
+        });
+        self.rebuild = Some(rx);
+    }
+
+    fn poll_rebuild(&mut self) {
+        let Some(rx) = &self.rebuild else { return };
+        let (generation, defines, result) = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.rebuild = None;
+                return;
+            }
+        };
+        self.rebuild = None;
+        // a reload since the request already built the pipeline from the new source
+        if generation == self.rebuild_gen {
+            match result {
+                Ok(p) => {
+                    if let Some(win) = &mut self.win {
+                        win.pipeline = Some(p);
+                    }
+                    self.param_error = None;
+                }
+                Err(e) => {
+                    let msg = format!("with {}: {e}", define_list(&defines));
+                    println!("\n[{}] \x1b[31mpipeline error\x1b[0m\n{msg}\n", stamp());
+                    self.param_error = Some(msg);
+                }
+            }
+        }
+        if std::mem::take(&mut self.rebuild_again) {
+            self.request_rebuild();
+        }
+    }
+
+    fn param_value(&self, p: &Param) -> f64 {
+        self.defines
+            .iter()
+            .find(|(k, _)| *k == p.name)
+            .map_or(p.default, |(_, v)| *v)
+    }
+
+    fn set_param(&mut self, p: &Param, v: f64) {
+        self.defines.retain(|(k, _)| *k != p.name);
+        if v != p.default {
+            self.defines.push((p.name.clone(), v));
+        }
+        self.params_dirty = true;
+    }
+
+    fn set_field_mask(&mut self) {
+        let n = self.fields.len();
+        self.opts.fields = match self.field_mode {
+            0 => all_fields(&self.fields),
+            m if m <= n.min(32) => 1 << (m - 1),
+            _ => 0,
+        };
+    }
+
+    fn reset_camera(&mut self) {
+        self.cam = Camera::framing(&self.shape);
+        self.opts.cut = self.cam.target[1];
+    }
+
+    fn set_view(&mut self, yaw: f32, pitch: f32) {
+        (self.cam.yaw, self.cam.pitch) = (yaw.to_radians(), pitch.to_radians());
+    }
+
+    // ------------------------------------------------------------------------------------ jobs
+
+    /// The file the Print step meshes: the design, or the optimization result.
+    fn print_source(&self) -> Option<PathBuf> {
+        if self.print_result
+            && let Some(r) = self.existing_result()
+        {
+            return Some(r);
+        }
+        self.design.clone()
+    }
+
+    fn out_path(&self, src: &Path, ext: &str) -> PathBuf {
+        let defines: &[(String, f64)] = if is_vti(src) { &[] } else { &self.defines };
+        crate::default_out(src, ext, defines)
+    }
+
+    fn mesh_path(&self, src: &Path) -> PathBuf {
+        self.out_path(src, if self.print.three_mf { ".3mf" } else { ".stl" })
+    }
+
+    /// `gen3d export|slice|open` arguments that mesh `src` the way the app shows it.
+    fn mesh_args(&self, src: &Path) -> Vec<String> {
+        let mut a = vec![src.display().to_string()];
+        if is_vti(src) {
+            let o = if self.shown == src {
+                self.current_vopts()
+            } else {
+                self.vopts.clone()
+            };
+            if let Some(n) = o.array {
+                a.extend(["--array".into(), n]);
+            }
+            if let Some(iso) = o.iso {
+                a.extend(["--iso".into(), iso.to_string()]);
+            }
+            match o.below {
+                Some(true) => a.push("--below".into()),
+                Some(false) => a.push("--above".into()),
+                None => {}
+            }
+        } else {
+            for (k, v) in &self.defines {
+                a.extend(["-D".into(), format!("{k}={v}")]);
+            }
+            if let Some(v) = self.print.voxel {
+                a.extend(["--voxel".into(), fmt_num(v as f64)]);
+            }
+        }
+        if let Some(d) = self.print.decimate {
+            a.extend(["--decimate".into(), fmt_num(d as f64)]);
+        }
+        a
+    }
+
+    /// PrusaSlicer options for the overrides chosen in the Print step.
+    fn slicer_overrides(&self) -> Vec<String> {
+        if self.slicer.as_ref().is_none_or(|(k, _)| *k != slicer::Kind::Prusa) {
+            return vec![];
+        }
+        let mut a = vec![];
+        if let Some(l) = self.print.layer {
+            a.extend(["--layer-height".into(), fmt_num(l as f64)]);
+        }
+        if let Some(i) = self.print.infill {
+            a.extend(["--fill-density".into(), format!("{i}%")]);
+        }
+        match self.print.supports {
+            Supports::Profile => {}
+            Supports::Off => a.push("--no-support-material".into()),
+            Supports::Everywhere => a.extend(["--support-material", "--support-material-auto"].map(String::from)),
+            Supports::BuildPlate => a.extend(
+                [
+                    "--support-material",
+                    "--support-material-auto",
+                    "--support-material-buildplate-only",
+                ]
+                .map(String::from),
+            ),
+        }
+        a
+    }
+
+    fn start_export(&mut self) {
+        let Some(src) = self.print_source() else { return };
+        let out = self.mesh_path(&src);
+        let mut a = self.mesh_args(&src);
+        a.extend([
+            "--format".into(),
+            if self.print.three_mf { "3mf" } else { "stl" }.into(),
+        ]);
+        a.extend(["-o".into(), out.display().to_string()]);
+        self.out_job.start("export", a, out);
+    }
+
+    fn start_slice(&mut self) {
+        let Some(src) = self.print_source() else { return };
+        let gcode = self.out_path(&src, ".gcode");
+        let mut a = self.mesh_args(&src);
+        a.extend(["-o".into(), gcode.display().to_string()]);
+        if let Some(p) = &self.print.profile {
+            a.extend(["-c".into(), p.display().to_string()]);
+        }
+        let extra = self.slicer_overrides();
+        if !extra.is_empty() {
+            a.push("--".into());
+            a.extend(extra);
+        }
+        self.out_job.start("slice", a, gcode);
+    }
+
+    fn start_open(&mut self) {
+        let Some(src) = self.print_source() else { return };
+        let mut a = self.mesh_args(&src);
+        a.extend([
+            "--format".into(),
+            if self.print.three_mf { "3mf" } else { "stl" }.into(),
+        ]);
+        let target = self.mesh_path(&src);
+        self.out_job.start("open", a, target);
+    }
+
+    fn start_optimize(&mut self) {
+        let (Some(design), Some(result), Some(shape)) = (self.design.clone(), self.result_path(), &self.design_shape)
+        else {
+            return;
+        };
+        let o = &self.opt;
+        let vox = o.voxel.unwrap_or_else(|| crate::topopt::auto_voxel(shape, 40_000.0));
+        let mut a = vec![design.display().to_string()];
+        for (k, v) in &self.defines {
+            a.extend(["-D".into(), format!("{k}={v}")]);
+        }
+        for (k, v) in [
+            ("--volfrac", o.volfrac),
+            ("--iters", o.iters as f64),
+            ("--voxel", vox as f64),
+            ("--force", o.force),
+            ("--rmin", o.rmin),
+        ] {
+            a.extend([k.to_string(), fmt_num(v)]);
+        }
+        if !o.projection {
+            a.push("--no-projection".into());
+        }
+        a.extend(["-o".into(), result.display().to_string()]);
+        self.opt_job.start("optimize", a, result);
+    }
+
+    fn gcode_summary(&mut self, p: &Path) -> Vec<(String, String)> {
+        let m = mtime(p);
+        if let Some((t, s)) = self.gcode_cache.get(p)
+            && *t == m
+        {
+            return s.clone();
+        }
+        let s = pretty_summary(&slicer::gcode_summary(p).unwrap_or_default());
+        self.gcode_cache.insert(p.to_path_buf(), (m, s.clone()));
+        s
+    }
+
+    fn edit_design(&mut self) {
+        if let Some(d) = &self.design
+            && let Err(e) = slicer::open_in_editor(d)
+        {
+            self.notice = Some(format!("{e:#}"));
+        }
+    }
+
+    fn on_key(&mut self, key: KeyCode) {
+        let step = self.shape.size()[1] / 50.0;
+        match key {
+            KeyCode::KeyR => self.reset_camera(),
+            KeyCode::KeyC => self.opts.section = !self.opts.section,
+            KeyCode::BracketLeft => self.opts.cut -= step,
+            KeyCode::BracketRight => self.opts.cut += step,
+            KeyCode::KeyB => self.opts.clip = !self.opts.clip,
+            KeyCode::KeyV => self.opts.show_bounds = !self.opts.show_bounds,
+            KeyCode::Minus | KeyCode::Equal if self.volume.is_some() => {
+                let dir = if key == KeyCode::Minus { -1.0 } else { 1.0 };
+                self.edit_volume(false, |v| v.nudge_iso(dir));
+            }
+            KeyCode::KeyM if self.volume.is_some() => self.edit_volume_uniforms(|v| v.blocky = !v.blocky),
+            KeyCode::KeyI if self.volume.is_some() => self.edit_volume(false, |v| {
+                v.below = !v.below;
+                v.recompute();
+            }),
+            KeyCode::KeyA if self.volume.is_some() => self.edit_volume(true, |v| {
+                let next = (v.array + 1) % v.file.arrays.len();
+                v.select(next);
+                v.recompute();
+            }),
+            KeyCode::KeyF if self.volume.is_some() => self.edit_volume(false, |v| {
+                let n = v.file.arrays.len();
+                v.color = match v.color {
+                    None => Some(0),
+                    Some(c) if c + 1 < n => Some(c + 1),
+                    Some(_) => None,
+                };
+                v.update_color();
+            }),
+            KeyCode::KeyF if !self.fields.is_empty() => {
+                self.field_mode = (self.field_mode + 1) % (self.fields.len() + 2);
+                self.set_field_mask();
+            }
+            KeyCode::F5 => self.reload(false),
+            KeyCode::Digit1 => self.set_view(-90.0, 0.0),
+            KeyCode::Digit2 => self.set_view(0.0, 0.0),
+            KeyCode::Digit3 => self.set_view(-90.0, 89.9),
+            KeyCode::Digit4 => self.set_view(-60.0, 28.0),
+            _ => {}
+        }
+    }
+
+    // -------------------------------------------------------------------------------------- ui
+
+    fn ui(&mut self, ui: &mut egui::Ui, tex: egui::TextureId) {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+            let dir = self.browser.dir.clone();
+            self.browser.show_at(&dir);
+        }
+        let ctx = ui.ctx().clone();
+        match self.browser.ui(&ctx, self.design.is_some()) {
+            Some(Pick::Open(p)) => self.open_design(&p, vec![]),
+            Some(Pick::Created(p)) => {
+                self.open_design(&p, vec![]);
+                self.edit_design();
+            }
+            None => {}
+        }
+        egui::Panel::top("steps").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::left("controls")
+            .resizable(false)
+            .exact_size(340.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add_space(4.0);
+                    if let Some(n) = self.notice.clone() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(ui.visuals().warn_fg_color, n);
+                            if ui.small_button("Dismiss").clicked() {
+                                self.notice = None;
+                            }
+                        });
+                        ui.separator();
+                    }
+                    if self.design.is_none() {
+                        ui.weak("Open a shape to start: Ctrl+O, or the Open button above.");
+                        return;
+                    }
+                    match self.step {
+                        Step::Design => self.design_ui(ui),
+                        Step::Optimize => self.optimize_ui(ui),
+                        Step::Print => self.print_ui(ui),
+                    }
+                    ui.add_space(12.0);
+                    egui::CollapsingHeader::new("Keyboard & mouse").show(ui, |ui| {
+                        egui::Grid::new("keys").num_columns(2).striped(true).show(ui, |ui| {
+                            for (k, v) in KEYS {
+                                ui.monospace(*k);
+                                ui.label(*v);
+                                ui.end_row();
+                            }
+                        });
+                    });
+                });
+            });
+        if let Some(err) = self.error.as_ref().or(self.param_error.as_ref()) {
+            egui::Panel::bottom("error")
+                .resizable(true)
+                .default_size(170.0)
+                .show(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.colored_label(ui.visuals().error_fg_color, egui::RichText::new("Error").strong());
+                        ui.weak(if self.loaded {
+                            "— showing the last version that worked; fix the file and save"
+                        } else {
+                            "— fix the file and save"
+                        });
+                    });
+                    egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(err).monospace()).selectable(true));
+                    });
+                });
+        }
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            egui::Frame::new()
+                .fill(ui.visuals().panel_fill)
+                .inner_margin(egui::Margin::symmetric(8, 4))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    self.toolbar(ui)
+                });
+            self.viewport_ui(ui, tex);
+        });
+    }
+
+    /// File, the three steps, and running jobs.
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("Open…")
+                .on_hover_text("open or create a shape (Ctrl+O)")
+                .clicked()
+            {
+                let dir = self.browser.dir.clone();
+                self.browser.show_at(&dir);
+            }
+            if let Some(d) = self.design.clone() {
+                if self.error.is_some() {
+                    status_dot(ui, ui.visuals().error_fg_color);
+                } else if self.loaded {
+                    status_dot(ui, OK_GREEN);
+                }
+                ui.label(egui::RichText::new(file_name(&d)).strong())
+                    .on_hover_text(format!(
+                        "{}\nreloads when the file (or an include) is saved; last loaded {}",
+                        d.display(),
+                        self.loaded_at
+                    ));
+                if !is_vti(&d)
+                    && ui
+                        .button("Edit")
+                        .on_hover_text("open the .wgsl in your editor ($GEN3D_EDITOR, else the desktop default)")
+                        .clicked()
+                {
+                    self.edit_design();
+                }
+            }
+            ui.separator();
+            let steps = [
+                (Step::Design, "1  Design", "shape and parameters"),
+                (
+                    Step::Optimize,
+                    "2  Optimize",
+                    "optional: topology optimization of the design domain",
+                ),
+                (Step::Print, "3  Print", "mesh and slice to G-code"),
+            ];
+            for (i, (step, label, tip)) in steps.into_iter().enumerate() {
+                if i > 0 {
+                    ui.weak(">");
+                }
+                let enabled = self.design.is_some() && !(step == Step::Optimize && self.design_is_grid());
+                let r = ui
+                    .add_enabled_ui(enabled, |ui| ui.selectable_label(self.step == step, label))
+                    .inner
+                    .on_hover_text(tip);
+                if r.clicked() && self.step != step {
+                    self.set_step(step);
+                }
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(&self.gpu_name);
+                for slot in [&self.out_job, &self.opt_job] {
+                    let j = slot.get();
+                    if j.running {
+                        let what = if j.cmd == "optimize" {
+                            format!("optimizing: iteration {}", opt_progress(&j.log).iteration)
+                        } else {
+                            format!("{}: {}", j.cmd, file_name(&j.target))
+                        };
+                        ui.label(what);
+                        ui.spinner();
+                        ui.separator();
+                    }
+                }
+            });
+        });
+        ui.add_space(2.0);
+    }
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for (label, key, yaw, pitch) in [
+                ("Front", "1", -90.0, 0.0),
+                ("Side", "2", 0.0, 0.0),
+                ("Top", "3", -90.0, 89.9),
+                ("Iso", "4", -60.0, 28.0),
+            ] {
+                if ui.small_button(label).on_hover_text(key).clicked() {
+                    self.set_view(yaw, pitch);
+                }
+            }
+            if ui
+                .small_button("Reset")
+                .on_hover_text("R, or double-click the view")
+                .clicked()
+            {
+                self.reset_camera();
+            }
+            ui.separator();
+            ui.toggle_value(&mut self.opts.section, "Section")
+                .on_hover_text("cut the part open (C); the cut face shows internal distance bands, [ and ] move it");
+            if self.opts.section {
+                let (lo, hi) = self.shape.bounds;
+                ui.spacing_mut().slider_width = 120.0;
+                ui.add(
+                    egui::Slider::new(&mut self.opts.cut, lo[1]..=hi[1])
+                        .suffix(" mm")
+                        .clamping(egui::SliderClamping::Never),
+                )
+                .on_hover_text("y of the cut plane");
+            }
+            ui.toggle_value(&mut self.opts.show_bounds, "Bounds")
+                .on_hover_text("show the export region (V)");
+            ui.toggle_value(&mut self.opts.clip, "Clip")
+                .on_hover_text("cut everything outside the export region (B)");
+            ui.separator();
+            egui::ComboBox::from_id_salt("res")
+                .width(64.0)
+                .selected_text(format!("{:.0}%", self.render_scale * 100.0))
+                .show_ui(ui, |ui| {
+                    for s in [1.0, 0.75, 0.5, 0.25] {
+                        ui.selectable_value(&mut self.render_scale, s, format!("{:.0}%", s * 100.0));
+                    }
+                })
+                .response
+                .on_hover_text("resolution: raymarch fewer pixels for heavy shapes");
+        });
+    }
+
+    fn viewport_ui(&mut self, ui: &mut egui::Ui, tex: egui::TextureId) {
+        let rect = ui.available_rect_before_wrap();
+        let ppp = ui.ctx().pixels_per_point();
+        let px = |v: f32| ((v * ppp * self.render_scale).round() as u32).max(1);
+        self.view_px = (px(rect.width()), px(rect.height()));
+        let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        if self.design.is_none() {
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(28, 30, 34));
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Open a shape to start (Ctrl+O)",
+                egui::FontId::proportional(18.0),
+                egui::Color32::from_white_alpha(200),
+            );
+            return;
+        }
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(tex, rect, uv, egui::Color32::WHITE);
+
+        // camera (rates per physical pixel)
+        let d = resp.drag_delta();
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            self.cam.yaw -= d.x * ppp * 0.008;
+            self.cam.pitch = (self.cam.pitch + d.y * ppp * 0.008).clamp(-1.55, 1.55);
+        } else if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
+            let s = self.cam.dist / rect.height().max(1.0) * 1.1;
+            let right = (-self.cam.yaw.sin(), self.cam.yaw.cos());
+            self.cam.target[0] -= right.0 * d.x * s;
+            self.cam.target[1] -= right.1 * d.x * s;
+            self.cam.target[2] += d.y * s;
+        }
+        if resp.double_clicked() {
+            self.reset_camera();
+        }
+        if resp.hovered() {
+            let dy: f32 = ui.input(|i| {
+                i.events
+                    .iter()
+                    .map(|e| match e {
+                        egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                            egui::MouseWheelUnit::Point => delta.y / 40.0,
+                            egui::MouseWheelUnit::Line => delta.y,
+                            egui::MouseWheelUnit::Page => delta.y * 10.0,
+                        },
+                        _ => 0.0,
+                    })
+                    .sum()
+            });
+            self.cam.dist *= 0.9f32.powf(dy);
+        }
+        if resp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+        }
+
+        // what is shown, top left; frame rate and modes, top right
+        let what = if self.volume.is_some() && Some(&self.shown) != self.design.as_ref() {
+            format!("optimization result · {}", file_name(&self.shown))
+        } else {
+            file_name(&self.shown)
+        };
+        painter.text(
+            rect.left_top() + egui::vec2(10.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            what,
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_white_alpha(170),
+        );
+        let mut info = vec![format!("{:.0} fps", self.fps)];
+        if self.rebuild.is_some() {
+            info.insert(0, "compiling…".into());
+        }
+        painter.text(
+            rect.right_top() + egui::vec2(-10.0, 8.0),
+            egui::Align2::RIGHT_TOP,
+            info.join("  ·  "),
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_white_alpha(170),
+        );
+        if !self.loaded {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "nothing to show until the shape compiles",
+                egui::FontId::proportional(18.0),
+                egui::Color32::from_white_alpha(200),
+            );
+        }
+    }
+
+    fn next_button(&mut self, ui: &mut egui::Ui, label: &str, step: Step) {
+        ui.add_space(12.0);
+        if primary(ui, true, label).clicked() {
+            self.set_step(step);
+        }
+    }
+
+    // ---------------------------------------------------------------------------- 1. Design
+
+    fn design_ui(&mut self, ui: &mut egui::Ui) {
+        if self.design_is_grid() {
+            ui.weak(
+                "A .vti grid (e.g. a simulation result): pick the array and threshold that form the \
+                 solid, then print it.",
+            );
+            section(ui, "Solid");
+            self.volume_ui(ui);
+            egui::CollapsingHeader::new("Grid details").show(ui, |ui| self.grid_ui(ui));
+            self.next_button(ui, "Next: Print", Step::Print);
+            return;
+        }
+        ui.weak("Edit the .wgsl in your editor; the preview reloads when you save.");
+        section(ui, "Parameters");
+        self.params_ui(ui);
+        if !self.fields.is_empty() {
+            section(ui, "Field overlays");
+            self.fields_ui(ui);
+        }
+        ui.add_space(6.0);
+        egui::CollapsingHeader::new("Shape details").show(ui, |ui| self.shape_ui(ui));
+        if !self.loaded {
+            return;
+        }
+        if self.optimizable() {
+            self.next_button(ui, "Next: Optimize", Step::Optimize);
+            if ui.small_button("Skip to Print").clicked() {
+                self.set_step(Step::Print);
+            }
+        } else {
+            self.next_button(ui, "Next: Print", Step::Print);
+        }
+    }
+
+    fn params_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.loaded {
+            ui.weak("shown once the shape compiles");
+            return;
+        }
+        if self.params.is_empty() {
+            ui.weak(
+                "This shape has no parameters. Declare one with\n`override SIZE: f32 = 10.0;` to get a slider here.",
+            );
+            return;
+        }
+        ui.spacing_mut().slider_width = 150.0;
+        let params = self.params.clone();
+        egui::Grid::new("params").num_columns(3).show(ui, |ui| {
+            for p in &params {
+                let cur = self.param_value(p);
+                let mut tip = p.note.clone();
+                if !tip.is_empty() {
+                    tip.push('\n');
+                }
+                tip += &format!("default {}", fmt_num(p.default));
+                ui.label(&p.name).on_hover_text(tip);
+                let mut v = cur;
+                let changed = match p.kind {
+                    ParamKind::Bool => {
+                        let mut b = v != 0.0;
+                        let r = ui.checkbox(&mut b, "");
+                        v = b as u8 as f64;
+                        r.changed()
+                    }
+                    kind => {
+                        let (lo, hi) = p.slider_range();
+                        let mut s = egui::Slider::new(&mut v, lo..=hi).clamping(egui::SliderClamping::Never);
+                        if kind != ParamKind::Float {
+                            s = s.integer();
+                        }
+                        let changed = ui.add(s).changed();
+                        if kind == ParamKind::Uint {
+                            v = v.max(0.0);
+                        }
+                        changed
+                    }
+                };
+                if changed && v != cur {
+                    self.set_param(p, v);
+                }
+                if v != p.default {
+                    if ui
+                        .small_button("reset")
+                        .on_hover_text(format!("reset to {}", fmt_num(p.default)))
+                        .clicked()
+                    {
+                        self.set_param(p, p.default);
+                    }
+                } else {
+                    ui.label("");
+                }
+                ui.end_row();
+            }
+        });
+        if !self.defines.is_empty() && ui.button("Reset all").clicked() {
+            self.defines.clear();
+            self.params_dirty = true;
+        }
+    }
+
+    fn fields_ui(&mut self, ui: &mut egui::Ui) {
+        let before = self.field_mode;
+        let n = self.fields.len();
+        ui.horizontal_wrapped(|ui| {
+            ui.radio_value(&mut self.field_mode, 0, "All").on_hover_text("F cycles");
+            for (i, f) in self.fields.iter().enumerate() {
+                ui.radio_value(&mut self.field_mode, i + 1, &f.name)
+                    .on_hover_text(if f.comps == 1 {
+                        "scalar field: tints the surface where it is < 0"
+                    } else {
+                        "vector field: tints where it is non-zero; bands move along it"
+                    });
+                let (r, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, 3.0, rgb_gamma(field_color(i)));
+            }
+            ui.radio_value(&mut self.field_mode, n + 1, "Off");
+        });
+        if self.field_mode != before {
+            self.set_field_mask();
+        }
+    }
+
+    fn shape_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(s) = self.design_shape.clone() else {
+            ui.weak("shown once the shape compiles");
+            return;
+        };
+        let (lo, hi) = s.bounds;
+        let v3 = |v: [f32; 3]| {
+            format!(
+                "{} {} {}",
+                fmt_num(v[0] as f64),
+                fmt_num(v[1] as f64),
+                fmt_num(v[2] as f64)
+            )
+        };
+        egui::Grid::new("shape").num_columns(2).show(ui, |ui| {
+            ui.label("bounds");
+            ui.monospace(format!("{}  to  {}", v3(lo), v3(hi)));
+            ui.end_row();
+            ui.label("size");
+            ui.monospace(format!("{} mm", v3(s.size())));
+            ui.end_row();
+            ui.label("voxel");
+            ui.monospace(format!("{} mm", fmt_num(s.voxel as f64)));
+            ui.end_row();
+            ui.label("step");
+            ui.monospace(fmt_num(s.step() as f64));
+            ui.end_row();
+            if let Some(d) = s.decimate() {
+                ui.label("decimate");
+                ui.monospace(fmt_num(d as f64));
+                ui.end_row();
+            }
+            ui.label("files");
+            let files: Vec<_> = s.files.iter().map(|f| f.display().to_string()).collect();
+            ui.label(files.len().to_string()).on_hover_text(files.join("\n"));
+            ui.end_row();
+            ui.label("GPU");
+            ui.label(&self.gpu_name);
+            ui.end_row();
+        });
+    }
+
+    /// Threshold, inside side, smooth/blocky, material volume and colour of the shown grid.
+    fn volume_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(v) = &self.volume else {
+            ui.weak("shown once the file loads");
+            return;
+        };
+        let names: Vec<String> = v.file.arrays.iter().map(|a| a.name.clone()).collect();
+        let (cur_array, cur_below, cur_blocky, cur_color) = (v.array, v.below, v.blocky, v.color);
+        let (lo, hi) = v.range;
+        let hist = v.hist.clone();
+        let (inside, count, inside_mm3) = (v.inside_count, v.count(), v.inside_volume());
+        let (crange, auto_crange, fixed_crange) = (v.crange(), v.auto_crange(), v.color_range);
+        let (mut array, mut below, mut blocky, mut color) = (cur_array, cur_below, cur_blocky, cur_color);
+        let cur_iso = v.iso;
+        let mut iso = self.iso_drag.unwrap_or(cur_iso);
+
+        if names.len() > 1 {
+            egui::ComboBox::from_label("array")
+                .selected_text(&names[array])
+                .show_ui(ui, |ui| {
+                    for (i, n) in names.iter().enumerate() {
+                        ui.selectable_value(&mut array, i, n);
+                    }
+                })
+                .response
+                .on_hover_text("the array that forms the solid (A cycles)");
+        }
+
+        // threshold: histogram (click/drag) and slider; recomputing is CPU work, so both apply on release
+        let (h, picked) = histogram(ui, &hist, (lo, hi), iso, below);
+        if picked.is_finite() && (h.dragged() || h.clicked()) {
+            iso = picked;
+        }
+        let r = ui
+            .add(
+                egui::Slider::new(&mut iso, lo..=hi)
+                    .text("threshold")
+                    .clamping(egui::SliderClamping::Never),
+            )
+            .on_hover_text("- and = step it; applied when you let go");
+        let dragging = h.dragged() || r.dragged();
+        let commit = h.clicked() || h.drag_stopped() || r.drag_stopped() || (r.changed() && !r.dragged());
+        self.iso_drag = if dragging { Some(iso) } else { None };
+
+        ui.horizontal(|ui| {
+            ui.label("solid where");
+            ui.radio_value(&mut below, true, "below");
+            ui.radio_value(&mut below, false, "above");
+        });
+        ui.horizontal(|ui| {
+            ui.label("draw");
+            ui.radio_value(&mut blocky, false, "smooth");
+            ui.radio_value(&mut blocky, true, "blocky")
+                .on_hover_text("M · every inside sample as a cube (for cell data: the elements)");
+        });
+
+        let pct = 100.0 * inside as f64 / count.max(1) as f64;
+        ui.label(format!(
+            "≈ {} cm³ · {} g PLA · {pct:.1}% of the grid",
+            fmt_num((inside_mm3 / 1000.0 * 100.0).round() / 100.0),
+            fmt_num((inside_mm3 / 1000.0 * 1.24 * 10.0).round() / 10.0)
+        ))
+        .on_hover_text(format!(
+            "{inside} of {count} samples inside × cell volume; solid, so an upper bound for the print \
+             (PLA at 1.24 g/cm³, 100% infill)"
+        ));
+
+        ui.add_space(4.0);
+        egui::ComboBox::from_label("colour by")
+            .selected_text(color.map_or("none", |c| names[c].as_str()))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut color, None, "none");
+                for (i, n) in names.iter().enumerate() {
+                    ui.selectable_value(&mut color, Some(i), n);
+                }
+            })
+            .response
+            .on_hover_text("F cycles");
+        let mut new_crange = fixed_crange;
+        if color.is_some() && color == cur_color {
+            colour_bar(ui, crange);
+            let mut fixed = fixed_crange.is_some();
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut fixed, "fixed range").on_hover_text(
+                    "by default the range is the 1st..99th percentile over the inside samples; fix it to \
+                     compare iterations or to ignore a few hotspots",
+                );
+                if fixed {
+                    let (mut a, mut b) = fixed_crange.unwrap_or(auto_crange);
+                    let speed = ((b - a).abs() / 200.0).max(1e-6);
+                    ui.add(egui::DragValue::new(&mut a).speed(speed));
+                    ui.add(egui::DragValue::new(&mut b).speed(speed));
+                    new_crange = Some((a, b));
+                } else {
+                    new_crange = None;
+                }
+            });
+        }
+
+        if array != cur_array {
+            return self.edit_volume(true, |v| {
+                v.select(array);
+                v.recompute();
+            });
+        }
+        if commit && iso != cur_iso {
+            self.edit_volume(false, |v| {
+                v.iso = iso;
+                v.recompute();
+            });
+        }
+        if below != cur_below {
+            self.edit_volume(false, |v| {
+                v.below = below;
+                v.recompute();
+            });
+        }
+        if blocky != cur_blocky {
+            self.edit_volume_uniforms(|v| v.blocky = blocky);
+        }
+        if color != cur_color {
+            self.edit_volume(false, |v| {
+                v.color = color;
+                v.update_color();
+            });
+        } else if new_crange != fixed_crange {
+            self.edit_volume_uniforms(|v| v.color_range = new_crange);
+        }
+    }
+
+    /// Lattice and arrays of the shown grid.
+    fn grid_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(v) = &self.volume else { return };
+        let (o, sp, d) = v.grid();
+        let f = &v.file;
+        let v3 = |a: [f64; 3]| format!("{} {} {}", fmt_num(a[0]), fmt_num(a[1]), fmt_num(a[2]));
+        let (_, pd) = f.lattice(false);
+        egui::Grid::new("grid").num_columns(2).show(ui, |ui| {
+            ui.label("points");
+            ui.monospace(format!("{} × {} × {}", pd[0], pd[1], pd[2]));
+            ui.end_row();
+            ui.label("spacing");
+            ui.monospace(format!("{} mm", v3(sp)));
+            ui.end_row();
+            ui.label("first sample");
+            ui.monospace(format!("{} mm", v3(o)))
+                .on_hover_text("of the shown array (cell data sits half a cell inside the points)");
+            ui.end_row();
+            ui.label("shown samples");
+            ui.monospace(format!("{} × {} × {}", d[0], d[1], d[2]));
+            ui.end_row();
+        });
+        ui.add_space(4.0);
+        egui::Grid::new("arrays").num_columns(3).striped(true).show(ui, |ui| {
+            ui.strong("array");
+            ui.strong("data");
+            ui.strong("range");
+            ui.end_row();
+            for (i, a) in f.arrays.iter().enumerate() {
+                let name = if a.comps == 1 {
+                    a.name.clone()
+                } else {
+                    format!("{} [{}]", a.name, a.comps)
+                };
+                if i == v.array {
+                    ui.strong(name).on_hover_text("shown");
+                } else {
+                    ui.label(name);
+                }
+                ui.label(if a.cell { "cell" } else { "point" });
+                let (lo, hi) = a
+                    .data
+                    .iter()
+                    .filter(|x| x.is_finite())
+                    .fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+                ui.monospace(format!("{} .. {}", fmt_num(lo as f64), fmt_num(hi as f64)));
+                ui.end_row();
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------------- 2. Optimize
+
+    fn optimize_ui(&mut self, ui: &mut egui::Ui) {
+        ui.weak(
+            "Optional. Finds the stiffest part that uses a given share of the design domain (the \
+             shape), held where field_fixed < 0 and loaded along field_load.",
+        );
+        if !self.optimizable() {
+            ui.add_space(6.0);
+            ui.label(
+                "This shape isn't set up as an optimization problem. Add \
+                 `fn field_fixed(p: vec3f) -> f32` (< 0 where the part is clamped) and \
+                 `fn field_load(p: vec3f) -> vec3f` (the load direction); optional field_keep / \
+                 field_void force material / empty space. See shapes/bracket_domain.wgsl.",
+            );
+            self.next_button(ui, "Skip to Print", Step::Print);
+            return;
+        }
+        let Some(shape) = self.design_shape.clone() else { return };
+        if !self.defines.is_empty() {
+            ui.weak(format!("for {}", define_list(&self.defines)));
+        }
+        let result = self.result_path();
+        let job = self.opt_job.get();
+        let mine = result.as_ref() == Some(&job.target);
+        let running_here = job.running && mine;
+
+        section(ui, "Settings");
+        let auto = crate::topopt::auto_voxel(&shape, 40_000.0);
+        ui.add_enabled_ui(!running_here, |ui| {
+            let o = &mut self.opt;
+            egui::Grid::new("opt").num_columns(2).show(ui, |ui| {
+                ui.label("material");
+                ui.add(
+                    egui::Slider::new(&mut o.volfrac, 0.05..=0.8)
+                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                        .custom_parser(|s| s.trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0)),
+                )
+                .on_hover_text("share of the design domain to fill with material");
+                ui.end_row();
+                ui.label("load");
+                ui.add(
+                    egui::DragValue::new(&mut o.force)
+                        .speed(1.0)
+                        .range(0.0..=1e6)
+                        .suffix(" N"),
+                )
+                .on_hover_text("total force over the field_load region; only scales the displacements");
+                ui.end_row();
+                ui.label("element size");
+                ui.horizontal(|ui| {
+                    let mut v = o.voxel.unwrap_or(auto);
+                    let speed = v * 0.01;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut v)
+                                .speed(speed)
+                                .range(1e-3..=1e3)
+                                .suffix(" mm"),
+                        )
+                        .on_hover_text("voxel size of the simulation; time grows quickly as it shrinks")
+                        .changed()
+                    {
+                        o.voxel = Some(v);
+                    }
+                    if o.voxel.is_some() && ui.small_button("auto").clicked() {
+                        o.voxel = None;
+                    }
+                });
+                ui.end_row();
+                ui.label("min. member");
+                ui.add(
+                    egui::Slider::new(&mut o.rmin, 1.0..=4.0)
+                        .fixed_decimals(1)
+                        .suffix(" elements"),
+                )
+                .on_hover_text("filter radius: larger gives thicker, simpler members");
+                ui.end_row();
+                ui.label("iterations");
+                ui.add(egui::Slider::new(&mut o.iters, 5..=300))
+                    .on_hover_text("at most; stops early when converged");
+                ui.end_row();
+                ui.label("");
+                ui.checkbox(&mut o.projection, "crisp 0/1 design").on_hover_text(
+                    "Heaviside projection: sharpens step by step (beta 1 to 32) so no grey, partly dense \
+                     material is left. Takes more iterations; off is faster but leaves grey regions.",
+                );
+                ui.end_row();
+            });
+        });
+        let vox = self.opt.voxel.unwrap_or(auto);
+        let n: usize = shape
+            .size()
+            .iter()
+            .map(|s| (*s / vox).ceil().max(1.0) as usize)
+            .product();
+        ui.weak(format!("≤ {n} elements (only those inside the domain are solved)"));
+        ui.add_space(6.0);
+
+        if running_here {
+            let p = opt_progress(&job.log);
+            ui.add(
+                egui::ProgressBar::new(p.iteration as f32 / self.opt.iters.max(1) as f32)
+                    .text(format!("iteration {} of at most {}", p.iteration, self.opt.iters)),
+            );
+            let mut parts = vec![];
+            if let Some(c) = p.compliance {
+                parts.push(format!("compliance {c}"));
+            }
+            if let Some(g) = p.grey {
+                parts.push(format!("grey {g}"));
+            }
+            if let Some(b) = p.beta {
+                parts.push(format!("beta {b}"));
+            }
+            ui.weak(parts.join(" · ")).on_hover_text(
+                "compliance: lower is stiffer. grey: share of partly dense elements. beta: \
+                 sharpness of the projection (the run ends at 32)",
+            );
+        } else {
+            let busy = self.opt_job.running();
+            let label = if self.existing_result().is_some() {
+                "Optimize again"
+            } else {
+                "Optimize"
+            };
+            if primary(ui, !busy, label)
+                .on_hover_text("runs in the background; the design forms live in the view")
+                .clicked()
+            {
+                self.start_optimize();
+            }
+            if busy {
+                ui.weak(format!("another optimization is running ({})", file_name(&job.target)));
+            }
+        }
+        if mine {
+            job_ui(ui, &self.opt_job, &job);
+            if let Some(f) = opt_progress(&job.log).finished {
+                ui.weak(f);
+            }
+        }
+
+        section(ui, "Result");
+        let Some(result) = result else { return };
+        let mut notice = self.notice.take();
+        let exists = file_line(ui, &result, &self.design_files(), &mut notice);
+        self.notice = notice;
+        if !exists {
+            ui.weak("Run the optimization to get a result for these parameter values.");
+            return;
+        }
+        if self.volume.is_some() && self.shown == result {
+            ui.weak("Pick the threshold that forms the part; the mesh follows it.");
+            self.volume_ui(ui);
+        }
+        ui.add_space(12.0);
+        if primary(ui, true, "Next: Print the result").clicked() {
+            self.print_result = true;
+            self.set_step(Step::Print);
+        }
+    }
+
+    // ------------------------------------------------------------------------------ 3. Print
+
+    fn print_ui(&mut self, ui: &mut egui::Ui) {
+        let result = self.existing_result();
+        if result.is_some() {
+            ui.horizontal(|ui| {
+                ui.label("Print");
+                let before = self.print_result;
+                ui.radio_value(&mut self.print_result, false, "the design");
+                ui.radio_value(&mut self.print_result, true, "the optimized result");
+                if before != self.print_result {
+                    self.sync_shown();
+                }
+            });
+        } else {
+            self.print_result = false;
+        }
+        let Some(src) = self.print_source() else { return };
+        let grid = is_vti(&src);
+        let job = self.out_job.get();
+        let busy = job.running;
+        if !grid && !self.defines.is_empty() {
+            ui.weak(format!("with {}", define_list(&self.defines)));
+        }
+
+        section(ui, "Mesh");
+        if grid {
+            match &self.volume {
+                Some(v) if self.shown == src => {
+                    let op = if v.below { "<" } else { ">" };
+                    ui.weak(format!(
+                        "surface where {} {op} {}",
+                        v.array_name(),
+                        fmt_num(v.iso as f64)
+                    ));
+                }
+                _ => {}
+            }
+            if self.design_is_grid() {
+                ui.weak("(change the threshold in Design)");
+            } else {
+                ui.weak("(change the threshold in Optimize)");
+            }
+        } else if let Some(shape) = self.design_shape.clone() {
+            egui::Grid::new("mesh").num_columns(2).show(ui, |ui| {
+                ui.label("voxel");
+                ui.horizontal(|ui| {
+                    let mut v = self.print.voxel.unwrap_or(shape.voxel);
+                    let speed = v * 0.01;
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut v)
+                                .speed(speed)
+                                .range(0.01..=10.0)
+                                .suffix(" mm"),
+                        )
+                        .on_hover_text("mesh resolution: smaller is finer and slower (default: //! voxel)")
+                        .changed()
+                    {
+                        self.print.voxel = Some(v);
+                    }
+                    if self.print.voxel.is_some() && ui.small_button("default").clicked() {
+                        self.print.voxel = None;
+                    }
+                    let n: f64 = shape.size().iter().map(|s| (*s / v) as f64 + 1.0).product();
+                    ui.weak(format!("{:.0}M samples", (n / 1e6).max(0.1)));
+                });
+                ui.end_row();
+                ui.label("triangles");
+                ui.horizontal(|ui| {
+                    let mut on = self.print.decimate.is_some();
+                    let def = shape.decimate();
+                    if ui
+                        .checkbox(&mut on, "reduce")
+                        .on_hover_text("decimate the mesh to a fraction of its triangles")
+                        .changed()
+                    {
+                        self.print.decimate = on.then(|| def.unwrap_or(0.5));
+                    }
+                    if let Some(d) = &mut self.print.decimate {
+                        ui.add(
+                            egui::Slider::new(d, 0.05..=1.0)
+                                .custom_formatter(|v, _| format!("keep {:.0}%", v * 100.0))
+                                .custom_parser(|s| {
+                                    s.trim_start_matches("keep")
+                                        .trim_end_matches('%')
+                                        .trim()
+                                        .parse::<f64>()
+                                        .ok()
+                                        .map(|v| v / 100.0)
+                                }),
+                        );
+                    } else if let Some(d) = def {
+                        ui.weak(format!("shape keeps {:.0}%", d * 100.0));
+                    }
+                });
+                ui.end_row();
+            });
+        }
+        ui.horizontal(|ui| {
+            ui.label("format");
+            ui.radio_value(&mut self.print.three_mf, false, "STL");
+            ui.radio_value(&mut self.print.three_mf, true, "3MF");
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(!busy && self.loaded, egui::Button::new("Export mesh"))
+                .on_hover_text("write the mesh only (slicing below also does this)")
+                .clicked()
+            {
+                self.start_export();
+            }
+        });
+        let inputs = if grid { vec![src.clone()] } else { self.design_files() };
+        let mesh = self.mesh_path(&src);
+        let mut notice = self.notice.take();
+        file_line(ui, &mesh, &inputs, &mut notice);
+        if job.cmd != "open"
+            && job.target == mesh
+            && let Some(r) = mesh_report(&job.log)
+        {
+            ui.weak(r);
+        }
+
+        section(ui, "Slice");
+        match &self.slicer {
+            Some((_, exe)) => {
+                ui.weak(format!("slicer: {}", exe.display()));
+            }
+            None => {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    "No slicer found. Install PrusaSlicer (sudo pacman -S prusa-slicer), or set \
+                     GEN3D_SLICER to a PrusaSlicer/OrcaSlicer executable.",
+                );
+            }
+        }
+        let auto_label = match self.design_shape.as_ref() {
+            Some(s) if !grid || self.print_result => {
+                let c = crate::resolve_configs(&[], s);
+                if c.is_empty() {
+                    "slicer defaults".to_string()
+                } else {
+                    c.iter().map(|p| file_name(p)).collect::<Vec<_>>().join(", ")
+                }
+            }
+            _ => {
+                let d = Path::new("printers/default.ini");
+                if d.exists() {
+                    "default.ini".into()
+                } else {
+                    "slicer defaults".into()
+                }
+            }
+        };
+        let profiles = self.print.profiles.clone();
+        egui::ComboBox::from_label("printer profile")
+            .selected_text(match &self.print.profile {
+                Some(p) => file_name(p),
+                None => format!("auto: {auto_label}"),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.print.profile, None, format!("auto: {auto_label}"))
+                    .on_hover_text("the shape's //! slicer directive, else printers/default.ini");
+                for p in &profiles {
+                    ui.selectable_value(&mut self.print.profile, Some(p.clone()), file_name(p));
+                }
+            })
+            .response
+            .on_hover_text(
+                "profiles are read from printers/ (PrusaSlicer: File > Export > Export Config, see \
+                 printers/README.md)",
+            );
+        if auto_label == "slicer defaults" && self.print.profile.is_none() {
+            ui.weak("no profile: the slicer's generic printer; export yours to printers/default.ini");
+        }
+        if matches!(self.slicer, Some((slicer::Kind::Prusa, _))) {
+            egui::Grid::new("overrides").num_columns(2).show(ui, |ui| {
+                ui.label("layer height");
+                egui::ComboBox::from_id_salt("layer")
+                    .selected_text(self.print.layer.map_or("profile".into(), |l| format!("{l} mm")))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.print.layer, None, "profile");
+                        for l in [0.08, 0.1, 0.12, 0.15, 0.2, 0.25, 0.3] {
+                            ui.selectable_value(&mut self.print.layer, Some(l), format!("{l} mm"));
+                        }
+                    });
+                ui.end_row();
+                ui.label("infill");
+                egui::ComboBox::from_id_salt("infill")
+                    .selected_text(self.print.infill.map_or("profile".into(), |i| format!("{i}%")))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.print.infill, None, "profile");
+                        for i in [0, 5, 10, 15, 20, 30, 40, 60, 100] {
+                            ui.selectable_value(&mut self.print.infill, Some(i), format!("{i}%"));
+                        }
+                    });
+                ui.end_row();
+                ui.label("supports");
+                let name = |s: Supports| match s {
+                    Supports::Profile => "profile",
+                    Supports::Off => "off",
+                    Supports::Everywhere => "everywhere",
+                    Supports::BuildPlate => "from the plate only",
+                };
+                egui::ComboBox::from_id_salt("supports")
+                    .selected_text(name(self.print.supports))
+                    .show_ui(ui, |ui| {
+                        for s in [
+                            Supports::Profile,
+                            Supports::Off,
+                            Supports::Everywhere,
+                            Supports::BuildPlate,
+                        ] {
+                            ui.selectable_value(&mut self.print.supports, s, name(s));
+                        }
+                    });
+                ui.end_row();
+            });
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let ok = !busy && self.loaded && self.slicer.is_some();
+            if primary(ui, ok, "Slice to G-code")
+                .on_hover_text("mesh and slice in the background")
+                .clicked()
+            {
+                self.start_slice();
+            }
+            if ui
+                .add_enabled(ok, egui::Button::new("Open in slicer"))
+                .on_hover_text("mesh and open it in the slicer's window, to arrange or tweak it there")
+                .clicked()
+            {
+                self.start_open();
+            }
+        });
+        let gcode = self.out_path(&src, ".gcode");
+        let mut gcode_inputs = inputs.clone();
+        gcode_inputs.extend(self.print.profile.clone());
+        if file_line(ui, &gcode, &gcode_inputs, &mut notice) && !(busy && job.target == gcode) {
+            let summary = self.gcode_summary(&gcode);
+            if !summary.is_empty() {
+                egui::Grid::new("gcode").num_columns(2).show(ui, |ui| {
+                    for (k, v) in summary {
+                        ui.label(k);
+                        ui.strong(v);
+                        ui.end_row();
+                    }
+                });
+            }
+        }
+        self.notice = notice;
+        if !job.cmd.is_empty() {
+            ui.add_space(6.0);
+            job_ui(ui, &self.out_job, &job);
+        }
+    }
+
+    // ---------------------------------------------------------------------------------- frame
+
+    /// Run the UI for one frame and the work that follows it (pipeline rebuilds).
+    fn run_ui(&mut self, raw: egui::RawInput) -> Option<egui::FullOutput> {
+        let win = self.win.as_ref()?;
+        let ctx = win.egui.clone();
+        let tex = win.viewport.id;
+        let out = ctx.run_ui(raw, |ui| self.ui(ui, tex));
+        if std::mem::take(&mut self.params_dirty) {
+            self.request_rebuild();
+        }
+        self.poll_rebuild();
+        self.opts.time = self.start.elapsed().as_secs_f32();
+        Some(out)
+    }
+
+    /// Draw the preview and the UI into `target` (`None`: only apply egui's texture changes).
+    fn paint(&mut self, mut out: egui::FullOutput, target: Option<(&wgpu::TextureView, [u32; 2])>) {
+        let Some(win) = &mut self.win else { return };
+        // egui's texture uploads must be applied (and frees honoured) even if this frame isn't drawn
+        for (id, deltas) in out.textures_delta.set.drain() {
+            for delta in &deltas {
+                win.renderer.update_texture(&win.gpu.device, &win.gpu.queue, id, delta);
+            }
+        }
+        let free: Vec<_> = out.textures_delta.free.drain().collect();
+        let Some((view, size_in_pixels)) = target else {
+            free.iter().for_each(|id| win.renderer.free_texture(id));
+            return;
+        };
+        if win.viewport.size != self.view_px {
+            win.viewport.size = self.view_px;
+            win.viewport.view = Viewport::target(&win.gpu, self.view_px);
+            win.renderer.update_egui_texture_from_wgpu_texture(
+                &win.gpu.device,
+                &win.viewport.view,
+                wgpu::FilterMode::Linear,
+                win.viewport.id,
+            );
+        }
+        let u = uniforms(&self.shape, &self.cam, &self.opts, win.viewport.size, true);
+        win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
+        let preview = draw(&win.gpu, win.pipeline.as_ref(), &win.viewport.view);
+
+        let (device, queue) = (&win.gpu.device, &win.gpu.queue);
+        let jobs = win
+            .egui
+            .tessellate(std::mem::take(&mut out.shapes), out.pixels_per_point);
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels,
+            pixels_per_point: out.pixels_per_point,
+        };
+        let mut enc = device.create_command_encoder(&Default::default());
+        let extra = win.renderer.update_buffers(device, queue, &mut enc, &jobs, &screen);
+        {
+            let mut pass = enc
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            win.renderer.render(&mut pass, &jobs, &screen);
+        }
+        queue.submit(std::iter::once(preview).chain(extra).chain([enc.finish()]));
+        free.iter().for_each(|id| win.renderer.free_texture(id));
+    }
+
+    fn request_redraw(&self) {
+        if let Some(os) = self.win.as_ref().and_then(|w| w.os.as_ref()) {
+            os.window.request_redraw();
+        }
+    }
+
+    fn frame(&mut self) {
+        let Some(os) = self.win.as_mut().and_then(|w| w.os.as_mut()) else {
+            return;
+        };
+        let raw = os.egui_state.take_egui_input(&os.window);
+        let Some(mut out) = self.run_ui(raw) else { return };
+        let title = match &self.design {
+            Some(d) => format!("gen3d — {}", file_name(d)),
+            None => "gen3d".into(),
+        };
+        let Some(win) = &mut self.win else { return };
+        let Some(os) = &mut win.os else { return };
+        if win.title != title {
+            os.window.set_title(&title);
+            win.title = title;
+        }
+        os.egui_state
+            .handle_platform_output(&os.window, std::mem::take(&mut out.platform_output));
+        let frame = match os.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                os.surface.configure(&win.gpu.device, &os.config);
+                return self.paint(out, None);
+            }
+            _ => return self.paint(out, None),
+        };
+        let size = [os.config.width, os.config.height];
+        let (window, gpu) = (os.window.clone(), win.gpu.clone());
+        let view = frame.texture.create_view(&Default::default());
+        self.paint(out, Some((&view, size)));
+        window.pre_present_notify();
+        gpu.queue.present(frame);
+
+        self.frames += 1;
+        let dt = self.fps_t.elapsed().as_secs_f32();
+        if dt >= 0.5 {
+            self.fps = self.frames as f32 / dt;
+            self.frames = 0;
+            self.fps_t = Instant::now();
+        }
+    }
+
+    fn open_window(&mut self, el: &ActiveEventLoop) -> Result<Win> {
+        let attrs = Window::default_attributes()
+            .with_title("gen3d")
+            .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 900.0));
+        let window = Arc::new(el.create_window(attrs)?);
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle_from_env(Box::new(
+            el.owned_display_handle(),
+        )));
+        let surface = instance.create_surface(window.clone())?;
+        let gpu = Arc::new(crate::gpu::create(instance, Some(&surface), true)?);
+        let info = gpu.adapter.get_info();
+        self.gpu_name = format!("{} ({:?})", info.name, info.backend);
+        let caps = surface.get_capabilities(&gpu.adapter);
+        // egui blends in gamma space: prefer a non-sRGB swapchain format
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+        let size = window.inner_size();
+        let mut config = surface
+            .get_default_config(&gpu.adapter, size.width.max(1), size.height.max(1))
+            .ok_or_else(|| anyhow::anyhow!("surface not supported by the GPU adapter"))?;
+        config.format = format;
+        config.present_mode = wgpu::PresentMode::AutoVsync;
+        surface.configure(&gpu.device, &config);
+        let egui_state = egui_winit::State::new(
+            egui::Context::default(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            Some(gpu.device.limits().max_texture_dimension_2d as usize),
+        );
+        let os = OsWindow {
+            window,
+            surface,
+            config,
+            egui_state,
+        };
+        Ok(Win::new(gpu, format, Some(os)))
+    }
+
+    /// Draw the app offscreen at `size` (logical pixels = physical) and save it as a PNG.
+    fn snapshot_png(&mut self, size: (u32, u32), out: &Path) -> Result<()> {
+        let gpu = self.win.as_ref().map(|w| w.gpu.clone()).context("no GPU")?;
+        let (w, h) = size;
+        let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("snapshot"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: VIEW_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        // a few frames: egui sizes some widgets from the previous frame's layout
+        // (time advances a second per frame so fade-ins finish)
+        for i in 0..4 {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(w as f32, h as f32),
+                )),
+                time: Some(i as f64),
+                predicted_dt: 1.0,
+                ..Default::default()
+            };
+            let Some(o) = self.run_ui(raw) else { break };
+            self.paint(o, Some((&view, [w, h])));
+            // let a parameter rebuild started by this frame land before the next one
+            while self.rebuild.is_some() {
+                std::thread::sleep(Duration::from_millis(10));
+                self.poll_rebuild();
+            }
+        }
+        crate::viewer::save_texture_png(&gpu, &tex, size, out)
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.win.is_some() {
+            return;
+        }
+        match self.open_window(el) {
+            Ok(w) => {
+                self.win = Some(w);
+                self.reload(true);
+                if !self.loaded {
+                    self.reset_camera();
+                }
+                self.request_redraw();
+            }
+            Err(e) => {
+                eprintln!("\x1b[31merror:\x1b[0m could not open the window: {e:#}");
+                el.exit();
+            }
+        }
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        let Some(win) = &mut self.win else { return };
+        let Some(os) = &mut win.os else { return };
+        let _ = os.egui_state.on_window_event(&os.window, &event);
+        match event {
+            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::Resized(size) => {
+                os.config.width = size.width.max(1);
+                os.config.height = size.height.max(1);
+                os.surface.configure(&win.gpu.device, &os.config);
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && !win.egui.egui_wants_keyboard_input()
+                    && !self.browser.open
+                    && self.design.is_some() =>
+            {
+                let ctrl = win.egui.input(|i| i.modifiers.command);
+                if let PhysicalKey::Code(code) = event.physical_key
+                    && !ctrl
+                {
+                    self.on_key(code);
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                self.frame();
+                self.request_redraw();
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now - self.last_poll > Duration::from_millis(250) {
+            self.last_poll = now;
+            // a result appearing (first iteration of an optimization) or vanishing switches the view
+            self.sync_shown();
+            if self.mtimes.iter().any(|(f, m)| mtime(f) != *m) {
+                std::thread::sleep(Duration::from_millis(50)); // let editors finish writing
+                self.reload(false);
+            }
+        }
+        el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(250)));
+    }
+}
+
+/// What `snapshot` sets up before drawing.
+pub struct SnapshotSetup {
+    pub step: String,
+    pub print_result: bool,
+    pub browser: bool,
+    pub section: bool,
+}
+
+/// Draw the app's window offscreen, without opening one, and save it as a PNG: for checking the
+/// UI headlessly (`gen3d snapshot`). Same GPU code paths as the window.
+pub fn snapshot(
+    file: Option<&Path>,
+    defines: Vec<(String, f64)>,
+    setup: &SnapshotSetup,
+    size: (u32, u32),
+    out: &Path,
+) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut app = App::new(cwd.clone());
+    let gpu = Arc::new(crate::gpu::headless()?);
+    let info = gpu.adapter.get_info();
+    app.gpu_name = format!("{} ({:?})", info.name, info.backend);
+    app.win = Some(Win::new(gpu, VIEW_FORMAT, None));
+    match file {
+        Some(f) => app.open_design(f, defines),
+        None => app.browser.show_at(&cwd.join("shapes")),
+    }
+    if !app.loaded {
+        app.reset_camera();
+    }
+    app.print_result = setup.print_result;
+    app.opts.section = setup.section;
+    match setup.step.as_str() {
+        "design" => {}
+        "optimize" => app.set_step(Step::Optimize),
+        "print" => app.set_step(Step::Print),
+        s => anyhow::bail!("unknown step `{s}` (design, optimize, print)"),
+    }
+    if setup.browser {
+        let dir = app.browser.dir.clone();
+        app.browser.show_at(&dir);
+    }
+    app.snapshot_png(size, out)
+}
+
+/// Open the app, optionally with a file.
+pub fn run(file: Option<&Path>, defines: Vec<(String, f64)>) -> Result<()> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut app = App::new(cwd.clone());
+    match file {
+        Some(f) => {
+            let p = f
+                .canonicalize()
+                .with_context(|| format!("cannot open {}", f.display()))?;
+            if !crate::browser::openable(&p) {
+                anyhow::bail!("{} is not a .wgsl shape or .vti grid", p.display());
+            }
+            app.open_design(&p, defines);
+        }
+        None => {
+            let shapes = cwd.join("shapes");
+            app.browser.show_at(if shapes.is_dir() { &shapes } else { &cwd });
+        }
+    }
+    let event_loop = EventLoop::new()?;
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pretty_gcode_summary() {
+        let lines: Vec<String> = [
+            "estimated printing time (normal mode) = 1h 2m 3s",
+            "filament used [g] = 12.34",
+            "filament used [mm] = 4123.4",
+            "fill_density = 15%",
+            "support_material = 0",
+            "printer_model = ",
+        ]
+        .map(String::from)
+        .to_vec();
+        let p = pretty_summary(&lines);
+        assert_eq!(p[0], ("print time".into(), "1h 2m 3s".into()));
+        assert_eq!(p[1], ("filament".into(), "12.34 g".into()));
+        assert_eq!(p[2], ("filament length".into(), "4.12 m".into()));
+        assert_eq!(p[3], ("infill".into(), "15%".into()));
+        assert_eq!(p[4], ("supports".into(), "off".into()));
+        assert_eq!(p.len(), 5, "an empty printer model is dropped");
+    }
+
+    #[test]
+    fn result_and_output_paths_follow_parameters() {
+        let mut app = App::new(PathBuf::from("/tmp"));
+        app.design = Some(PathBuf::from("/x/shapes/bracket.wgsl"));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(app.result_path(), Some(cwd.join("out/bracket_topopt.vti")));
+        app.defines = vec![("T".into(), 4.0)];
+        assert_eq!(app.result_path(), Some(cwd.join("out/bracket_T-4_topopt.vti")));
+        let r = app.result_path().unwrap();
+        assert_eq!(app.mesh_path(&r), cwd.join("out/bracket_T-4_topopt.stl"));
+        assert_eq!(
+            app.mesh_path(Path::new("/x/shapes/bracket.wgsl")),
+            cwd.join("out/bracket_T-4.stl")
+        );
+        // a grid opened directly has no optimization step
+        app.design = Some(PathBuf::from("/x/out/sim.vti"));
+        assert_eq!(app.result_path(), None);
+    }
+}

@@ -1,31 +1,25 @@
 # gen3d: procedural SDF workbench for 3D printing
 
-Write shapes as WGSL signed distance functions, preview them live (with hot reload), mesh them on the GPU,
-and slice them to G-code. A single Rust binary built on [wgpu](https://wgpu.rs) (Vulkan, Metal, DX12 or GL).
+Write shapes as WGSL signed distance functions, preview them live (with hot reload), optionally
+topology-optimize them, mesh them on the GPU, and slice them to G-code. A single Rust binary built on
+[wgpu](https://wgpu.rs) (Vulkan, Metal, DX12 or GL).
 
 ```
-shape.wgsl ──► gen3d view    live raymarched preview, reloads on save
-           ──► gen3d export  GPU compute-shader sampling → marching cubes → watertight STL/3MF
-           ──► gen3d slice   export + PrusaSlicer/OrcaSlicer CLI → .gcode
-           ──► gen3d open    export + open in the slicer GUI
-           ──► gen3d export --format vti   SDF + boundary-condition fields as a VTK grid (simulation)
-           ──► gen3d optimize  topology optimization of the design domain → result.vti (live)
-
-result.vti ──► gen3d view    threshold surface of a grid (e.g. a topology-optimization density), live reload
-           ──► gen3d export  marching cubes → STL/3MF, or slice / open like a shape
+gen3d   ─►  1 Design    open or create a .wgsl, edit it in your editor (live reload), tune parameters
+            2 Optimize  optional: topology optimization of the shape as a design domain (live)
+            3 Print     mesh the design or the optimized result, pick a printer profile, slice to G-code
 ```
+
+Every step is also a command (`export`, `optimize`, `slice`, ...) for scripting; the app runs them.
 
 ## Quick start
 
 ```sh
 cargo install --path .              # installs the `gen3d` binary to ~/.cargo/bin
-gen3d new mything                   # creates shapes/mything.wgsl from a template
-gen3d view shapes/mything.wgsl      # open the preview, then edit the file in your editor
-gen3d export shapes/mything.wgsl    # -> out/mything.stl
-gen3d slice shapes/mything.wgsl     # -> out/mything.gcode (needs a slicer, see below)
+gen3d                               # open the app: pick a shape in shapes/, or create one
 ```
 
-(Or use `cargo run --release -- view shapes/knob.wgsl` without installing.)
+(Or `cargo run --release` without installing. `gen3d view FILE` opens a file directly.)
 
 Slicer: `sudo pacman -S prusa-slicer` (full CLI slicing support). Then export your printer profile to
 `printers/default.ini`; see [printers/README.md](printers/README.md).
@@ -67,12 +61,12 @@ and errors are reported as `yourfile.wgsl:LINE:COL` with the offending line.
 **Parameters** are WGSL [pipeline-overridable constants](https://www.w3.org/TR/WGSL/#override-decls):
 declare `override NAME: f32 = default;` and set it with `-D NAME=VALUE` on any command. Values are applied
 when the pipeline is created, so changing them never edits the source. An unknown `-D` name is an error
-that lists the shape's parameters (the viewer warns and ignores it instead).
+that lists the shape's parameters (the app warns and ignores it instead).
 
-In the viewer every parameter gets a slider (a checkbox for `bool`). A trailing `// comment` on the
+In the app every parameter gets a slider (a checkbox for `bool`). A trailing `// comment` on the
 declaration becomes its tooltip. The slider covers 0 to twice the default unless you give it a range
-with `//! range NAME min max`; you can still type any value into the number box. Export, slice and open
-from the viewer use the values on screen, and **Copy -D flags** puts them on the clipboard for the CLI.
+with `//! range NAME min max`; you can still type any value into the number box. Optimize and Print use
+the values on screen.
 
 ### Library (`src/wgsl/sdf.wgsl`)
 
@@ -101,46 +95,58 @@ Distance functions are mostly from [Inigo Quilez](https://iquilezles.org/article
 | `max(v, 0.0)` on a vector | `max(v, vec3f(0.0))` |
 | `c ? a : b` | `select(b, a, c)` |
 
-## Viewer
+## The app
 
-`gen3d view` opens the preview with a sidebar ([egui](https://github.com/emilk/egui), drawn with the same
-wgpu device as the raymarcher):
+`gen3d` (or `gen3d view [FILE]`) opens one window ([egui](https://github.com/emilk/egui), drawn with the
+same wgpu device as the raymarcher). The top bar has **Open…**, the file with an **Edit** button, and
+the three steps; the sidebar shows the current step's controls, and the viewport has a toolbar for the
+camera presets, section view, bounds box, clipping and render resolution.
 
-- **Parameters:** sliders for the shape's `override` constants (see above). A change rebuilds only the
-  pipeline, on a background thread, so dragging stays smooth while the preview catches up.
-- **View:** camera presets, section view and cut plane, clip to bounds, bounds box, and a resolution
-  slider that raymarches fewer pixels for heavy shapes.
-- **Field overlays:** pick which `field_*` regions to tint, with their colours.
-- **Volume** (for `.vti` files): array, a histogram of its values with the threshold on it (click or drag
-  it to move the threshold), inside below/above, smooth/blocky, the inside volume (cm³, % of the grid,
-  grams of PLA), and colour by another array with a colour bar and an optional fixed range.
-- **Grid** (for `.vti` files): grid size, spacing and origin, and every array with point/cell data and
-  value range.
-- **Output:** export, slice and open in the slicer, with the job's progress and log. For shapes, **Export
-  VTI** writes the simulation grid (SDF + `field_*` arrays) at its own voxel size. The default keeps it
-  around a million samples; the size and file size are shown before you export. When it's done,
-  **View** opens the `.vti` in a second viewer window.
-- **Errors** appear in a panel under the view (also printed to the terminal); the last version that
-  compiled stays on screen until you fix the file.
+- **Open** (`Ctrl+O`, and at startup without a file): browse folders for `.wgsl` shapes and `.vti`
+  grids, newest first, with shortcuts to the project, `shapes/` and `out/`. **New shape** writes the
+  template into the folder, opens it and starts your editor.
+- **Edit** opens the shape in `$GEN3D_EDITOR` (a command, e.g. `code` or `kitty nvim`) or else the
+  desktop's default app. The preview reloads whenever the file or an include is saved; errors show in a
+  panel under the view, and the last version that compiled stays on screen.
+- **1 Design:** sliders for the shape's [parameters](#writing-shapes), `field_*` overlay selection, and
+  shape details. A parameter change rebuilds only the pipeline, on a background thread, so dragging stays
+  smooth.
+- **2 Optimize** (for shapes with `field_fixed` and `field_load`, see
+  [Topology optimization](#topology-optimization)): material share, load, element size, minimum member
+  size, iterations, crisp 0/1. **Optimize** runs in the background with a progress bar; from the first
+  iteration the viewport shows the result growing. Then pick the threshold on its histogram (with the
+  material volume in cm³ and grams), optionally colour by `energy` or `displacement`, and continue
+  with **Print the result**.
+- **3 Print:** print the design or the optimized result. Mesh voxel and triangle reduction (for
+  shapes), STL or 3MF, **Export mesh**. Pick a printer profile from `printers/` (or *auto*: the shape's
+  `//! slicer`, else `printers/default.ini`), optionally override layer height, infill and supports
+  (PrusaSlicer), then **Slice to G-code** or **Open in slicer**. The result shows print time,
+  filament and settings, read from the G-code.
+
+Outputs have fixed names in `out/` from the file and its parameter values (`knob_DIAM-30.stl`,
+`bracket_domain_topopt.vti`), so reopening a shape finds its earlier result, mesh and G-code. Each
+output says when it is older than its source. Jobs run as `gen3d` subprocesses: one optimization and
+one export/slice at a time, each with **Stop** and a log.
 
 The keyboard shortcuts work whenever no text field has focus:
 
 | | |
 |---|---|
+| `Ctrl+O` | open a shape |
 | left drag / right drag / wheel | orbit / pan / zoom (double-click resets the camera) |
 | `1` `2` `3` `4` | front / side / top / iso view |
 | `C`, `[` `]` | toggle cross-section, move the cut plane (the section face shows internal distance bands) |
 | `B` / `V` | toggle clipping to export bounds / bounds box |
 | `F` | cycle `field_*` overlays: all, each field alone, off (see [Extra fields](#extra-fields-boundary-conditions-and-regions)) |
-| `E` / `G` / `O` | export mesh / slice to G-code / open in slicer GUI (runs in the background) |
-| `R`, `F5`, `Q` | reset camera, force reload, quit |
+| `R`, `F5` | reset camera, force reload |
 
 Keys are matched by physical position (US layout), so `[` `]` work without AltGr on Nordic layouts.
 
 ## Command reference
 
 ```
-gen3d view   SHAPE [-D NAME=VAL]...     (SHAPE is a .wgsl file, or a .vti grid with the options below)
+gen3d                                   the app
+gen3d view   [FILE] [-D NAME=VAL]...    the app with a .wgsl shape or .vti grid open
 gen3d export SHAPE [-o out.stl] [--format stl|3mf|obj|ply|vti] [--voxel MM] [--bounds X0 Y0 Z0 X1 Y1 Z1] [--decimate F]
 gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh opts] [-- extra slicer args]
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
@@ -148,8 +154,9 @@ gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DE
 gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
 gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--modulus MPA] [--nu V] [-o out.vti]
 
-.vti options (view/render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
+.vti options (render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
+gen3d snapshot [FILE] [--step design|optimize|print] [--result] [--browser] [-o png]   (hidden; see Development)
 ```
 
 Outputs go to `out/`; `-D` values are appended to the filename (`out/knob_DIAM-30.stl`).
@@ -209,12 +216,13 @@ the sign is always right).
 
 ## Viewing and meshing grids (.vti)
 
-`view`, `render`, `export`, `slice` and `open` also take a `.vti` file (VTK ImageData), such as the density
-your topology optimizer writes back. The viewer draws the region where one array is past a threshold:
+The app opens `.vti` files (VTK ImageData), such as the density an external topology optimizer writes
+back, and `render`, `export`, `slice` and `open` take them too. The viewport draws the region where one
+array is past a threshold; the Design step has the threshold and colour controls, and Print meshes it:
 
 ```sh
 gen3d check  result.vti                                   # list arrays: point/cell data, ranges
-gen3d view   result.vti --array density --color stress    # live view; reloads when the file changes
+gen3d view   result.vti                                   # live view; reloads when the file changes
 gen3d export result.vti --array density --iso 0.5         # marching cubes -> out/result.stl
 gen3d slice  result.vti --array density                   # straight to G-code
 ```
@@ -230,8 +238,8 @@ gen3d slice  result.vti --array density                   # straight to G-code
 - **Smooth or blocky:** smooth draws the interpolated threshold surface, the same one `export` meshes.
   `--blocky` (or `M`) draws every inside sample as a cube; for cell data those are exactly the elements.
 - **Colour:** `--color NAME` (or `F`) colours the surface and the section face by another array, using a
-  viridis colour map. The range is the 1st to 99th percentile of that array over the inside samples (so a few hotspots don't flatten it), and the window
-  title shows it.
+  viridis colour map. The range is the 1st to 99th percentile of that array over the inside samples (so
+  a few hotspots don't flatten it); the sidebar shows a colour bar and can fix the range.
 - **Live reload:** when the file changes on disk, the view reloads but keeps the array, threshold and
   colour you picked. If a write is caught half-finished, the old view stays until the next change.
 - **Below the plate:** as with shapes, anything below z = 0 is hidden by the build plate. Grids centred
@@ -248,8 +256,8 @@ Keys in the viewer for `.vti` files:
 | `F` | colour by: off, then each array in turn |
 
 The sidebar has the same controls, plus a histogram for picking the threshold and the material volume
-(see [Viewer](#viewer)). `E` / `G` / `O` export, slice or open with the current array and threshold. On a large grid (8M samples)
-a threshold change takes about a second, because the distance field is recomputed on the CPU.
+(see [The app](#the-app)); Print meshes with the current array and threshold. On a large grid (8M
+samples) a threshold change takes about a second, because the distance field is recomputed on the CPU.
 
 ## Topology optimization
 
@@ -271,9 +279,9 @@ gen3d view out/bracket_domain_topopt.vti                     # opens on `density
 gen3d export out/bracket_domain_topopt.vti                   # -> out/bracket_domain_topopt.stl
 ```
 
-In the viewer, the **Topology optimization** section runs the same thing in the background. **View**
-opens the result in a second window while it is still running. The file is rewritten after every
-iteration, atomically, so you watch the design form; **Stop** ends the run and keeps the last iteration.
+In the app, the **Optimize** step runs the same thing in the background and shows the result in the
+viewport while it is still running. The file is rewritten after every iteration, atomically, so you
+watch the design form; **Stop** ends the run and keeps the last iteration.
 
 - **Output:** cell arrays `density` (0..1) and `energy` (strain energy density, MPa: where the part
   works hardest), and point array `displacement` (mm). Colour by `energy` or `displacement` to see how
@@ -324,18 +332,26 @@ iteration, atomically, so you watch the design form; **Stop** ends the run and k
 ```
 cargo test            # marching-cubes table and watertightness, shape loading / error mapping
 cargo clippy --all-targets
+gen3d snapshot shapes/bracket_domain.wgsl --step optimize -o out/ui.png   # the app's window, offscreen
 ```
+
+`snapshot` draws the app's window into a PNG without opening one (same GPU path), to check the UI
+headlessly. It can open a step (`--step`), the optimized result in Print (`--result`), or the Open
+dialog (`--browser`).
 
 | file | role |
 |---|---|
 | `src/main.rs` | CLI |
+| `src/app.rs` | the app window: Design / Optimize / Print steps, jobs, viewport, `snapshot` |
+| `src/browser.rs` | the Open dialog and New shape |
+| `src/jobs.rs` | background `gen3d` subprocess jobs, log parsing (optimization progress, mesh report) |
 | `src/shape.rs` | `#include` expansion, `//!` directives, naga validation, error → `file:line:col` |
 | `src/gpu.rs` | adapter selection (hardware first, software fallback with a warning) |
 | `src/mesher.rs` | compute-shader sampling harness, grid padding, polygonize + report |
 | `src/mc.rs` | marching cubes with a generated crack-free case table |
 | `src/mesh.rs` | volume / watertight / bodies, decimation, STL/3MF/OBJ/PLY writers |
-| `src/viewer.rs` | raymarching preview harness, viewer window and egui sidebar, headless PNG render |
-| `src/slicer.rs` | PrusaSlicer / OrcaSlicer discovery and CLI driving |
+| `src/viewer.rs` | raymarching preview harness and pipelines, headless PNG render |
+| `src/slicer.rs` | PrusaSlicer / OrcaSlicer discovery and CLI driving, G-code summary, profiles, opening files |
 | `src/vti.rs` | VTK ImageData reader and writers |
 | `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing |
 | `src/topopt.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |

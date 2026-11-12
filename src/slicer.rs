@@ -186,13 +186,16 @@ pub fn slice_to_gcode(
     summarize(out)
 }
 
-fn summarize(gcode: &Path) -> Result<()> {
+/// The settings and estimates worth showing from a G-code file's comments (print time, filament,
+/// layer height, ...), as `key = value` lines. Slicers write them at the end of the file.
+pub fn gcode_summary(gcode: &Path) -> Result<Vec<String>> {
     const KEYS: &[&str] = &[
         "estimated printing time (normal mode)",
-        "filament used [mm]",
         "filament used [g]",
+        "filament used [mm]",
         "layer_height",
         "fill_density",
+        "support_material",
         "nozzle_diameter",
         "printer_model",
     ];
@@ -208,10 +211,72 @@ fn summarize(gcode: &Path) -> Result<()> {
             found[i] = Some(rest.trim().to_string());
         }
     }
+    Ok(found.into_iter().flatten().collect())
+}
+
+fn summarize(gcode: &Path) -> Result<()> {
     let size = std::fs::metadata(gcode)?.len();
     println!("wrote {} ({:.1} MB)", gcode.display(), size as f64 / 1e6);
-    for f in found.into_iter().flatten() {
+    for f in gcode_summary(gcode)? {
         println!("  {f}");
     }
+    Ok(())
+}
+
+/// Slicer profiles in `printers/` under the working directory (PrusaSlicer .ini, Orca .json).
+pub fn profiles() -> Vec<PathBuf> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Ok(entries) = std::fs::read_dir(cwd.join("printers")) else {
+        return vec![];
+    };
+    let mut out: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("ini") || e.eq_ignore_ascii_case("json"))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Open a file or folder with the desktop's default application (detached).
+pub fn open_with_desktop(path: &Path) -> Result<()> {
+    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let mut cmd = Command::new(opener);
+    cmd.arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn().map_err(|e| anyhow!("could not run {opener}: {e}"))?;
+    Ok(())
+}
+
+/// Open a shape in the user's editor: `$GEN3D_EDITOR` (a command, e.g. `code` or `kitty nvim`) if
+/// set, else the desktop's default application for the file.
+pub fn open_in_editor(path: &Path) -> Result<()> {
+    let Some(editor) = std::env::var("GEN3D_EDITOR").ok().filter(|e| !e.trim().is_empty()) else {
+        return open_with_desktop(path);
+    };
+    let mut words = editor.split_whitespace();
+    let exe = words.next().unwrap_or_default();
+    let mut cmd = Command::new(exe);
+    cmd.args(words)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
+        .map_err(|e| anyhow!("could not run GEN3D_EDITOR ({editor}): {e}"))?;
     Ok(())
 }

@@ -503,6 +503,42 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
     Ok(shape)
 }
 
+const TEMPLATE: &str = "// {name}.wgsl — gen3d shape. Units: mm, +Z up, build plate at z = 0.
+// Export region (xmin ymin zmin  xmax ymax zmax) and mesh resolution in mm:
+//! bounds -30 -30 0  30 30 50
+//! voxel 0.2
+//! range R 4 20
+#include <sdf.wgsl>
+
+override R: f32 = 12.0;  // ball radius (mm)
+
+fn map(p: vec3f) -> f32 {
+    let body = sdRoundBox(p - vec3f(0, 0, 15), vec3f(20, 20, 15), 3.0);
+    let hole = sdCylinder(rotX(p - vec3f(0, 0, 13), deg(90.0)), 7.0, 25.0);  // through-hole along Y
+    let ball = sdSphere(p - vec3f(0, 0, 30), R);
+    return opSmoothUnion(opSmoothSubtract(body, hole, 2.0), ball, 4.0);
+}
+";
+
+/// Write a new shape from the template. `name` is a file name (`.wgsl` added if missing) in `dir`.
+pub fn create_from_template(dir: &Path, name: &str) -> Result<PathBuf> {
+    let name = name.trim();
+    if name.is_empty() || name.contains(['/', '\\']) {
+        bail!("give the new shape a file name (no folders)");
+    }
+    let mut path = dir.join(name);
+    if path.extension().is_none_or(|e| e != "wgsl") {
+        path = dir.join(format!("{name}.wgsl"));
+    }
+    if path.exists() {
+        bail!("{} already exists", path.display());
+    }
+    std::fs::create_dir_all(dir)?;
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    std::fs::write(&path, TEMPLATE.replace("{name}", &stem))?;
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -3,6 +3,90 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: One app, one flow: Design → Optimize → Print
+
+**What:** the viewer's sidebar had grown a section per feature (Parameters, View, Field overlays,
+Topology optimization, Output with Export VTI and a second "View" window, Grid, Shape). It's now one app
+with three steps, so a shape goes from .wgsl to G-code without the terminal. `gen3d` with no arguments
+opens it.
+
+- **Top bar:** Open…, the file with an Edit button and a status dot, the steps (1 Design > 2 Optimize >
+  3 Print), and running jobs. The sidebar shows only the current step.
+- **Open dialog** (`src/browser.rs`, plain egui): folders and `.wgsl`/`.vti` files, newest first, with
+  shortcuts to project/shapes/out. **New shape** writes the template (moved to `shape.rs`), opens the
+  shape and starts the editor. It opens at startup when no file is given; `Ctrl+O` later.
+- **Edit:** `$GEN3D_EDITOR` (split on whitespace, e.g. `kitty nvim`), else `xdg-open`/`open`.
+- **Design:** parameters, field overlays, shape details. For a `.vti` opened directly, the threshold
+  and colour controls instead; Optimize is disabled.
+- **Optimize:** settings, Optimize/Stop, a progress bar parsed from the job log (iteration, compliance,
+  grey, β). The viewport switches to the result after the first iteration (polled every 250 ms), and the
+  threshold histogram and material volume sit under it. **Next: Print the result**.
+- **Print:** design or optimized result. Mesh voxel (with a sample count) and decimation, STL/3MF,
+  Export mesh. Printer profile from `printers/*.ini|json` or *auto* (what `slice` would pick anyway).
+  Layer height, infill and supports overrides passed to PrusaSlicer after `--` (hidden for Orca). Slice to
+  G-code / Open in slicer. The G-code summary is read from the file (`slicer::gcode_summary`, cached by
+  mtime) and shown as print time, filament, layer height, infill, supports, nozzle.
+- **Viewport toolbar:** camera presets, Section (+ cut slider), Bounds, Clip, resolution. These were a
+  sidebar section.
+- **Dropped:** Export VTI button and its voxel estimate (CLI `export --format vti` stays; the built-in
+  optimizer made it an expert path), the second viewer window, Copy -D flags, the E/G/O keys (too easy
+  to start a slow job by accident), Q/Esc quit (Esc should close the dialog), the resizable sidebar
+  (its width jumped between steps), and `view`'s `.vti` display flags (`render` keeps them).
+
+**Design decisions:**
+- **Outputs are derived, not remembered.** Every output path is a function of the file and parameter
+  values (`default_out`, new `topopt_out`), and the app passes `-o` explicitly. So reopening a shape
+  finds its result, mesh and G-code with no project file. Changing a parameter correctly leaves "no
+  result for these values". Each output line warns when the file is older than its sources (the
+  design's files, or the result).
+- **Design vs shown file.** `App.design` is what you opened; `App.shown` is what the viewport shows (the
+  design or `out/NAME_topopt.vti`), picked from the step by `wanted_shown`. The design's shape, fields
+  and parameters are kept while the result is shown, so the camera, Optimize settings and slider values
+  survive switching back and forth. The grid view options (array, threshold) are saved when switching
+  away and passed to export/slice as `--array/--iso/--above`.
+- **Jobs stay subprocesses** (`src/jobs.rs`, moved out of the viewer): Stop is a plain kill, the log
+  is the CLI's own output, and the CLI and app share one code path. There are two slots, so a mesh can be
+  exported while an optimization runs.
+- **Split:** `viewer.rs` is now only the raymarching core (harness, pipelines, `render_png`). The
+  window is `app.rs`.
+
+**Headless UI check (`gen3d snapshot`, hidden command):** there is no Xvfb here, and screenshotting the
+desktop is off-limits while the user is on it. So the window's GPU state is split from the OS window
+(`Win.os: Option<OsWindow>`), frames are `run_ui` + `paint(target)`, and `snapshot` paints the full UI
+into an offscreen texture for a few frames, with time advancing 1 s per frame so fade-ins finish, then
+writes a PNG (`viewer::save_texture_png`, shared with `render`). Options: `--step`, `--result`,
+`--browser`, `--section`.
+
+**Verified:**
+- clippy clean; 15 tests pass. New tests: optimization progress parsing, ANSI stripping, the G-code
+  summary labels, and result/mesh paths following parameter values.
+- The exact command lines the app builds, run from the CLI:
+  - Optimize with `-o`.
+  - Export the result with `--array density --iso 0.5 --above -o` (watertight).
+  - `slice` with `-- --layer-height 0.2 --fill-density 15% --no-support-material` (the G-code reports
+    `support_material = 0`) and with build-plate-only supports (`= 1`).
+- Snapshots on the RTX 3080:
+  - Startup Open dialog.
+  - Design: bracket_domain with field overlays.
+  - A broken shape: error panel, red view, steps still usable.
+  - Optimize with the existing result, histogram and volume.
+  - Print of the result, with the G-code summary.
+  - Print of the knob design.
+  - A `.vti` opened directly.
+- Found by the snapshots and fixed: `→` is not in egui's default fonts (it was already a box in the old
+  Shape panel), and "blocky" overflowed the sidebar.
+
+**Not verified:** real clicks and drags (KDE asks before synthetic input). Not exercised in a live
+window: hot reload of the result while optimizing, the Edit/Show buttons launching apps, and Stop.
+The logic for each is the same code as before or covered by the CLI runs above.
+
+**Open / next:**
+- A built-in WGSL editor panel (egui `TextEdit` with highlighting), for a truly single-window loop.
+- Printer upload (PrusaLink/OctoPrint) as a last step.
+- Show the mesh (not the SDF) in Print, with overhang shading, to catch printability problems before
+  slicing.
+- Remember recent files and the last profile across sessions.
+
 ## 2026-11-12: Heaviside projection for `gen3d optimize`
 
 **What:** a smoothed Heaviside projection of the filtered densities (Wang, Lazarov & Sigmund 2011),
