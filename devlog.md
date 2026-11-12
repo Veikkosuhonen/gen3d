@@ -3,6 +3,25 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: New shapes start empty
+
+**What:** the app's **New shape** writes an empty `.wgsl` and opens it, without starting the external
+editor. You build it from primitives, or click **Edit** to script it. An empty Design view says so
+("Empty shape: add a primitive…"), and the Parameters how-to is hidden for primitives-only shapes
+that have no parameters. `gen3d new NAME` on the command line still writes the scripted template (in a
+terminal you're scripting anyway).
+
+**How:** a `.wgsl` with **no code** counts as an editor shape even before its `.prims.json` exists.
+No code means only comments (`//`, `/* */`), `//!` directives and `#include` lines (`has_code`). The
+sidecar is created on the first Add. A file that has code but no `fn map` is still an error. The check
+now runs before parsing, so it says "no `fn map` found" instead of naga's "unknown identifier `map`" from
+inside the harness.
+
+**Verified:** `cargo test` (24 pass): an empty file and a comments/directives/include-only file both
+load as empty editor shapes and compile with the mesher and preview harnesses. Code without `map` still
+gives the clear error. A `gen3d snapshot` of a fresh empty shape shows the hint and the Add buttons.
+clippy clean.
+
 ## 2026-11-12: Supports, loads and load cases from editor primitives
 
 **What:** a primitive has an **Optimize as** role: design (default), keep solid, fixed or load. Load

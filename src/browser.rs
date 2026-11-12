@@ -173,11 +173,14 @@ impl Browser {
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ui
                     .add_enabled(!self.new_name.trim().is_empty(), egui::Button::new("Create"))
-                    .on_hover_text("from a template, in this folder; opens it in your editor")
+                    .on_hover_text(
+                        "an empty .wgsl in this folder: build it from primitives in Design, or click \
+                         Edit to script it",
+                    )
                     .clicked()
                     || (enter && !self.new_name.trim().is_empty())
                 {
-                    match crate::shape::create_from_template(&self.dir, &self.new_name) {
+                    match crate::shape::create_empty(&self.dir, &self.new_name) {
                         Ok(p) => {
                             self.new_name.clear();
                             pick = Some(Pick::Created(p));

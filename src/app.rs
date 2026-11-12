@@ -1054,6 +1054,13 @@ impl App {
 
     // ------------------------------------------------------------------------- primitive editor
 
+    /// A design with nothing in it yet: no script `map` and no visible added primitive.
+    fn is_empty_design(&self) -> bool {
+        self.design_shape
+            .as_ref()
+            .is_some_and(|s| s.editor && !s.script_map && !s.prims.iter().any(|p| !p.hidden && p.op == Op::Union))
+    }
+
     /// Whether the viewport shows the .wgsl design, so its primitives can be edited.
     fn can_edit(&self) -> bool {
         self.step == Step::Design
@@ -1843,10 +1850,7 @@ impl App {
         let ctx = ui.ctx().clone();
         match self.browser.ui(&ctx, self.design.is_some()) {
             Some(Pick::Open(p)) => self.open_design(&p, vec![]),
-            Some(Pick::Created(p)) => {
-                self.open_design(&p, vec![]);
-                self.edit_design();
-            }
+            Some(Pick::Created(p)) => self.open_design(&p, vec![]),
             None => {}
         }
         egui::Panel::top("steps").show(ui, |ui| self.top_bar(ui));
@@ -2127,6 +2131,15 @@ impl App {
             egui::FontId::proportional(13.0),
             egui::Color32::from_white_alpha(170),
         );
+        if self.loaded && self.step == Step::Design && self.is_empty_design() {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Empty shape: add a primitive (Primitives > Add), or click Edit to script it",
+                egui::FontId::proportional(16.0),
+                egui::Color32::from_white_alpha(190),
+            );
+        }
         if !self.loaded {
             painter.text(
                 rect.center(),
@@ -2159,9 +2172,20 @@ impl App {
             self.next_button(ui, "Next: Print", Step::Print);
             return;
         }
-        ui.weak("Edit the .wgsl in your editor; the preview reloads when you save.");
-        section(ui, "Parameters");
-        self.params_ui(ui);
+        if self.is_empty_design() {
+            ui.weak(
+                "An empty shape: add primitives below, or click Edit to script it (`fn map`); the \
+                 preview reloads when you save.",
+            );
+        } else {
+            ui.weak("Edit the .wgsl in your editor; the preview reloads when you save.");
+        }
+        // a shape made of primitives only has no use for the parameters' how-to
+        let script = self.design_shape.as_ref().is_none_or(|s| s.script_map);
+        if script || !self.params.is_empty() {
+            section(ui, "Parameters");
+            self.params_ui(ui);
+        }
         section(ui, "Primitives");
         self.prims_ui(ui);
         if !self.fields.is_empty() {
