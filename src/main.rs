@@ -201,9 +201,16 @@ enum Cmd {
         /// fraction of the design domain to fill
         #[arg(long, default_value_t = 0.3)]
         volfrac: f64,
-        /// maximum iterations
-        #[arg(long, default_value_t = 50)]
+        /// maximum iterations (stops early when converged)
+        #[arg(long, default_value_t = 150)]
         iters: usize,
+        /// final sharpness of the Heaviside projection (crisp 0/1 designs); beta starts at 1 and
+        /// doubles each time the design settles
+        #[arg(long, default_value_t = 32.0)]
+        beta_max: f64,
+        /// no Heaviside projection (faster, but leaves grey, partly dense regions)
+        #[arg(long)]
+        no_projection: bool,
         /// density filter radius in voxels (larger = thicker, simpler members)
         #[arg(long, default_value_t = 1.5)]
         rmin: f64,
@@ -425,6 +432,8 @@ fn run(cli: Cli) -> Result<()> {
             voxel,
             volfrac,
             iters,
+            beta_max,
+            no_projection,
             rmin,
             penal,
             force,
@@ -450,6 +459,7 @@ fn run(cli: Cli) -> Result<()> {
                 e0: modulus,
                 nu,
                 force,
+                beta_max: if no_projection { 0.0 } else { beta_max.max(1.0) },
             };
             let gpu = gpu::headless()?;
             let problem = topopt::setup(&shape, &settings, &gpu)?;

@@ -3,6 +3,38 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: Heaviside projection for `gen3d optimize`
+
+**What:** a smoothed Heaviside projection of the filtered densities (Wang, Lazarov & Sigmund 2011),
+x̄ = (tanh βη + tanh β(x̃−η)) / (tanh βη + tanh β(1−η)) with η = 0.5, on by default.
+
+- **Continuation:** β starts at 1 and doubles (to `--beta-max`, 32) each time a stage converges (the
+  same stall rule: < 0.1% compliance change for 3 iterations, or density change < tol), or after 25
+  iterations at one β. The final stop only happens at β_max. After each doubling, x̄ is recomputed from
+  the current x̃, and the stall counter restarts, because compliance jumps when β changes.
+- **Sensitivities:** compliance and volume both get the factor dx̄/dx̃ before the filter's chain rule.
+  So the volume sensitivity is recomputed every iteration (before, it was a constant).
+- **Volume:** measured on the projected densities inside the OC bisection.
+- **Kept-solid elements** stay 1 and aren't projected.
+- **Interface:** `--beta-max`, `--no-projection`, default `--iters` raised to 150 (runs stop early). The
+  viewer's Topology optimization section has a "crisp 0/1 design" checkbox.
+
+**Verified:**
+- A new test: endpoints 0 and 1 fixed, x̄(η) = η, the derivative matches central differences for β in
+  {0, 1, 8, 32}, and β = 32 is sharp. 13 tests pass, clippy is clean.
+- bracket_domain at 1.3 mm:
+  - Grey (0.1–0.9) went 24% → 20% (β 2) → 10% (β 4) → 2% (β 8) → 0% (β 16, 32).
+  - Final compliance 8.96 against 10.36 N·mm without projection: 13% stiffer for the same material.
+  - 49 iterations and 77 s, against 29 and 52 s without.
+  - Same truss topology. Thresholded mesh watertight, one body, 27.6 cm³ against 28.6 for the exact
+    voxel volume; marching cubes cuts the staircase corners.
+- `--no-projection` reproduces the previous run exactly (compliance 40.976 at iteration 3).
+
+**Tradeoff seen:** the crisp design's threshold surface is a voxel staircase. The grey design looked
+smoother only because of its soft density gradient. Options: a finer voxel (costly), or smoothing the
+density field before meshing (cheap; a small blur keeps the volume nearly unchanged), as a viewer and
+export option.
+
 ## 2026-11-12: Topology optimization MVP (`gen3d optimize`)
 
 **What:** minimum-compliance topology optimization with SIMP, in Rust inside gen3d (`src/topopt.rs`).

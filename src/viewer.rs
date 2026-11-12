@@ -775,16 +775,19 @@ struct OptUi {
     voxel: Option<f32>,
     force: f64,
     rmin: f64,
+    /// Heaviside projection (crisp 0/1 designs)
+    projection: bool,
 }
 
 impl Default for OptUi {
     fn default() -> Self {
         OptUi {
             volfrac: 0.3,
-            iters: 50,
+            iters: 150,
             voxel: None,
             force: 100.0,
             rmin: 1.5,
+            projection: true,
         }
     }
 }
@@ -1835,8 +1838,14 @@ impl Viewer {
             .on_hover_text("minimum member size: larger gives thicker, simpler members");
             ui.end_row();
             ui.label("iterations");
-            ui.add(egui::Slider::new(&mut o.iters, 5..=200))
+            ui.add(egui::Slider::new(&mut o.iters, 5..=300))
                 .on_hover_text("at most; stops early when converged");
+            ui.end_row();
+            ui.label("projection");
+            ui.checkbox(&mut o.projection, "crisp 0/1 design").on_hover_text(
+                "Heaviside projection: sharpens step by step (beta 1 → 32) so no grey, partly dense \
+                 material is left. Takes more iterations; off is faster but leaves grey regions.",
+            );
             ui.end_row();
         });
         let vox = o.voxel.unwrap_or(auto);
@@ -1856,6 +1865,7 @@ impl Viewer {
         ]
         .iter()
         .flat_map(|(k, v)| [k.to_string(), fmt_num(*v)])
+        .chain((!o.projection).then(|| "--no-projection".to_string()))
         .collect();
         if ui
             .add_enabled(!running, egui::Button::new("Optimize"))

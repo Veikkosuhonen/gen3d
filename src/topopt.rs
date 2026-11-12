@@ -42,6 +42,9 @@ pub struct Settings {
     pub nu: f64,
     /// total load (N), spread over the loaded nodes
     pub force: f64,
+    /// Heaviside projection: final sharpness β (0 = no projection). β starts at 1 and doubles each
+    /// time the design converges, up to this.
+    pub beta_max: f64,
 }
 
 /// A discretized problem. Elements and nodes are indexed x-fastest.
@@ -482,6 +485,48 @@ impl Filter {
     }
 }
 
+/// Smoothed Heaviside projection of filtered densities (Wang, Lazarov & Sigmund 2011): pushes them
+/// towards 0 or 1 around the threshold `eta`, more sharply as `beta` grows. `beta == 0` is identity.
+#[derive(Clone, Copy)]
+struct Projection {
+    beta: f64,
+    eta: f64,
+}
+
+impl Projection {
+    fn den(&self) -> f64 {
+        (self.beta * self.eta).tanh() + (self.beta * (1.0 - self.eta)).tanh()
+    }
+
+    fn apply(&self, xt: f64) -> f64 {
+        if self.beta == 0.0 {
+            return xt;
+        }
+        ((self.beta * self.eta).tanh() + (self.beta * (xt - self.eta)).tanh()) / self.den()
+    }
+
+    fn deriv(&self, xt: f64) -> f64 {
+        if self.beta == 0.0 {
+            return 1.0;
+        }
+        let t = (self.beta * (xt - self.eta)).tanh();
+        self.beta * (1.0 - t * t) / self.den()
+    }
+
+    /// Physical densities from filtered ones: design elements projected, kept-solid stay 1.
+    fn densities(&self, p: &Problem, xt: &[f64]) -> Vec<f64> {
+        (0..xt.len())
+            .map(|e| {
+                if p.domain[e] && !p.passive[e] {
+                    self.apply(xt[e])
+                } else {
+                    xt[e]
+                }
+            })
+            .collect()
+    }
+}
+
 pub struct Outcome {
     pub iterations: usize,
     pub compliance: f64,
@@ -502,8 +547,10 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
     let f: Vec<f64> = p.load.iter().flatten().copied().collect();
     let emin = s.e0 * 1e-6;
     let filter = Filter::new(p, s.rmin);
-    // d(volume)/dx through the filter (constant)
-    let dv = filter.sensitivities(p, &vec![1.0; ne]);
+    let mut proj = Projection {
+        beta: if s.beta_max > 0.0 { 1.0 } else { 0.0 },
+        eta: 0.5,
+    };
 
     let mut x: Vec<f64> = (0..ne)
         .map(|e| {
@@ -516,18 +563,30 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
             }
         })
         .collect();
-    let mut xphys = filter.densities(p, &x);
+    let mut xtilde = filter.densities(p, &x);
+    let mut xphys = proj.densities(p, &xtilde);
     let mut u = vec![0.0; f.len()];
     let t_start = Instant::now();
     let mut stalled = 0;
+    let mut stage_its = 0;
     let mut result = Outcome {
         iterations: 0,
         compliance: 0.0,
         max_disp: 0.0,
     };
     println!(
-        "SIMP: volume fraction {}, penalty {}, filter radius {} voxels, E = {} MPa, nu = {}, load {} N",
-        s.volfrac, s.penal, s.rmin, s.e0, s.nu, s.force
+        "SIMP: volume fraction {}, penalty {}, filter radius {} voxels, E = {} MPa, nu = {}, load {} N, {}",
+        s.volfrac,
+        s.penal,
+        s.rmin,
+        s.e0,
+        s.nu,
+        s.force,
+        if s.beta_max > 0.0 {
+            format!("Heaviside projection up to beta {}", s.beta_max)
+        } else {
+            "no projection".into()
+        }
     );
     for it in 1..=s.iters {
         let t0 = Instant::now();
@@ -557,7 +616,11 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
                 }
             })
             .collect();
+        // chain rule: projection, then filter (the volume sensitivity changes with the projection)
+        let dproj: Vec<f64> = (0..ne).map(|e| proj.deriv(xtilde[e])).collect();
+        let dc: Vec<f64> = (0..ne).map(|e| dc[e] * dproj[e]).collect();
         let dc = filter.sensitivities(p, &dc);
+        let dv = filter.sensitivities(p, &dproj);
         let used_xphys = xphys.clone();
 
         // optimality criteria: bisect the Lagrange multiplier to meet the volume
@@ -570,7 +633,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
                 let be = (-dc[e]).max(0.0) / (dv[e] * lmid).max(1e-300);
                 xnew[e] = (x[e] * be.sqrt()).clamp((x[e] - mv).max(0.0), (x[e] + mv).min(1.0));
             }
-            let trial = filter.densities(p, &xnew);
+            let trial = proj.densities(p, &filter.densities(p, &xnew));
             let vol: f64 = design.iter().map(|&e| trial[e]).sum();
             if vol > target {
                 l1 = lmid;
@@ -579,7 +642,8 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
             }
         }
         let change = design.iter().map(|&e| (xnew[e] - x[e]).abs()).fold(0.0, f64::max);
-        xphys = filter.densities(p, &xnew);
+        xtilde = filter.densities(p, &xnew);
+        xphys = proj.densities(p, &xtilde);
         x = xnew;
 
         let max_disp = u
@@ -593,8 +657,13 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
             .filter(|&&e| used_xphys[e] > 0.1 && used_xphys[e] < 0.9)
             .count() as f64
             / design.len() as f64;
+        let beta = if proj.beta > 0.0 {
+            format!(", beta {}", proj.beta)
+        } else {
+            String::new()
+        };
         println!(
-            "it {it:3}: compliance {compliance:.4e} N·mm, max displacement {max_disp:.4} mm, change {change:.3}, grey {:.0}%, {cg} CG its, {:.1} s",
+            "it {it:3}: compliance {compliance:.4e} N·mm, max displacement {max_disp:.4} mm, change {change:.3}, grey {:.0}%{beta}, {cg} CG its, {:.1} s",
             grey * 100.0,
             t0.elapsed().as_secs_f64()
         );
@@ -635,16 +704,27 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
         // the max density change often hovers at the move limit while the design no longer
         // improves, so also stop once compliance has stagnated
         let improvement = (result.compliance - compliance) / compliance;
-        stalled = if it > 1 && improvement.abs() < 1e-3 {
+        stalled = if stage_its > 0 && improvement.abs() < 1e-3 {
             stalled + 1
         } else {
             0
         };
+        stage_its += 1;
         result = Outcome {
             iterations: it,
             compliance,
             max_disp,
         };
+        let converged = change < s.tol || stalled >= 3;
+        // continuation: sharpen the projection each time the design settles (or after 25 iterations)
+        if proj.beta > 0.0 && proj.beta < s.beta_max && (converged || stage_its >= 25) {
+            proj.beta = (proj.beta * 2.0).min(s.beta_max);
+            println!("beta -> {}", proj.beta);
+            xphys = proj.densities(p, &xtilde);
+            stalled = 0;
+            stage_its = 0;
+            continue;
+        }
         if change < s.tol {
             println!("converged (density change < {})", s.tol);
             break;
@@ -668,6 +748,23 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_endpoints_and_derivative() {
+        for beta in [0.0, 1.0, 8.0, 32.0] {
+            let pr = Projection { beta, eta: 0.5 };
+            assert!(pr.apply(0.0).abs() < 1e-12 && (pr.apply(1.0) - 1.0).abs() < 1e-12);
+            assert!((pr.apply(0.5) - 0.5).abs() < 1e-12);
+            for x in [0.1, 0.4, 0.5, 0.62, 0.9] {
+                let h = 1e-6;
+                let fd = (pr.apply(x + h) - pr.apply(x - h)) / (2.0 * h);
+                assert!((fd - pr.deriv(x)).abs() < 1e-5 * (1.0 + fd.abs()), "beta {beta} x {x}");
+            }
+        }
+        // sharp at high beta
+        let pr = Projection { beta: 32.0, eta: 0.5 };
+        assert!(pr.apply(0.4) < 0.05 && pr.apply(0.6) > 0.95);
+    }
 
     #[test]
     fn ke_is_symmetric_and_rigid_body_free() {

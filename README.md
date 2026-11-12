@@ -146,7 +146,7 @@ gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
 gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
-gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--modulus MPA] [--nu V] [-o out.vti]
+gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--modulus MPA] [--nu V] [-o out.vti]
 
 .vti options (view/render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
@@ -285,17 +285,25 @@ iteration, atomically, so you watch the design form; **Stop** ends the run and k
   - Each voxel is a trilinear 8-node hex element.
   - Density is penalized with p = 3, and a density filter with radius `--rmin` voxels sets the minimum
     member size.
-  - The density update uses optimality criteria (move limit 0.2) under the volume constraint.
-  - It stops when compliance improves by less than 0.1% for 3 iterations, or at `--iters`.
+  - **Heaviside projection** (on by default) pushes the filtered densities towards 0 or 1 around 0.5.
+    Its sharpness β starts at 1 and doubles each time the design settles (or after 25 iterations), up
+    to `--beta-max` (32). Starting sharp would lock in a poor layout early.
+  - The density update uses optimality criteria (move limit 0.2) under the volume constraint, which is
+    measured on the projected densities.
+  - It stops when compliance improves by less than 0.1% for 3 iterations at the final β, or at
+    `--iters` (150).
+- **Projection or not:** with projection the result is crisp (0% grey on the bracket against 24%
+  without) and stiffer for the same material (compliance 8.96 against 10.36 N·mm). Thresholding at
+  0.5 then matches `--volfrac` closely. The cost is about 1.7× the iterations. Because each voxel is now
+  fully in or out, the threshold surface follows the voxel staircase; a finer `--voxel` gives a smoother
+  part. `--no-projection` gives the faster, softer-edged grey result.
 - **Speed:** the solver is matrix-free conjugate gradient with a Jacobi preconditioner, multithreaded and
   warm-started. The default voxel keeps the bounds at about 40k elements. On 12 cores, the bracket
-  (34k domain elements) takes about 2 s per iteration and converges in about 30 iterations, under a
-  minute. Time grows quickly with resolution: halving the voxel is 8× the elements and more solver
-  iterations.
+  (34k domain elements) takes about 1–2 s per iteration: 49 iterations and 77 s with projection, 29
+  iterations and 52 s without. Time grows quickly with resolution: halving the voxel is 8× the elements
+  and more solver iterations.
 - **Shortcuts in this first version:**
   - No multigrid, so fine grids are slow.
-  - No Heaviside projection, so about 20–25% of the design stays grey (between 0.1 and 0.9).
-    Thresholding at 0.5 gives a clean part, but its volume differs a little from `--volfrac`.
   - One load case.
   - No symmetry or overhang (printability) constraints.
 
