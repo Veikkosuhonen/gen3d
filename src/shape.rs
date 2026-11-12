@@ -211,6 +211,9 @@ impl Shape {
     }
 
     fn compile_with(&self, body: &str, harness: &str, decl: &str, defines: &[(String, f64)]) -> Result<Compiled> {
+        if prims::find_fn(body, "map")?.is_none() {
+            bail!("{}: no `fn map(p: vec3f) -> f32` found", display_path(&self.path));
+        }
         let source = format!("{body}\n{decl}{harness}");
         let module = self.parse(&source)?;
         let mut validator =
@@ -707,9 +710,12 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
 
     // the editor's primitives: rename the script's map (and the optimization fields the primitives'
     // roles add to) and append the generated code that combines them
+    // a file without code (a new, empty shape) is an editor shape even before it has primitives
     let sidecar = prims::sidecar(&path);
-    if sidecar.exists() {
-        shape.prims = prims::load(&sidecar)?;
+    if sidecar.exists() || !has_code(&read_file(&path)?) {
+        if sidecar.exists() {
+            shape.prims = prims::load(&sidecar)?;
+        }
         shape.editor = true;
         shape.update_bounds();
         let (fixed, load, keep) = prims::role_fields(&shape.prims);
@@ -757,8 +763,32 @@ fn map(p: vec3f) -> f32 {
 }
 ";
 
-/// Write a new shape from the template. `name` is a file name (`.wgsl` added if missing) in `dir`.
+/// Whether a shape file has any WGSL besides comments, `//!` directives and `#include` lines.
+fn has_code(text: &str) -> bool {
+    let mut rest = text.to_string();
+    while let Some(a) = rest.find("/*") {
+        let b = rest[a..].find("*/").map_or(rest.len(), |b| a + b + 2);
+        rest.replace_range(a..b, " ");
+    }
+    rest.lines().any(|l| {
+        let code = l.split("//").next().unwrap_or("").trim();
+        !code.is_empty() && !code.starts_with("#include")
+    })
+}
+
+/// Write a new, empty shape (built from primitives in the app). `name` is a file name (`.wgsl`
+/// added if missing) in `dir`.
+pub fn create_empty(dir: &Path, name: &str) -> Result<PathBuf> {
+    create(dir, name, "")
+}
+
+/// Write a new shape from the template (a script to edit). `name` is a file name (`.wgsl` added
+/// if missing) in `dir`.
 pub fn create_from_template(dir: &Path, name: &str) -> Result<PathBuf> {
+    create(dir, name, TEMPLATE)
+}
+
+fn create(dir: &Path, name: &str, text: &str) -> Result<PathBuf> {
     let name = name.trim();
     if name.is_empty() || name.contains(['/', '\\']) {
         bail!("give the new shape a file name (no folders)");
@@ -772,7 +802,7 @@ pub fn create_from_template(dir: &Path, name: &str) -> Result<PathBuf> {
     }
     std::fs::create_dir_all(dir)?;
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    std::fs::write(&path, TEMPLATE.replace("{name}", &stem))?;
+    std::fs::write(&path, text.replace("{name}", &stem))?;
     Ok(path)
 }
 
@@ -870,6 +900,22 @@ mod tests {
         let ps = s.params().unwrap();
         assert_eq!(param_data(&c.live, &ps, &s.defines), [[2.0, 0.5, 0.0, 0.0]]);
         assert!(s.compile(&h).unwrap().live.is_empty());
+        // an empty file is an (empty) editor shape; code without a map is still an error
+        for empty in ["", "// my part\n//! voxel 0.5\n#include <sdf.wgsl>\n/* later */\n"] {
+            std::fs::write(&p, empty).unwrap();
+            let s = load_shape(&p, &[]).unwrap();
+            assert!(s.editor && !s.script_map && s.prims.is_empty(), "{empty:?}");
+            s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
+            s.compile_preview(&crate::viewer::preview_harness(&[], true)).unwrap();
+        }
+        assert!(!has_code("// x\n  \n/* a\nb */\n#include <sdf.wgsl>\n") && has_code("const A = 1.0;"));
+        std::fs::write(&p, "fn helper(p: vec3f) -> f32 { return 0.0; }\n").unwrap();
+        let err = load_shape(&p, &[])
+            .unwrap()
+            .compile(&crate::mesher::compute_harness("map", 1))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no `fn map"), "{err}");
         // an f32 parameter in another override's initializer must stay constant: all overrides
         std::fs::write(
             &p,

@@ -144,8 +144,11 @@ the three steps; the sidebar shows the current step's controls, and the viewport
 camera presets, section view, bounds box, clipping and render resolution.
 
 - **Open** (`Ctrl+O`, and at startup without a file): browse folders for `.wgsl` shapes and `.vti`
-  grids, newest first, with shortcuts to the project, `shapes/` and `out/`. **New shape** writes the
-  template into the folder, opens it and starts your editor.
+  grids, newest first, with shortcuts to the project, `shapes/` and `out/`. **New shape** writes an
+  empty `.wgsl` into the folder and opens it: build it from primitives in Design, or click **Edit** to
+  script it. A file with no code (only comments, `//!` directives, includes) is a shape made of its
+  primitives; a file with code still needs `fn map`. `gen3d new NAME` (CLI) still writes the scripted
+  template.
 - **Edit** opens the shape in `$GEN3D_EDITOR` (a command, e.g. `code` or `kitty nvim`) or else the
   desktop's default app. The preview reloads whenever the file or an include is saved; errors show in a
   panel under the view, and the last version that compiled stays on screen.
