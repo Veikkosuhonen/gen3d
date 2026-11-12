@@ -182,6 +182,9 @@ fn g3d_fs(@builtin(position) frag: vec4f) -> @location(0) vec4f {
         col = mix(col, g * (0.45 + 0.55 * sh), fade);
     }
 
+    // the selected editor primitive where it isn't the visible surface (no-op otherwise)
+    col = g3d_overlay(ro, rd, select(1e9, t, hit), col, scale);
+
     if (g3d_v.flags.z == 1u) {
         let bh = g3d_boxHit(ro, rd, bmin, bmax);
         if (bh.x < bh.y && bh.y > 0.0) {
@@ -227,7 +230,7 @@ pub fn field_color(i: usize) -> [f32; 3] {
 pub fn preview_harness(fields: &[Field], editor: bool) -> String {
     let mut f = String::from("\nfn g3d_field_tint(p: vec3f, ps: vec3f, scale: f32) -> vec4f {\n");
     if editor {
-        f += "    if (g3d_ed_selected(ps) < scale * 0.003) {\n        \
+        f += "    if (abs(g3d_ed_selected(ps)) < scale * 0.003) {\n        \
               let band = step(0.5, fract(dot(ps, vec3f(1.0)) / (scale * 0.02)));\n        \
               return vec4f(mix(vec3f(0.20, 0.65, 1.0), vec3f(0.45, 0.80, 1.0), band), 0.7);\n    }\n";
     }

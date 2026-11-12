@@ -27,7 +27,7 @@ use winit::window::{Window, WindowId};
 use crate::browser::{Browser, Pick, ago};
 use crate::gpu::Gpu;
 use crate::jobs::{Job, Slot, mesh_report, opt_progress};
-use crate::prims::{self, Kind, Prim};
+use crate::prims::{self, Kind, Op, Prim};
 use crate::shape::{Field, Param, ParamKind, Shape};
 use crate::slicer;
 use crate::viewer::{
@@ -1374,19 +1374,25 @@ impl App {
             .unwrap_or_default();
         if prims.is_empty() {
             ui.weak(format!(
-                "Added to the script's map() (union) and saved to {file}. Click one in the view to \
-                 select it; drag its arrows to move it."
+                "Combined with the script's map() in list order: added, subtracted or intersected. \
+                 Saved to {file}. Click one in the view to select it; drag its arrows to move it."
             ));
         } else {
-            ui.weak(format!("unioned with map(); saved to {file}"));
+            ui.weak(format!("applied to map() top to bottom; saved to {file}"));
         }
+        let mut new_step = false;
         for (i, p) in prims.iter_mut().enumerate() {
             ui.horizontal(|ui| {
                 let mut shown = !p.hidden;
                 if ui.checkbox(&mut shown, "").on_hover_text("show / hide").changed() {
                     p.hidden = !shown;
                 }
-                let text = egui::RichText::new(format!("{}  ·  {}", p.name, p.kind.name()));
+                let sign = match p.op {
+                    Op::Union => "+",
+                    Op::Subtract => "-",
+                    Op::Intersect => "&",
+                };
+                let text = egui::RichText::new(format!("{sign}  {}  ·  {}", p.name, p.kind.name()));
                 let text = if p.hidden { text.weak() } else { text };
                 if ui.selectable_label(sel == Some(i), text).clicked() {
                     sel = if sel == Some(i) { None } else { Some(i) };
@@ -1399,6 +1405,17 @@ impl App {
             egui::Grid::new("prim").num_columns(2).show(ui, |ui| {
                 ui.label("name");
                 ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(180.0));
+                ui.end_row();
+                ui.label("operation")
+                    .on_hover_text("how it combines with everything above it in the list (and the script)");
+                ui.horizontal(|ui| {
+                    for op in Op::ALL {
+                        if ui.selectable_label(p.op == op, op.name()).clicked() && p.op != op {
+                            p.op = op;
+                            new_step = true;
+                        }
+                    }
+                });
                 ui.end_row();
                 ui.label("kind");
                 let mut kind = p.kind;
@@ -1443,7 +1460,7 @@ impl App {
                     ui.end_row();
                 }
                 ui.label("blend")
-                    .on_hover_text("smooth union with the shape so far (0 = sharp)");
+                    .on_hover_text("smoothing radius of the operation with the shape so far (0 = sharp)");
                 ui.add(
                     egui::DragValue::new(&mut p.blend)
                         .speed(0.05)
@@ -1453,6 +1470,7 @@ impl App {
                 );
                 ui.end_row();
             });
+            let mut moved = None;
             ui.horizontal(|ui| {
                 if ui.button("Duplicate").on_hover_text("Ctrl+D").clicked() {
                     action = Some((true, i));
@@ -1460,7 +1478,31 @@ impl App {
                 if ui.button("Delete").on_hover_text("Del").clicked() {
                     action = Some((false, i));
                 }
+                ui.separator();
+                let n = prims.len();
+                if ui
+                    .add_enabled(i > 0, egui::Button::new("Up"))
+                    .on_hover_text("apply it earlier")
+                    .clicked()
+                {
+                    moved = Some(i - 1);
+                }
+                if ui
+                    .add_enabled(i + 1 < n, egui::Button::new("Down"))
+                    .on_hover_text("apply it later")
+                    .clicked()
+                {
+                    moved = Some(i + 1);
+                }
             });
+            if let Some(j) = moved {
+                prims.swap(i, j);
+                sel = Some(j);
+                new_step = true;
+            }
+        }
+        if new_step {
+            self.edit.last_edit = None; // its own undo step
         }
         ui.horizontal(|ui| {
             if ui
@@ -3305,6 +3347,19 @@ mod tests {
         );
         assert_eq!(prims::load(&sidecar).unwrap()[0].pos, p.pos, "saved");
         assert_eq!(app.design_shape.as_ref().unwrap().prims[0].pos, p.pos);
+
+        // switching to subtract is a value change: saved, no pipeline build, no bounds growth
+        let rebuilds = app.rebuilds;
+        let mut ps = app.prims();
+        ps[0].op = Op::Subtract;
+        app.edit.last_edit = None; // as the sidebar does: its own undo step
+        app.set_prims(ps);
+        frame(&mut app, vec![]);
+        assert_eq!(app.rebuilds, rebuilds);
+        assert_eq!(prims::load(&sidecar).unwrap()[0].op, Op::Subtract);
+        assert_eq!(app.shape.bounds, app.shape.base_bounds);
+        app.undo(false);
+        assert_eq!(app.prims()[0].op, Op::Union);
 
         // the whole drag is one undo step
         app.undo(false);

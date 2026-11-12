@@ -3,6 +3,40 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: Subtract and intersect for editor primitives
+
+**What:** every primitive has an **operation**: add (union), subtract or intersect, each smoothed by its
+blend radius. They apply top to bottom: the script first, then each primitive with everything above it.
+The sidebar has an operation selector, the list shows `+` / `-` / `&`, and **Up** / **Down** reorder
+(order matters now). Existing `.prims.json` files load as before (`op` defaults to add).
+
+**Design decisions**
+- **The operation is data, not code:** its code goes in the spare 4th slot of the primitive's third vec4
+  (`dims, op`), and the generated `map` calls `g3d_ed_combine(d, e, blend, op)`, which branches on it.
+  The branch is uniform (same for every pixel) in the preview, and folded away in the baked-in `const`
+  form for meshing/export. So switching add ↔ subtract is a buffer write like moving. Reordering
+  primitives of the same kind is too; reordering different kinds regenerates the source.
+- **Smooth formulas** are the same polynomial smin/smax as `sdf.wgsl`'s `opSmooth*`. A Rust copy
+  (`Op::apply`, test-only) is the reference.
+- **Ghost of the selected primitive:** a subtracting primitive is invisible apart from its hole. The
+  preview now sphere-traces the selected primitive alone (only while one is selected) and blends a
+  translucent blue ghost wherever it is nearer than the visible surface. That is the cutter in empty
+  space, or a primitive buried in the script. It's a `g3d_overlay` hook in `g3d_fs`; every compile
+  defines a no-op unless it's a preview with editor primitives (so .vti previews are untouched). The
+  surface tint now uses `abs(distance)` so it also marks faces a cutter carved.
+- **Bounds** grow only for added primitives.
+- Sidebar operation changes and reorders start a new undo step (not merged with a preceding drag).
+
+**Verified:** `cargo test` (22 pass). New GPU test: add box, smooth-subtract sphere, rotated intersect
+cylinder, smooth-add torus, sampled on the GPU = the CPU fold within 1e-3, and the carved centre is
+outside. The app test now also switches a primitive to subtract: no pipeline build, saved, bounds back
+to the file's own, undo restores it. Visually: a smooth-subtracted cylinder makes a clean through-hole in
+a tab, with the ghost when selected, and a subtracted sphere makes a dimple in the knob top. The
+exported STL is watertight. clippy clean.
+
+**Open:** rotation handles in the viewport; GPU picking so script geometry occludes; mirror/pattern
+helpers; drag-to-reorder in the list.
+
 ## 2026-11-12: Live f32 parameters; ints and bools are the compiled ones
 
 **What:** parameter sliders used to rebuild the pipeline on every change (overrides are applied at

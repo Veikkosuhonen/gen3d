@@ -1,5 +1,6 @@
 //! Primitives placed in the Design step's editor. They live in a sidecar file next to the shape
-//! (`knob.wgsl` → `knob.prims.json`) and are unioned with the script's `map()`: `load_shape` renames
+//! (`knob.wgsl` → `knob.prims.json`) and are combined with the script's `map()` in list order, each
+//! by its [`Op`] (union, subtract or intersect, optionally smooth): `load_shape` renames
 //! the script's `fn map` to `g3d_script_map` and appends a generated `map` (see [`wgsl`]), so every
 //! consumer (preview, mesher, optimizer, VTI export, the CLI) sees the combined shape.
 //!
@@ -78,10 +79,66 @@ impl Kind {
     }
 }
 
+/// How a primitive combines with everything before it (the script, then earlier primitives).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Op {
+    #[default]
+    Union,
+    Subtract,
+    Intersect,
+}
+
+impl Op {
+    pub const ALL: [Op; 3] = [Op::Union, Op::Subtract, Op::Intersect];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Op::Union => "add",
+            Op::Subtract => "subtract",
+            Op::Intersect => "intersect",
+        }
+    }
+
+    /// The value `g3d_ed_combine` branches on.
+    fn code(self) -> f32 {
+        match self {
+            Op::Union => 0.0,
+            Op::Subtract => 1.0,
+            Op::Intersect => 2.0,
+        }
+    }
+
+    /// `a` combined with `b` with smoothing radius `k`, as `g3d_ed_combine` does (the tests' reference).
+    #[cfg(test)]
+    pub fn apply(self, a: f32, b: f32, k: f32) -> f32 {
+        let mix = |x: f32, y: f32, h: f32| x + (y - x) * h;
+        match self {
+            Op::Union if k <= 0.0 => a.min(b),
+            Op::Union => {
+                let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
+                mix(b, a, h) - k * h * (1.0 - h)
+            }
+            Op::Subtract if k <= 0.0 => a.max(-b),
+            Op::Subtract => {
+                let h = (0.5 - 0.5 * (a + b) / k).clamp(0.0, 1.0);
+                mix(a, -b, h) + k * h * (1.0 - h)
+            }
+            Op::Intersect if k <= 0.0 => a.max(b),
+            Op::Intersect => {
+                let h = (0.5 - 0.5 * (b - a) / k).clamp(0.0, 1.0);
+                mix(b, a, h) + k * h * (1.0 - h)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prim {
     pub kind: Kind,
+    /// How it combines with what comes before it.
+    pub op: Op,
     pub name: String,
     /// Centre, mm.
     pub pos: [f32; 3],
@@ -91,7 +148,7 @@ pub struct Prim {
     pub dims: [f32; 3],
     /// Edge rounding radius (boxes and cylinders).
     pub round: f32,
-    /// Smooth-union radius with everything before it (0 = sharp).
+    /// Smoothing radius of the operation with everything before it (0 = sharp).
     pub blend: f32,
     pub hidden: bool,
 }
@@ -274,10 +331,11 @@ impl Prim {
     }
 }
 
-/// Grow `bounds` to contain the visible primitives (plus `margin`).
+/// Grow `bounds` to contain the visible added primitives (plus `margin`); subtracting and
+/// intersecting ones never add material.
 pub fn grow_bounds(bounds: Option<(V3, V3)>, prims: &[Prim], margin: f32) -> Option<(V3, V3)> {
     let mut out = bounds;
-    for p in prims.iter().filter(|p| !p.hidden) {
+    for p in prims.iter().filter(|p| !p.hidden && p.op == Op::Union) {
         let (lo, hi) = p.aabb();
         let lo = lo.map(|c| c - margin);
         let hi = hi.map(|c| c + margin);
@@ -370,12 +428,55 @@ fn g3d_ed_cone(p: vec3f, d: vec3f, r: f32) -> f32 {
     let s = select(1.0, -1.0, cb.x < 0.0 && ca.y < 0.0);
     return s * sqrt(min(dot(ca, ca), dot(cb, cb)));
 }
-fn g3d_ed_union(a: f32, b: f32, k: f32) -> f32 {
+// a combined with b: op 0 = union, 1 = subtract (a minus b), 2 = intersect; k = smoothing radius
+fn g3d_ed_combine(a: f32, b: f32, k: f32, op: f32) -> f32 {
+    if (op > 1.5) {
+        if (k <= 0.0) { return max(a, b); }
+        let h = clamp(0.5 - 0.5 * (b - a) / k, 0.0, 1.0);
+        return mix(b, a, h) + k * h * (1.0 - h);
+    }
+    if (op > 0.5) {
+        if (k <= 0.0) { return max(a, -b); }
+        let h = clamp(0.5 - 0.5 * (a + b) / k, 0.0, 1.0);
+        return mix(a, -b, h) + k * h * (1.0 - h);
+    }
     if (k <= 0.0) { return min(a, b); }
     let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
     return mix(b, a, h) - k * h * (1.0 - h);
 }
 ";
+
+/// Draws the selected primitive as a translucent ghost wherever it isn't part of the visible surface
+/// (a subtracting one, one inside the script's shape, or one past an intersection), so it can be
+/// seen and moved. `t_hit` is the distance to the shown surface (1e9 for none).
+pub const OVERLAY: &str = "
+fn g3d_overlay(ro: vec3f, rd: vec3f, t_hit: f32, col: vec3f, scale: f32) -> vec3f {
+    if (g3d_ed[0].x < 0.0) { return col; }
+    let eps = 1e-4 * scale;
+    var t = 0.0;
+    for (var i = 0; i < 160; i++) {
+        let p = ro + rd * t;
+        let d = g3d_ed_selected(p);
+        if (d < eps * max(1.0, t / scale)) {
+            if (t > t_hit - scale * 0.003) { return col; } // it is the surface there: tinted already
+            let k = vec2f(1.0, -1.0) * eps * 2.0;
+            let n = normalize(k.xyy * g3d_ed_selected(p + k.xyy) + k.yyx * g3d_ed_selected(p + k.yyx) +
+                              k.yxy * g3d_ed_selected(p + k.yxy) + k.xxx * g3d_ed_selected(p + k.xxx));
+            let facing = abs(dot(n, rd));
+            let shade = 0.55 + 0.45 * abs(dot(n, normalize(vec3f(0.6, -0.4, 0.9))));
+            let edge = pow(1.0 - facing, 2.0);
+            return mix(col, vec3f(0.25, 0.65, 1.0) * shade, 0.3 + 0.45 * edge);
+        }
+        t += max(d, eps);
+        if (t > min(t_hit, scale * 20.0)) { break; }
+    }
+    return col;
+}
+";
+
+/// `g3d_overlay` for previews without editor primitives.
+pub const NO_OVERLAY: &str =
+    "fn g3d_overlay(ro: vec3f, rd: vec3f, t_hit: f32, col: vec3f, scale: f32) -> vec3f { return col; }\n";
 
 /// Index of primitive `i`'s first vec4 in `g3d_ed` (element 0 holds the selection).
 fn base(i: usize) -> usize {
@@ -383,7 +484,7 @@ fn base(i: usize) -> usize {
 }
 
 /// The values `wgsl` reads from `g3d_ed`: element 0 = (selected index or -1, 0, 0, 0), then three
-/// vec4s per primitive (hidden ones too, so indices stay put): (pos, blend), (rot, round), (dims, 0).
+/// vec4s per primitive (hidden ones too, so indices stay put): (pos, blend), (rot, round), (dims, op).
 pub fn data(prims: &[Prim], selected: Option<usize>) -> Vec<[f32; 4]> {
     let sel = selected.filter(|&i| prims.get(i).is_some_and(|p| !p.hidden));
     let mut out = vec![[sel.map_or(-1.0, |i| i as f32), 0.0, 0.0, 0.0]];
@@ -391,7 +492,7 @@ pub fn data(prims: &[Prim], selected: Option<usize>) -> Vec<[f32; 4]> {
         let [x, y, z] = p.pos;
         let [rx, ry, rz] = p.rot;
         let [a, b, c] = p.dims;
-        out.extend([[x, y, z, p.blend], [rx, ry, rz, p.round], [a, b, c, 0.0]]);
+        out.extend([[x, y, z, p.blend], [rx, ry, rz, p.round], [a, b, c, p.op.code()]]);
     }
     out
 }
@@ -437,7 +538,12 @@ pub fn wgsl(prims: &[Prim], script_map: bool) -> String {
         "    var d = 1e10;\n"
     };
     for &(i, _) in &visible {
-        let _ = writeln!(s, "    d = g3d_ed_union(d, g3d_e{i}(p), g3d_ed[{}].w);", base(i));
+        let b = base(i);
+        let _ = writeln!(
+            s,
+            "    d = g3d_ed_combine(d, g3d_e{i}(p), g3d_ed[{b}].w, g3d_ed[{}].w);",
+            b + 2
+        );
     }
     s += "    return d;\n}\n";
     s += "fn g3d_ed_selected(p: vec3f) -> f32 {\n    switch (i32(g3d_ed[0].x)) {\n";
@@ -551,7 +657,10 @@ mod tests {
         s.compile(&preview).unwrap();
         let c = s.compile_preview(&preview).unwrap();
         assert!(c.source.contains("var<uniform> g3d_ed"));
-        assert!(c.constants.is_empty() && c.live == ["R"], "R is an f32: live in the preview");
+        assert!(
+            c.constants.is_empty() && c.live == ["R"],
+            "R is an f32: live in the preview"
+        );
 
         // errors in the script still point at the script's lines
         std::fs::write(&p, "fn map(p: vec3f) -> f32 {\n  return oops;\n}\n").unwrap();
@@ -618,6 +727,58 @@ mod tests {
                 }
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Add, smooth subtract, intersect and smooth add in list order, on the GPU, against the CPU fold.
+    #[test]
+    fn ops_match_gpu() {
+        use crate::mesher::{Grid, sample_field};
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("gen3d-ops-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.wgsl");
+        std::fs::write(&p, "//! bounds -12 -12 -12 12 12 12\n").unwrap();
+        let mut prims = vec![
+            Prim::new(Kind::Box, "body".into(), [0.0; 3], 14.0),
+            Prim::new(Kind::Sphere, "hole".into(), [5.0, 0.0, 3.0], 8.0),
+            Prim::new(Kind::Cylinder, "trim".into(), [0.0, 0.0, 0.0], 18.0),
+            Prim::new(Kind::Torus, "ring".into(), [0.0, 0.0, -6.0], 12.0),
+        ];
+        prims[1].op = Op::Subtract;
+        prims[1].blend = 1.5;
+        prims[2].op = Op::Intersect;
+        prims[2].rot = [30.0, 0.0, 0.0];
+        prims[3].blend = 1.0;
+        save(&sidecar(&p), &prims).unwrap();
+        let shape = crate::shape::load_shape(&p, &[]).unwrap();
+        let grid = Grid {
+            vol: vec![],
+            dims: [9, 9, 9],
+            origin: [-12.0; 3],
+            step: 3.0,
+        };
+        let got = sample_field(&shape, &grid, "map", 1, &gpu).unwrap();
+        let mut i = 0;
+        let mut inside = 0;
+        for x in 0..9 {
+            for y in 0..9 {
+                for z in 0..9 {
+                    let q = [x, y, z].map(|c| -12.0 + 3.0 * c as f32);
+                    let want = prims.iter().fold(1e10, |d, p| p.op.apply(d, p.sdf(q), p.blend));
+                    assert!((want - got[i]).abs() < 1e-3, "{q:?}: cpu {want} gpu {}", got[i]);
+                    inside += (want < 0.0) as usize;
+                    i += 1;
+                }
+            }
+        }
+        assert!(inside > 20, "the test shape isn't empty");
+        // the subtracted sphere's centre is carved out, outside the intersection is empty
+        let at = |q: V3| prims.iter().fold(1e10, |d, p| p.op.apply(d, p.sdf(q), p.blend));
+        assert!(at([5.0, 0.0, 3.0]) > 0.0 && at([-4.0, -4.0, -4.0]) < 0.0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -122,6 +122,7 @@ impl Shape {
             false => String::new(),
         };
         decl += NO_LIVE_PARAMS;
+        decl += prims::NO_OVERLAY;
         self.compile_with(&self.source, harness, &decl, &self.defines)
     }
 
@@ -137,8 +138,8 @@ impl Shape {
     /// override's initializer), every parameter stays an `override`.
     pub fn compile_preview(&self, harness: &str) -> Result<Compiled> {
         let ed = match self.editor {
-            true => prims::decl_uniform(1 + 3 * self.prims.len()),
-            false => String::new(),
+            true => prims::decl_uniform(1 + 3 * self.prims.len()) + prims::OVERLAY,
+            false => prims::NO_OVERLAY.to_string(),
         };
         if let Some((source, live)) = self.live_source() {
             let defines: Vec<_> = self
