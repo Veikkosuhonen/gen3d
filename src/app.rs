@@ -1,7 +1,8 @@
 //! The gen3d app: one window that takes a shape from design to G-code in three steps.
 //!
 //! 1. **Design**: open (or create) a .wgsl shape, edit it in your editor (the preview reloads on
-//!    save), tune its parameters with sliders.
+//!    save), tune its parameters with sliders, and add primitives (spheres, boxes, ...) that are
+//!    unioned with the script (`prims.rs`).
 //! 2. **Optimize** (optional): topology optimization of the shape as a design domain. The result
 //!    grows live in the same viewport; pick its threshold.
 //! 3. **Print**: mesh the design or the optimized result, pick a printer profile, slice to G-code
@@ -26,6 +27,7 @@ use winit::window::{Window, WindowId};
 use crate::browser::{Browser, Pick, ago};
 use crate::gpu::Gpu;
 use crate::jobs::{Job, Slot, mesh_report, opt_progress};
+use crate::prims::{self, Kind, Prim};
 use crate::shape::{Field, Param, ParamKind, Shape};
 use crate::slicer;
 use crate::viewer::{
@@ -40,6 +42,14 @@ const KEYS: &[(&str, &str)] = &[
     ("right/middle-drag", "pan"),
     ("wheel", "zoom"),
     ("double-click", "reset camera"),
+    ("click", "select a primitive"),
+    (
+        "drag arrows",
+        "move it along X/Y/Z (centre: in the view plane; Ctrl snaps to 1 mm)",
+    ),
+    ("Del  Esc", "delete / deselect the primitive"),
+    ("Ctrl+D", "duplicate the primitive"),
+    ("Ctrl+Z  Ctrl+Shift+Z", "undo / redo primitive edits"),
     ("1 2 3 4", "front / side / top / iso"),
     ("R", "reset camera"),
     ("C", "section view"),
@@ -67,6 +77,76 @@ enum Step {
     Design,
     Optimize,
     Print,
+}
+
+/// The primitive editor of the Design step.
+#[derive(Default)]
+struct EditUi {
+    sel: Option<usize>,
+    undo: Vec<Vec<Prim>>,
+    redo: Vec<Vec<Prim>>,
+    /// Edits within a short time of each other (a slider or gizmo drag) are one undo step.
+    last_edit: Option<Instant>,
+    drag: Option<GizmoDrag>,
+}
+
+/// A gizmo handle being dragged.
+struct GizmoDrag {
+    /// 0..3: along X/Y/Z; 3: in the view plane
+    handle: usize,
+    start: [f32; 3],
+    /// pointer movement since the drag started, in points
+    moved: egui::Vec2,
+}
+
+/// Screen-space layout of the gizmo of the selected primitive.
+struct Gizmo {
+    centre: egui::Pos2,
+    /// tips of the X, Y, Z arrows
+    tips: [egui::Pos2; 3],
+    /// world length of an arrow
+    len: f32,
+    /// world units per point in the view plane at the primitive's depth
+    per_point: f32,
+}
+
+const AXIS_COLORS: [egui::Color32; 3] = [
+    egui::Color32::from_rgb(230, 80, 80),
+    egui::Color32::from_rgb(90, 200, 100),
+    egui::Color32::from_rgb(90, 140, 255),
+];
+
+/// A "nice" size near `v` (1, 2 or 5 times a power of ten).
+fn nice(v: f32) -> f32 {
+    let e = 10f32.powf(v.max(1e-3).log10().floor());
+    let m = v / e;
+    e * if m < 1.5 {
+        1.0
+    } else if m < 3.5 {
+        2.0
+    } else if m < 7.5 {
+        5.0
+    } else {
+        10.0
+    }
+}
+
+/// Three drag values side by side; true if any changed.
+fn drag3(ui: &mut egui::Ui, v: &mut [f32; 3], speed: f64, suffix: &str) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        for (k, c) in v.iter_mut().enumerate() {
+            let r = ui.add(
+                egui::DragValue::new(c)
+                    .speed(speed)
+                    .max_decimals(2)
+                    .suffix(suffix)
+                    .prefix(["x ", "y ", "z "][k]),
+            );
+            changed |= r.changed();
+        }
+    });
+    changed
 }
 
 /// Settings of the Optimize step (`gen3d optimize` flags).
@@ -238,6 +318,7 @@ struct App {
     design_shape: Option<Shape>,
     design_fields: Vec<Field>,
     params: Vec<Param>,
+    edit: EditUi,
     opt: OptUi,
     print: PrintUi,
     slicer: Option<(slicer::Kind, PathBuf)>,
@@ -267,6 +348,8 @@ struct App {
     render_scale: f32,
     /// Viewport size wanted by this frame's layout, in physical pixels.
     view_px: (u32, u32),
+    /// Where the viewport is, in points.
+    view_rect: egui::Rect,
     /// `gen3d optimize` runs
     opt_job: Slot,
     /// export / slice / open runs
@@ -537,6 +620,7 @@ impl App {
             design_shape: None,
             design_fields: vec![],
             params: vec![],
+            edit: EditUi::default(),
             opt: OptUi::default(),
             print: PrintUi::default(),
             slicer: slicer::find_slicer(None),
@@ -571,6 +655,7 @@ impl App {
             },
             render_scale: 1.0,
             view_px: (1, 1),
+            view_rect: egui::Rect::NOTHING,
             opt_job: Slot::default(),
             out_job: Slot::default(),
             gcode_cache: HashMap::new(),
@@ -607,6 +692,7 @@ impl App {
         self.design_shape = None;
         self.design_fields.clear();
         self.params.clear();
+        self.edit = EditUi::default();
         self.fields.clear();
         self.field_mode = 0;
         self.loaded = false;
@@ -765,14 +851,18 @@ impl App {
                 self.notice = Some(msg);
             }
             src.shape.defines = self.defines.clone();
+            if self.edit.sel.is_some_and(|i| i >= src.shape.prims.len()) {
+                self.edit.sel = None;
+            }
         }
+        let constants = src.shape.preview_constants(self.edit.sel);
         let Some(win) = &mut self.win else { return };
         let vol = match src.volume.as_ref().map(|v| VolGpu::new(&win.gpu, v)).transpose() {
             Ok(v) => v,
             Err(e) => return self.fail(&format!("{e:#}")),
         };
         let built = preview_module(&win.gpu, &src).and_then(|m| {
-            let p = build_pipeline(&win.gpu, &m, &src.shape.defines, VIEW_FORMAT, &win.ubuf, vol.as_ref())?;
+            let p = build_pipeline(&win.gpu, &m, &constants, VIEW_FORMAT, &win.ubuf, vol.as_ref())?;
             Ok((m, p))
         });
         match built {
@@ -789,8 +879,10 @@ impl App {
             shape, fields, volume, ..
         } = src;
         // the camera stays put when switching between the design and its result, and when an
-        // optimizer rewrites the result; it reframes when a file's own bounds change
-        let reframe = first || (self.loaded && self.shape.path == shape.path && self.shape.bounds != shape.bounds);
+        // optimizer rewrites the result; it reframes when a file's own bounds change (not when
+        // primitives grow them)
+        let reframe =
+            first || (self.loaded && self.shape.path == shape.path && self.shape.base_bounds != shape.base_bounds);
         if !grid {
             self.params = params;
             self.design_shape = Some(shape.clone());
@@ -865,9 +957,10 @@ impl App {
             self.defines.clone(),
             self.rebuild_gen,
         );
+        let constants = self.shape.preview_constants(self.edit.sel);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = build_pipeline(&gpu, &module, &defines, VIEW_FORMAT, &ubuf, None);
+            let result = build_pipeline(&gpu, &module, &constants, VIEW_FORMAT, &ubuf, None);
             let _ = tx.send((generation, defines, result));
         });
         self.rebuild = Some(rx);
@@ -902,6 +995,438 @@ impl App {
         }
         if std::mem::take(&mut self.rebuild_again) {
             self.request_rebuild();
+        }
+    }
+
+    // ------------------------------------------------------------------------- primitive editor
+
+    /// Whether the viewport shows the .wgsl design, so its primitives can be edited.
+    fn can_edit(&self) -> bool {
+        self.step == Step::Design
+            && self.loaded
+            && self.volume.is_none()
+            && self.design_shape.is_some()
+            && Some(&self.shown) == self.design.as_ref()
+    }
+
+    fn prims(&self) -> Vec<Prim> {
+        match &self.design_shape {
+            Some(s) if s.editor => s.prims.clone(),
+            _ => vec![],
+        }
+    }
+
+    fn select(&mut self, sel: Option<usize>) {
+        if sel != self.edit.sel {
+            self.edit.sel = sel;
+            self.params_dirty = true; // the highlight is an override constant
+        }
+    }
+
+    /// Make `new` the primitives, as one undo step (or part of the current one, while a drag goes on).
+    fn set_prims(&mut self, new: Vec<Prim>) {
+        let old = self.prims();
+        if new == old {
+            return;
+        }
+        let structural = new.len() != old.len();
+        let recent = self
+            .edit
+            .last_edit
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(750));
+        if structural || !recent {
+            self.edit.undo.push(old);
+            self.edit.redo.clear();
+        }
+        self.edit.last_edit = (!structural).then(Instant::now);
+        self.apply_prims(new);
+    }
+
+    /// Save `new` to the sidecar and show it: by changing override constants when only numbers
+    /// changed, else by regenerating the source.
+    fn apply_prims(&mut self, new: Vec<Prim>) {
+        let Some(shape) = &self.design_shape else { return };
+        let path = shape.prims_path();
+        let old = if shape.editor { shape.prims.clone() } else { vec![] };
+        let structural = !shape.editor
+            || new.len() != old.len()
+            || new
+                .iter()
+                .zip(&old)
+                .any(|(a, b)| a.kind != b.kind || a.hidden != b.hidden);
+        if let Err(e) = prims::save(&path, &new) {
+            self.notice = Some(format!("{e:#}"));
+            return;
+        }
+        // our own write: don't hot-reload for it
+        self.mtimes.insert(path.clone(), mtime(&path));
+        if self.edit.sel.is_some_and(|i| i >= new.len()) {
+            self.edit.sel = None;
+        }
+        if structural {
+            self.reload(false);
+        } else {
+            self.shape.set_prims(new.clone());
+            if let Some(s) = &mut self.design_shape {
+                s.set_prims(new);
+            }
+            self.params_dirty = true;
+        }
+    }
+
+    fn undo(&mut self, redo: bool) {
+        let current = self.prims();
+        let (from, to) = if redo {
+            (&mut self.edit.redo, &mut self.edit.undo)
+        } else {
+            (&mut self.edit.undo, &mut self.edit.redo)
+        };
+        let Some(prev) = from.pop() else { return };
+        to.push(current);
+        self.edit.last_edit = None;
+        self.apply_prims(prev);
+    }
+
+    /// Add a primitive at the centre of the view, sized to the shape.
+    fn add_prim(&mut self, kind: Kind) {
+        let mut prims = self.prims();
+        let size = nice(self.shape.size().iter().cloned().fold(0.0, f32::max) / 4.0);
+        let pos = self.cam.target.map(|c| (c * 2.0).round() / 2.0);
+        let n = prims.iter().filter(|p| p.kind == kind).count() + 1;
+        prims.push(Prim::new(kind, format!("{} {n}", kind.name()), pos, size));
+        let i = prims.len() - 1;
+        self.set_prims(prims);
+        self.select(Some(i));
+    }
+
+    fn duplicate_prim(&mut self, i: usize) {
+        let mut prims = self.prims();
+        let Some(p) = prims.get(i).cloned() else { return };
+        let mut copy = p.clone();
+        copy.name = format!("{} copy", p.name);
+        copy.pos[0] += nice(p.bound_radius());
+        prims.insert(i + 1, copy);
+        self.set_prims(prims);
+        self.select(Some(i + 1));
+    }
+
+    fn delete_prim(&mut self, i: usize) {
+        let mut prims = self.prims();
+        if i >= prims.len() {
+            return;
+        }
+        prims.remove(i);
+        self.edit.sel = None;
+        self.set_prims(prims);
+        self.params_dirty = true;
+    }
+
+    /// Editor shortcuts (only while no text field has focus).
+    fn edit_keys(&mut self, ui: &mut egui::Ui) {
+        if !self.can_edit() || ui.ctx().egui_wants_keyboard_input() {
+            return;
+        }
+        let key = |ui: &mut egui::Ui, m: egui::Modifiers, k: egui::Key| ui.input_mut(|i| i.consume_key(m, k));
+        let shift_cmd = egui::Modifiers::COMMAND | egui::Modifiers::SHIFT;
+        if key(ui, shift_cmd, egui::Key::Z) || key(ui, egui::Modifiers::COMMAND, egui::Key::Y) {
+            self.undo(true);
+        } else if key(ui, egui::Modifiers::COMMAND, egui::Key::Z) {
+            self.undo(false);
+        }
+        if let Some(i) = self.edit.sel {
+            if key(ui, egui::Modifiers::NONE, egui::Key::Delete) {
+                self.delete_prim(i);
+            } else if key(ui, egui::Modifiers::COMMAND, egui::Key::D) {
+                self.duplicate_prim(i);
+            } else if key(ui, egui::Modifiers::NONE, egui::Key::Escape) {
+                self.select(None);
+            }
+        }
+    }
+
+    /// Where the gizmo of the selected primitive is on screen (None if it isn't in front of the camera).
+    fn gizmo(&self, rect: egui::Rect) -> Option<Gizmo> {
+        let p = self.prims().get(self.edit.sel?).filter(|p| !p.hidden)?.pos;
+        let eye = self.cam.eye();
+        let (fw, rt, up) = self.cam.basis();
+        let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+        let h = rect.height();
+        let project = |q: [f32; 3]| {
+            let v = [0, 1, 2].map(|k| q[k] - eye[k]);
+            let z = dot(v, fw);
+            (z > 1e-3).then(|| rect.center() + egui::vec2(dot(v, rt), -dot(v, up)) * (1.8 * h / z))
+        };
+        let depth = dot([0, 1, 2].map(|k| p[k] - eye[k]), fw);
+        let centre = project(p)?;
+        let len = depth * 0.07;
+        let tips = [0, 1, 2].map(|k| {
+            let mut q = p;
+            q[k] += len;
+            project(q)
+        });
+        Some(Gizmo {
+            centre,
+            tips: [tips[0]?, tips[1]?, tips[2]?],
+            len,
+            per_point: depth / (1.8 * h),
+        })
+    }
+
+    /// The gizmo handle under `pos`: 0..3 the arrow tips, 3 the centre.
+    fn gizmo_handle(g: &Gizmo, pos: egui::Pos2) -> Option<usize> {
+        (0..3)
+            .find(|&k| g.tips[k].distance(pos) < 10.0)
+            .or((g.centre.distance(pos) < 9.0).then_some(3))
+    }
+
+    /// Selection, the gizmo and its dragging. Returns true while a handle is being dragged (the
+    /// camera then stays put).
+    fn edit_viewport(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect) -> bool {
+        if !self.can_edit() {
+            self.edit.drag = None;
+            return false;
+        }
+        let gizmo = self.gizmo(rect);
+        if resp.drag_started_by(egui::PointerButton::Primary)
+            && let (Some(g), Some(origin)) = (&gizmo, ui.input(|i| i.pointer.press_origin()))
+            && let Some(handle) = Self::gizmo_handle(g, origin)
+            && let Some(p) = self.prims().get(self.edit.sel.unwrap_or(usize::MAX))
+        {
+            self.edit.drag = Some(GizmoDrag {
+                handle,
+                start: p.pos,
+                moved: egui::Vec2::ZERO,
+            });
+            self.edit.last_edit = None; // a new undo step
+        }
+        let mut dragging = false;
+        if let (Some(drag), Some(g), Some(i)) = (&mut self.edit.drag, &gizmo, self.edit.sel) {
+            if resp.dragged_by(egui::PointerButton::Primary) {
+                dragging = true;
+                drag.moved += resp.drag_delta();
+                let snap = ui.input(|i| i.modifiers.command);
+                let mut pos = drag.start;
+                if drag.handle < 3 {
+                    let k = drag.handle;
+                    let u = g.tips[k] - g.centre;
+                    if u.length_sq() > 1.0 {
+                        pos[k] += drag.moved.dot(u) / u.length_sq() * g.len;
+                    }
+                } else {
+                    let (_, rt, up) = self.cam.basis();
+                    for k in 0..3 {
+                        pos[k] += (rt[k] * drag.moved.x - up[k] * drag.moved.y) * g.per_point;
+                    }
+                }
+                for (c, start) in pos.iter_mut().zip(drag.start) {
+                    if (*c - start).abs() > 1e-6 {
+                        *c = if snap { c.round() } else { (*c * 100.0).round() / 100.0 };
+                    }
+                }
+                let mut prims = self.prims();
+                if let Some(p) = prims.get_mut(i) {
+                    p.pos = pos;
+                    self.set_prims(prims);
+                }
+            } else {
+                self.edit.drag = None;
+            }
+        }
+
+        // click: select what's under the pointer (primitives only; the script's shape isn't
+        // known on the CPU)
+        if resp.clicked()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            let on_handle = gizmo.as_ref().is_some_and(|g| Self::gizmo_handle(g, pos).is_some());
+            if !on_handle {
+                let (fw, rt, up) = self.cam.basis();
+                let uv = (pos - rect.center()) / rect.height();
+                let rd = [0, 1, 2].map(|k| fw[k] * 1.8 + uv.x * rt[k] - uv.y * up[k]);
+                let l = (rd[0] * rd[0] + rd[1] * rd[1] + rd[2] * rd[2]).sqrt();
+                let far = self.cam.dist * 4.0 + self.shape.size().iter().sum::<f32>();
+                let hit = prims::pick(&self.prims(), self.cam.eye(), rd.map(|c| c / l), far);
+                self.select(hit);
+            }
+        }
+
+        // draw the gizmo
+        if let Some(g) = &gizmo {
+            let painter = ui.painter_at(rect);
+            let hover = resp.hover_pos().and_then(|p| Self::gizmo_handle(g, p));
+            let active = self.edit.drag.as_ref().map(|d| d.handle);
+            for (k, &col) in AXIS_COLORS.iter().enumerate() {
+                let hot = hover == Some(k) || active == Some(k);
+                painter.line_segment(
+                    [g.centre, g.tips[k]],
+                    egui::Stroke::new(if hot { 3.5 } else { 2.5 }, col),
+                );
+                painter.circle_filled(g.tips[k], if hot { 7.0 } else { 5.5 }, col);
+            }
+            let hot = hover == Some(3) || active == Some(3);
+            painter.circle(
+                g.centre,
+                if hot { 7.0 } else { 5.5 },
+                egui::Color32::from_white_alpha(if hot { 120 } else { 60 }),
+                egui::Stroke::new(1.5, egui::Color32::WHITE),
+            );
+            if let Some(p) = self.prims().get(self.edit.sel.unwrap_or(usize::MAX)) {
+                painter.text(
+                    g.centre + egui::vec2(10.0, 10.0),
+                    egui::Align2::LEFT_TOP,
+                    &p.name,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_white_alpha(200),
+                );
+            }
+            if hover.is_some() || active.is_some() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+            }
+        }
+        dragging
+    }
+
+    fn prims_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.loaded || self.design_shape.is_none() {
+            ui.weak("shown once the shape compiles");
+            return;
+        }
+        let before = self.prims();
+        let mut prims = before.clone();
+        let mut add = None;
+        let mut sel = self.edit.sel;
+        let mut action = None; // (duplicate?, index)
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Add");
+            for k in Kind::ALL {
+                if ui.small_button(k.name()).clicked() {
+                    add = Some(k);
+                }
+            }
+        });
+        let file = self
+            .design_shape
+            .as_ref()
+            .map(|s| file_name(&s.prims_path()))
+            .unwrap_or_default();
+        if prims.is_empty() {
+            ui.weak(format!(
+                "Added to the script's map() (union) and saved to {file}. Click one in the view to \
+                 select it; drag its arrows to move it."
+            ));
+        } else {
+            ui.weak(format!("unioned with map(); saved to {file}"));
+        }
+        for (i, p) in prims.iter_mut().enumerate() {
+            ui.horizontal(|ui| {
+                let mut shown = !p.hidden;
+                if ui.checkbox(&mut shown, "").on_hover_text("show / hide").changed() {
+                    p.hidden = !shown;
+                }
+                let text = egui::RichText::new(format!("{}  ·  {}", p.name, p.kind.name()));
+                let text = if p.hidden { text.weak() } else { text };
+                if ui.selectable_label(sel == Some(i), text).clicked() {
+                    sel = if sel == Some(i) { None } else { Some(i) };
+                }
+            });
+        }
+        if let Some(i) = sel.filter(|&i| i < prims.len()) {
+            ui.add_space(4.0);
+            let p = &mut prims[i];
+            egui::Grid::new("prim").num_columns(2).show(ui, |ui| {
+                ui.label("name");
+                ui.add(egui::TextEdit::singleline(&mut p.name).desired_width(180.0));
+                ui.end_row();
+                ui.label("kind");
+                let mut kind = p.kind;
+                egui::ComboBox::from_id_salt("prim kind")
+                    .selected_text(kind.name())
+                    .show_ui(ui, |ui| {
+                        for k in Kind::ALL {
+                            ui.selectable_value(&mut kind, k, k.name());
+                        }
+                    });
+                if kind != p.kind {
+                    p.kind = kind;
+                    p.dims = kind.default_dims(nice(2.0 * p.bound_radius() / 3f32.sqrt()));
+                }
+                ui.end_row();
+                ui.label("position");
+                drag3(ui, &mut p.pos, 0.1, "");
+                ui.end_row();
+                ui.label("rotation").on_hover_text("degrees about X, then Y, then Z");
+                drag3(ui, &mut p.rot, 1.0, "°");
+                ui.end_row();
+                for (k, label) in p.kind.dims().iter().enumerate() {
+                    ui.label(*label);
+                    ui.add(
+                        egui::DragValue::new(&mut p.dims[k])
+                            .speed(0.1)
+                            .range(0.0..=f32::MAX)
+                            .max_decimals(2)
+                            .suffix(" mm"),
+                    );
+                    ui.end_row();
+                }
+                if p.kind.rounds() {
+                    ui.label("rounding");
+                    ui.add(
+                        egui::DragValue::new(&mut p.round)
+                            .speed(0.05)
+                            .range(0.0..=f32::MAX)
+                            .max_decimals(2)
+                            .suffix(" mm"),
+                    );
+                    ui.end_row();
+                }
+                ui.label("blend")
+                    .on_hover_text("smooth union with the shape so far (0 = sharp)");
+                ui.add(
+                    egui::DragValue::new(&mut p.blend)
+                        .speed(0.05)
+                        .range(0.0..=f32::MAX)
+                        .max_decimals(2)
+                        .suffix(" mm"),
+                );
+                ui.end_row();
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Duplicate").on_hover_text("Ctrl+D").clicked() {
+                    action = Some((true, i));
+                }
+                if ui.button("Delete").on_hover_text("Del").clicked() {
+                    action = Some((false, i));
+                }
+            });
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.edit.undo.is_empty(), egui::Button::new("Undo").small())
+                .on_hover_text("Ctrl+Z")
+                .clicked()
+            {
+                action = Some((false, usize::MAX));
+            }
+            if ui
+                .add_enabled(!self.edit.redo.is_empty(), egui::Button::new("Redo").small())
+                .on_hover_text("Ctrl+Shift+Z")
+                .clicked()
+            {
+                action = Some((true, usize::MAX));
+            }
+        });
+        if prims != before {
+            self.set_prims(prims);
+        }
+        self.select(sel);
+        match action {
+            Some((redo, usize::MAX)) => self.undo(redo),
+            Some((true, i)) => self.duplicate_prim(i),
+            Some((false, i)) => self.delete_prim(i),
+            None => {}
+        }
+        if let Some(k) = add {
+            self.add_prim(k);
         }
     }
 
@@ -1159,6 +1684,9 @@ impl App {
             let dir = self.browser.dir.clone();
             self.browser.show_at(&dir);
         }
+        if !self.browser.open {
+            self.edit_keys(ui);
+        }
         let ctx = ui.ctx().clone();
         match self.browser.ui(&ctx, self.design.is_some()) {
             Some(Pick::Open(p)) => self.open_design(&p, vec![]),
@@ -1367,6 +1895,7 @@ impl App {
         let ppp = ui.ctx().pixels_per_point();
         let px = |v: f32| ((v * ppp * self.render_scale).round() as u32).max(1);
         self.view_px = (px(rect.width()), px(rect.height()));
+        self.view_rect = rect;
         let resp = ui.allocate_rect(rect, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         if self.design.is_none() {
@@ -1383,9 +1912,12 @@ impl App {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(tex, rect, uv, egui::Color32::WHITE);
 
+        let editing = self.edit_viewport(ui, &resp, rect);
+
         // camera (rates per physical pixel)
         let d = resp.drag_delta();
-        if resp.dragged_by(egui::PointerButton::Primary) {
+        if editing {
+        } else if resp.dragged_by(egui::PointerButton::Primary) {
             self.cam.yaw -= d.x * ppp * 0.008;
             self.cam.pitch = (self.cam.pitch + d.y * ppp * 0.008).clamp(-1.55, 1.55);
         } else if resp.dragged_by(egui::PointerButton::Secondary) || resp.dragged_by(egui::PointerButton::Middle) {
@@ -1477,6 +2009,8 @@ impl App {
         ui.weak("Edit the .wgsl in your editor; the preview reloads when you save.");
         section(ui, "Parameters");
         self.params_ui(ui);
+        section(ui, "Primitives");
+        self.prims_ui(ui);
         if !self.fields.is_empty() {
             section(ui, "Field overlays");
             self.fields_ui(ui);
@@ -2513,6 +3047,8 @@ pub struct SnapshotSetup {
     pub print_result: bool,
     pub browser: bool,
     pub section: bool,
+    /// select this primitive (Design step)
+    pub select: Option<usize>,
 }
 
 /// Draw the app's window offscreen, without opening one, and save it as a PNG: for checking the
@@ -2544,6 +3080,9 @@ pub fn snapshot(
         "optimize" => app.set_step(Step::Optimize),
         "print" => app.set_step(Step::Print),
         s => anyhow::bail!("unknown step `{s}` (design, optimize, print)"),
+    }
+    if setup.select.is_some() {
+        app.select(setup.select);
     }
     if setup.browser {
         let dir = app.browser.dir.clone();
@@ -2599,6 +3138,109 @@ mod tests {
         assert_eq!(p[3], ("infill".into(), "15%".into()));
         assert_eq!(p[4], ("supports".into(), "off".into()));
         assert_eq!(p.len(), 5, "an empty printer model is dropped");
+    }
+
+    /// Add, click-select, drag along X with the gizmo, undo; through egui input like a user would.
+    /// Skipped without a GPU adapter.
+    #[test]
+    fn primitive_editor() {
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("gen3d-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.wgsl");
+        std::fs::write(
+            &path,
+            "//! bounds -20 -20 0 20 20 20\nfn map(p: vec3f) -> f32 { return length(p - vec3f(0, 0, 10)) - 3.0; }\n",
+        )
+        .unwrap();
+        let mut app = App::new(dir.clone());
+        app.win = Some(Win::new(Arc::new(gpu), VIEW_FORMAT, None));
+        app.open_design(&path, vec![]);
+        assert!(app.loaded, "{:?}", app.error);
+        let mut t = 0.0;
+        let mut frame = |app: &mut App, events: Vec<egui::Event>| {
+            t += 0.05;
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1200.0, 800.0))),
+                time: Some(t),
+                predicted_dt: 0.05,
+                events,
+                ..Default::default()
+            };
+            if let Some(out) = app.run_ui(raw) {
+                app.paint(out, None);
+            }
+            while app.rebuild.is_some() {
+                std::thread::sleep(Duration::from_millis(5));
+                app.poll_rebuild();
+            }
+            assert!(
+                app.param_error.is_none() && app.error.is_none(),
+                "{:?} {:?}",
+                app.param_error,
+                app.error
+            );
+        };
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+
+        app.add_prim(Kind::Box);
+        let sidecar = prims::sidecar(&app.design.clone().unwrap());
+        assert!(sidecar.exists());
+        assert_eq!(app.edit.sel, Some(0));
+        let mut ps = app.prims();
+        ps[0].pos = [12.0, 0.0, 10.0];
+        app.set_prims(ps);
+        assert!(app.shape.bounds.1[0] > 14.0, "bounds grow: {:?}", app.shape.bounds);
+        app.select(None);
+        frame(&mut app, vec![]);
+        frame(&mut app, vec![]);
+
+        // click on the box selects it
+        app.select(Some(0));
+        let centre = app.gizmo(app.view_rect).unwrap().centre;
+        app.select(None);
+        frame(&mut app, vec![egui::Event::PointerMoved(centre)]);
+        frame(&mut app, vec![button(centre, true)]);
+        frame(&mut app, vec![button(centre, false)]);
+        assert_eq!(app.edit.sel, Some(0), "click picks the box");
+
+        // drag the X arrow: only x changes, the camera stays put
+        let yaw = app.cam.yaw;
+        let g = app.gizmo(app.view_rect).unwrap();
+        let tip = g.tips[0];
+        let along = (g.tips[0] - g.centre).normalized();
+        frame(&mut app, vec![egui::Event::PointerMoved(tip)]);
+        frame(&mut app, vec![button(tip, true)]);
+        let mut at = tip;
+        for _ in 0..6 {
+            at += along * 10.0;
+            frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+        }
+        frame(&mut app, vec![button(at, false)]);
+        let p = app.prims()[0].clone();
+        assert!(p.pos[0] > 13.0 && p.pos[1] == 0.0 && p.pos[2] == 10.0, "{:?}", p.pos);
+        assert_eq!(app.cam.yaw, yaw);
+        assert_eq!(prims::load(&sidecar).unwrap()[0].pos, p.pos, "saved");
+        assert_eq!(app.design_shape.as_ref().unwrap().prims[0].pos, p.pos);
+
+        // the whole drag is one undo step
+        app.undo(false);
+        assert_eq!(app.prims()[0].pos, [12.0, 0.0, 10.0]);
+        app.undo(true);
+        assert_eq!(app.prims()[0].pos, p.pos);
+        app.delete_prim(0);
+        assert!(app.prims().is_empty() && app.loaded);
+        app.undo(false);
+        assert_eq!(app.prims().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

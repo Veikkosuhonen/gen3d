@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 
+use crate::prims::{self, Prim};
+
 /// Built-in library files, available to `#include <name>` without being on disk.
 pub const LIBRARY: &[(&str, &str)] = &[("sdf.wgsl", include_str!("wgsl/sdf.wgsl"))];
 
@@ -29,6 +31,14 @@ pub struct Shape {
     pub directives: BTreeMap<String, String>,
     /// `-D NAME=VALUE` overrides, applied as WGSL pipeline-overridable constants.
     pub defines: Vec<(String, f64)>,
+    /// Primitives from the editor's sidecar file (see `prims.rs`), unioned with the script's map.
+    pub prims: Vec<Prim>,
+    /// Whether the editor's code is part of `source` (the sidecar file exists).
+    pub editor: bool,
+    /// Whether the script itself defines `fn map` (without one, the primitives are the shape).
+    pub script_map: bool,
+    /// The bounds the file declares (`bounds` grows from these to fit the primitives).
+    pub base_bounds: ([f32; 3], [f32; 3]),
 }
 
 impl Shape {
@@ -54,6 +64,7 @@ impl Shape {
         Shape {
             source: source.to_string(),
             bounds,
+            base_bounds: bounds,
             voxel,
             ..Shape::placeholder(path)
         }
@@ -70,7 +81,50 @@ impl Shape {
             voxel: 0.25,
             directives: BTreeMap::new(),
             defines: vec![],
+            prims: vec![],
+            editor: false,
+            script_map: true,
+            base_bounds: ([-50.0, -50.0, 0.0], [50.0, 50.0, 100.0]),
         }
+    }
+
+    /// The editor's sidecar file for this shape (it may not exist yet).
+    pub fn prims_path(&self) -> PathBuf {
+        prims::sidecar(&self.path)
+    }
+
+    /// Replace the primitives' values without regenerating the source: valid while the kinds and
+    /// visibility match what `source` was generated for (only the override constants change).
+    pub fn set_prims(&mut self, prims: Vec<Prim>) {
+        self.prims = prims;
+        self.update_bounds();
+    }
+
+    fn update_bounds(&mut self) {
+        let declared = self.script_map || self.directives.contains_key("bounds");
+        let base = declared.then_some(self.base_bounds);
+        let margin = 2.0 * self.voxel;
+        let prims = if self.editor { &self.prims[..] } else { &[] };
+        self.bounds = prims::grow_bounds(base, prims, margin).unwrap_or(self.base_bounds);
+    }
+
+    /// Values for the module's override constants: the `-D` parameters and the primitives.
+    pub fn constants(&self) -> Vec<(String, f64)> {
+        let mut c = self.defines.clone();
+        if self.editor {
+            c.extend(prims::constants(&self.prims));
+        }
+        c
+    }
+
+    /// `constants` plus which primitive the preview highlights.
+    pub fn preview_constants(&self, selected: Option<usize>) -> Vec<(String, f64)> {
+        let mut c = self.constants();
+        if self.editor {
+            let sel = selected.filter(|&i| self.prims.get(i).is_some_and(|p| !p.hidden));
+            c.push((prims::SELECT.to_string(), sel.map_or(-1.0, |i| i as f64)));
+        }
+        c
     }
 
     /// Append gen3d's harness (entry points, uniforms) to the shape and validate it with naga.
@@ -109,7 +163,7 @@ impl Shape {
         }
         Ok(Compiled {
             source,
-            constants: self.defines.clone(),
+            constants: self.constants(),
         })
     }
 
@@ -164,6 +218,9 @@ impl Shape {
         let mut out = vec![];
         for (_, o) in module.overrides.iter() {
             let Some(name) = o.name.clone() else { continue };
+            if name.starts_with("g3d_") {
+                continue; // gen3d's own (the editor's primitives)
+            }
             let kind = match module.types[o.ty].inner {
                 naga::TypeInner::Scalar(s) => match s {
                     naga::Scalar::BOOL => ParamKind::Bool,
@@ -500,6 +557,24 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
             _ => {}
         }
     }
+    shape.base_bounds = shape.bounds;
+
+    // the editor's primitives: rename the script's map and append the generated union
+    let sidecar = prims::sidecar(&path);
+    if sidecar.exists() {
+        shape.prims = prims::load(&sidecar)?;
+        shape.editor = true;
+        shape.script_map = prims::rename_script_map(&mut shape.source)?;
+        shape.files.push(sidecar);
+        let idx = shape.files.len();
+        shape.files.push(library_path("editor.wgsl"));
+        for (i, line) in prims::wgsl(&shape.prims, shape.script_map).lines().enumerate() {
+            shape.source.push_str(line);
+            shape.source.push('\n');
+            shape.origins.push(Origin { file: idx, line: i + 1 });
+        }
+        shape.update_bounds();
+    }
     Ok(shape)
 }
 
@@ -552,7 +627,7 @@ mod tests {
         let s = load_shape(&p, &[("R".into(), 2.0)]).unwrap();
         assert_eq!(s.bounds, ([-1.0, -1.0, 0.0], [1.0, 1.0, 2.0]));
         s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
-        s.compile(&crate::viewer::preview_harness(&[])).unwrap();
+        s.compile(&crate::viewer::preview_harness(&[], false)).unwrap();
         let ps = s.params().unwrap();
         assert_eq!(
             (ps[0].name.as_str(), ps[0].default, ps[0].kind),
@@ -588,7 +663,7 @@ mod tests {
         for f in &f {
             s.compile(&crate::mesher::compute_harness(&f.func, f.comps)).unwrap();
         }
-        s.compile(&crate::viewer::preview_harness(&f)).unwrap();
+        s.compile(&crate::viewer::preview_harness(&f, false)).unwrap();
         std::fs::write(
             &p,
             "//! range W 0.5 4\n\

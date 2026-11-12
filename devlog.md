@@ -3,6 +3,52 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-12: Primitive editor in the Design step (union with the script)
+
+**What:** the Design step has a **Primitives** section: add a sphere, box, cylinder, capsule, torus or
+cone, select it (click in the view or the list), move it with X/Y/Z arrows in the viewport (the centre
+handle moves it in the view plane, Ctrl snaps to 1 mm), and edit position, rotation, size, edge
+rounding and a smooth-union *blend* in the sidebar. Hide/show, duplicate (Ctrl+D), delete (Del),
+deselect (Esc), undo/redo (Ctrl+Z / Ctrl+Shift+Z; a drag is one step). Only union for now.
+
+**Design decisions**
+- **Sidecar file, not the script.** Primitives are saved on every change to `NAME.prims.json` next to
+  `NAME.wgsl` (serde_json, write-then-rename). The app never rewrites the user's .wgsl, which may be
+  open in their editor. Because it's on disk, the CLI and the app's subprocess jobs (optimize, export,
+  slice) pick primitives up with no extra plumbing.
+- **Merged at load time, under the name `map`.** When the sidecar exists, `load_shape` renames the
+  script's `fn map` (a comment-aware text scan that keeps line structure, so `file:line:col` errors
+  still point into the script) to `g3d_script_map` and appends generated WGSL: a prefixed primitive
+  library (`g3d_ed_*`, self-contained so it doesn't depend on `#include <sdf.wgsl>` or clash with the
+  script's own `sdBox`), one function per primitive, and `map = script ∪ primitives`. Every harness
+  (preview, mesher, topopt, VTI export) calls `map`, so none of them changed. Script functions that call
+  `map(p)` get the combined shape. A .wgsl without `fn map` works when a sidecar exists (primitives
+  only). Without a sidecar nothing changes.
+- **Numbers are `override` constants** (`g3d_e{i}_px` …, hidden from the parameter sliders). Dragging
+  goes through the same async pipeline rebuild as parameter sliders; only add/delete/hide/kind change
+  regenerates the source. `Shape::constants()` now returns `-D` values plus the primitives' values.
+- **Selection highlight:** `override g3d_ed_sel` and a generated `g3d_ed_selected(p)`; the preview
+  harness tints surface points on the selected primitive in striped blue.
+- **Bounds grow** to fit the primitives: a rotated local AABB plus the blend bulge plus 2 voxels. A
+  bounding sphere put the tilted test torus 8 mm under the plate. The camera reframes only when the
+  file's own `//! bounds` change, not when primitives grow them.
+- **Picking on the CPU:** Rust copies of the six SDFs, sphere-traced along the same ray the shader uses
+  (`Camera::basis`). It only sees primitives, not the script, so a primitive buried in script geometry is
+  still clickable. Good enough for now; GPU picking would fix it.
+
+**Verified:** `cargo test` (20 pass): the `fn map` rename, CPU SDF vs. the GPU-sampled generated WGSL
+for all six kinds under rotation (within 1e-3), the AABB holds every inside point for random rotations,
+shapes with primitives compile with every harness, `g3d_` overrides stay out of the parameter list,
+script error lines stay correct, primitives-only shapes work. An app test drives egui with synthetic
+pointer events: click-select, X-arrow drag (only x moves, camera doesn't orbit, sidecar saved), the drag
+is one undo step, delete + undo. `gen3d snapshot --select N` of a knob with a blended box, a sphere and a
+tilted torus looks right. `gen3d export` of it gives a watertight STL reaching the box's edge
+(x = 32 mm). All bundled shapes still `check` unchanged. clippy clean.
+
+**Open:** subtraction/intersection (per-primitive op, ordering against the script); rotation handles in
+the viewport; GPU picking so script geometry occludes; snapping/alignment helpers (e.g. sit on the
+plate); an "editor only" choice in New shape.
+
 ## 2026-11-12: One app, one flow: Design → Optimize → Print
 
 **What:** the viewer's sidebar had grown a section per feature (Parameters, View, Field overlays,

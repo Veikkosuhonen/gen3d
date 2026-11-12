@@ -221,9 +221,15 @@ pub fn field_color(i: usize) -> [f32; 3] {
 /// The preview harness plus `g3d_field_tint`, which colours surface points inside the shape's
 /// `field_*` regions: scalar fields where they are < 0, vector fields where they are non-zero (with
 /// bands moving along the vector). Overlapping regions alternate in diagonal stripes fixed to the surface (in world space, so
-/// they don't swim when the camera moves).
-pub fn preview_harness(fields: &[Field]) -> String {
+/// they don't swim when the camera moves). With the editor's primitives (`editor`), the selected
+/// one is tinted first.
+pub fn preview_harness(fields: &[Field], editor: bool) -> String {
     let mut f = String::from("\nfn g3d_field_tint(p: vec3f, ps: vec3f, scale: f32) -> vec4f {\n");
+    if editor {
+        f += "    if (g3d_ed_selected(ps) < scale * 0.003) {\n        \
+              let band = step(0.5, fract(dot(ps, vec3f(1.0)) / (scale * 0.02)));\n        \
+              return vec4f(mix(vec3f(0.20, 0.65, 1.0), vec3f(0.45, 0.80, 1.0), band), 0.7);\n    }\n";
+    }
     if !fields.is_empty() {
         f += &format!(
             "    let mask = g3d_v.fmask.x;\n    var cols: array<vec3f, {}>;\n    var n = 0u;\n",
@@ -297,7 +303,29 @@ impl Camera {
         }
     }
 
-    fn eye(&self) -> [f32; 3] {
+    /// (forward, right, up) unit vectors, as `g3d_fs` builds them. A point at camera-space (x, y, z)
+    /// (along right, up, forward) lands at uv = 1.8 (x, y) / z, with uv in units of the view height.
+    pub fn basis(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
+        let e = self.eye();
+        let norm = |v: [f32; 3]| {
+            let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-12);
+            v.map(|c| c / l)
+        };
+        let cross = |a: [f32; 3], b: [f32; 3]| {
+            [
+                a[1] * b[2] - a[2] * b[1],
+                a[2] * b[0] - a[0] * b[2],
+                a[0] * b[1] - a[1] * b[0],
+            ]
+        };
+        let fw = norm([0, 1, 2].map(|k| self.target[k] - e[k]));
+        let side = cross(fw, [0.0, 0.0, 1.0]);
+        let len = (side[0] * side[0] + side[1] * side[1]).sqrt();
+        let rt = if len < 1e-4 { [1.0, 0.0, 0.0] } else { norm(side) };
+        (fw, rt, cross(rt, fw))
+    }
+
+    pub fn eye(&self) -> [f32; 3] {
         let cp = self.pitch.cos();
         [
             self.target[0] + self.dist * cp * self.yaw.cos(),
@@ -361,7 +389,7 @@ pub fn load_source(path: &Path, defines: &[(String, f64)], vopts: &VolumeOpts) -
     let shape = load_shape(path, defines)?;
     let fields = shape.fields()?;
     Ok(Source {
-        harness: preview_harness(&fields),
+        harness: preview_harness(&fields, shape.editor),
         shape,
         fields,
         volume: None,
@@ -588,7 +616,7 @@ pub fn render_png(
     });
     let vol = src.volume.as_ref().map(|v| VolGpu::new(&gpu, v)).transpose()?;
     let module = preview_module(&gpu, &src)?;
-    let pipeline = build_pipeline(&gpu, &module, &src.shape.defines, format, &ubuf, vol.as_ref())?;
+    let pipeline = build_pipeline(&gpu, &module, &src.shape.constants(), format, &ubuf, vol.as_ref())?;
     let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("render"),
         size: wgpu::Extent3d {

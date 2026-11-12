@@ -5,7 +5,8 @@ topology-optimize them, mesh them on the GPU, and slice them to G-code. A single
 [wgpu](https://wgpu.rs) (Vulkan, Metal, DX12 or GL).
 
 ```
-gen3d   ─►  1 Design    open or create a .wgsl, edit it in your editor (live reload), tune parameters
+gen3d   ─►  1 Design    open or create a .wgsl, edit it in your editor (live reload), tune parameters,
+                        add primitives (sphere, box, ...) with the mouse
             2 Optimize  optional: topology optimization of the shape as a design domain (live)
             3 Print     mesh the design or the optimized result, pick a printer profile, slice to G-code
 ```
@@ -68,6 +69,30 @@ declaration becomes its tooltip. The slider covers 0 to twice the default unless
 with `//! range NAME min max`; you can still type any value into the number box. Optimize and Print use
 the values on screen.
 
+### Primitives from the app (`NAME.prims.json`)
+
+The Design step can also add **primitives**: sphere, box, cylinder, capsule, torus and cone, each with
+a position, rotation (degrees about X, then Y, then Z), size, edge rounding (boxes, cylinders) and a
+*blend* radius for a smooth union. They are stored next to the shape, `knob.wgsl` → `knob.prims.json`,
+and are **unioned** with the script: when that file exists, gen3d renames the script's `fn map` to
+`g3d_script_map` and generates
+
+```wgsl
+fn map(p: vec3f) -> f32 {
+    var d = g3d_script_map(p);                        // your script (or nothing, if it has no map)
+    d = g3d_ed_union(d, g3d_e0(p), g3d_e0_blend);     // each visible primitive, in list order
+    ...
+    return d;
+}
+```
+
+so every command (`render`, `export`, `optimize`, `slice`) and the app see the combined shape. Other
+functions that call `map(p)` (e.g. a `field_keep`) get the combined shape too. The bounds grow to fit the
+primitives. A shape can be primitives only: a `.wgsl` without `fn map` works when its `.prims.json`
+exists. Each primitive's numbers are `override` constants, so moving or resizing one only rebuilds the
+pipeline; adding, removing, hiding or changing a kind regenerates the source. Only union for now (no
+subtraction or intersection).
+
 ### Library (`src/wgsl/sdf.wgsl`)
 
 - **Primitives:** `sdSphere sdBox sdRoundBox sdTorus sdCylinder sdRoundCylinder sdCapsule sdCappedCone sdHexPrism sdOctahedron sdPlane`
@@ -108,9 +133,15 @@ camera presets, section view, bounds box, clipping and render resolution.
 - **Edit** opens the shape in `$GEN3D_EDITOR` (a command, e.g. `code` or `kitty nvim`) or else the
   desktop's default app. The preview reloads whenever the file or an include is saved; errors show in a
   panel under the view, and the last version that compiled stays on screen.
-- **1 Design:** sliders for the shape's [parameters](#writing-shapes), `field_*` overlay selection, and
-  shape details. A parameter change rebuilds only the pipeline, on a background thread, so dragging stays
-  smooth.
+- **1 Design:** sliders for the shape's [parameters](#writing-shapes), [primitives](#primitives-from-the-app-nameprimsjson),
+  `field_*` overlay selection, and shape details. A parameter change rebuilds only the pipeline, on a
+  background thread, so dragging stays smooth. **Primitives:** *Add* puts one at the centre of the view;
+  click one in the view (or the list) to select it. It is tinted blue and gets arrows: drag an arrow to
+  move along X/Y/Z, the centre to move in the view plane, `Ctrl` snaps to whole mm. The sidebar edits
+  its numbers; `Del` deletes, `Ctrl+D` duplicates, `Esc` deselects, `Ctrl+Z` / `Ctrl+Shift+Z` undo and
+  redo. Every change is saved to the `.prims.json` right away, so Optimize and Print use it. Picking only
+  sees primitives (the script's shape isn't known on the CPU), so a primitive hidden inside script
+  geometry can still be clicked.
 - **2 Optimize** (for shapes with `field_fixed` and `field_load`, see
   [Topology optimization](#topology-optimization)): material share, load, element size, minimum member
   size, iterations, crisp 0/1. **Optimize** runs in the background with a progress bar; from the first
@@ -336,8 +367,8 @@ gen3d snapshot shapes/bracket_domain.wgsl --step optimize -o out/ui.png   # the 
 ```
 
 `snapshot` draws the app's window into a PNG without opening one (same GPU path), to check the UI
-headlessly. It can open a step (`--step`), the optimized result in Print (`--result`), or the Open
-dialog (`--browser`).
+headlessly. It can open a step (`--step`), the optimized result in Print (`--result`), the Open
+dialog (`--browser`), or select a primitive (`--select N`).
 
 | file | role |
 |---|---|
@@ -346,6 +377,7 @@ dialog (`--browser`).
 | `src/browser.rs` | the Open dialog and New shape |
 | `src/jobs.rs` | background `gen3d` subprocess jobs, log parsing (optimization progress, mesh report) |
 | `src/shape.rs` | `#include` expansion, `//!` directives, naga validation, error → `file:line:col` |
+| `src/prims.rs` | editor primitives: `.prims.json`, generated WGSL union, bounds, CPU SDFs for picking |
 | `src/gpu.rs` | adapter selection (hardware first, software fallback with a warning) |
 | `src/mesher.rs` | compute-shader sampling harness, grid padding, polygonize + report |
 | `src/mc.rs` | marching cubes with a generated crack-free case table |

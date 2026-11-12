@@ -7,6 +7,7 @@ mod jobs;
 mod mc;
 mod mesh;
 mod mesher;
+mod prims;
 mod shape;
 mod slicer;
 mod topopt;
@@ -237,6 +238,9 @@ enum Cmd {
         browser: bool,
         #[arg(long)]
         section: bool,
+        /// select primitive N of the shape's editor
+        #[arg(long)]
+        select: Option<usize>,
         #[arg(long, num_args = 2, value_names = ["W", "H"], default_values_t = [1440u32, 900])]
         size: Vec<u32>,
         #[arg(short, long, default_value = "out/snapshot.png")]
@@ -393,6 +397,7 @@ fn run(cli: Cli) -> Result<()> {
             result,
             browser,
             section,
+            select,
             size,
             output,
         } => {
@@ -401,6 +406,7 @@ fn run(cli: Cli) -> Result<()> {
                 print_result: result,
                 browser,
                 section,
+                select,
             };
             app::snapshot(
                 file.as_deref(),
@@ -534,7 +540,7 @@ fn run(cli: Cli) -> Result<()> {
             let shape = load_shape(&s.shape, &parse_defines(&s.define)?)?;
             shape.compile(&mesher::compute_harness("map", 1))?;
             let fields = shape.fields()?;
-            shape.compile(&viewer::preview_harness(&fields))?;
+            shape.compile(&viewer::preview_harness(&fields, shape.editor))?;
             for f in &fields {
                 shape.compile(&mesher::compute_harness(&f.func, f.comps))?;
             }
