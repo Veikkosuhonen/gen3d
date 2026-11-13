@@ -368,6 +368,8 @@ struct App {
     out_job: Slot,
     gcode_cache: HashMap<PathBuf, (Option<SystemTime>, Summary)>,
     gpu_name: String,
+    /// `gen3d optimize` will use the GPU solver (a hardware GPU): sets the automatic element size
+    gpu_solver: bool,
     win: Option<Win>,
     last_poll: Instant,
     frames: u32,
@@ -674,6 +676,7 @@ impl App {
             out_job: Slot::default(),
             gcode_cache: HashMap::new(),
             gpu_name: String::new(),
+            gpu_solver: true,
             win: None,
             last_poll: Instant::now(),
             frames: 0,
@@ -1751,7 +1754,9 @@ impl App {
             return;
         };
         let o = &self.opt;
-        let vox = o.voxel.unwrap_or_else(|| crate::topopt::auto_voxel(shape, 40_000.0));
+        let vox = o
+            .voxel
+            .unwrap_or_else(|| crate::topopt::auto_voxel(shape, crate::topopt::auto_elements(self.gpu_solver)));
         let mut a = vec![design.display().to_string()];
         for (k, v) in &self.defines {
             a.extend(["-D".into(), format!("{k}={v}")]);
@@ -2587,7 +2592,7 @@ impl App {
         let running_here = job.running && mine;
 
         section(ui, "Settings");
-        let auto = crate::topopt::auto_voxel(&shape, 40_000.0);
+        let auto = crate::topopt::auto_voxel(&shape, crate::topopt::auto_elements(self.gpu_solver));
         ui.add_enabled_ui(!running_here, |ui| {
             let o = &mut self.opt;
             egui::Grid::new("opt").num_columns(2).show(ui, |ui| {
@@ -3121,6 +3126,7 @@ impl App {
         let gpu = Arc::new(crate::gpu::create(instance, Some(&surface), true)?);
         let info = gpu.adapter.get_info();
         self.gpu_name = format!("{} ({:?})", info.name, info.backend);
+        self.gpu_solver = !gpu.is_software();
         let caps = surface.get_capabilities(&gpu.adapter);
         // egui blends in gamma space: prefer a non-sRGB swapchain format
         let format = caps
@@ -3288,6 +3294,7 @@ pub fn snapshot(
     let gpu = Arc::new(crate::gpu::headless()?);
     let info = gpu.adapter.get_info();
     app.gpu_name = format!("{} ({:?})", info.name, info.backend);
+    app.gpu_solver = !gpu.is_software();
     app.win = Some(Win::new(gpu, VIEW_FORMAT, None));
     match file {
         Some(f) => app.open_design(f, defines),

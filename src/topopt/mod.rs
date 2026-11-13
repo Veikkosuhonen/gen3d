@@ -137,11 +137,18 @@ impl Problem {
     }
 }
 
-/// Element size giving at most about `target` elements in the shape's bounds (never finer than the
-/// shape's own voxel), rounded up to 2 significant digits.
+/// How many elements the automatic element size aims for: the GPU solver runs ~300k elements in a
+/// few seconds per optimization; the CPU solvers stay at 40k to be as quick.
+pub fn auto_elements(gpu_solver: bool) -> f64 {
+    if gpu_solver { 300_000.0 } else { 40_000.0 }
+}
+
+/// Element size giving at most about `target` elements in the shape's bounds, rounded up to 2
+/// significant digits. (It may be finer than the shape's `//! voxel`, which is its meshing and
+/// preview resolution; the optimized result is a grid of its own.)
 pub fn auto_voxel(shape: &Shape, target: f64) -> f32 {
     let vol: f64 = shape.size().iter().map(|s| (*s as f64).max(1e-3)).product();
-    let v = (shape.voxel as f64).max((vol / target).cbrt());
+    let v = (vol / target).cbrt();
     let mag = 10f64.powf(v.log10().floor() - 1.0);
     ((v / mag).ceil() * mag) as f32
 }

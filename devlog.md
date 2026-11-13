@@ -3,6 +3,29 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: Default element count 300k on the GPU
+
+**What:** with the GPU solver, the automatic element size now aims for ~300k elements in the bounds,
+instead of 40k. The CPU solvers keep 40k.
+- Bracket: 0.64 mm and 291k elements, 50 iterations in 2.7 s. Compliance 8.57 against 8.96 at 1.3 mm:
+  a finer, stiffer design.
+- `bracket_editor`: 211k elements, 3.6 s.
+
+**How:** `topopt::auto_elements(gpu_solver)` sets the target.
+- `optimize` (CLI) uses 300k when the solver resolves to `gpu`.
+- The app's Optimize step uses it when its own adapter is a hardware GPU (`App::gpu_solver`).
+- The preview's `g3d_reach` default uses the GPU value, the usual case.
+- `auto_voxel` no longer stops at the shape's `//! voxel`. That cap dated from the Jacobi solver, and
+  the shape's voxel is only its meshing and preview resolution. Without it, the bracket (`voxel 1`)
+  would have stayed at 76k.
+
+**Note:** fixed and loaded shells are 1.5 elements thick, so finer elements make them thinner. That
+shifts results: `bracket_editor`'s compliance went from 13.3 to 17.0, probably mostly from the
+thinner clamped bolt-hole shells (not verified separately).
+
+**Verified:** CLI runs above; `gen3d snapshot --step optimize` shows "element size 0.640 mm, ≤ 299250
+elements". Tests pass.
+
 ## 2026-11-13: Optimizer output at large grids: background writes, previews, full result on Stop
 
 **What:**

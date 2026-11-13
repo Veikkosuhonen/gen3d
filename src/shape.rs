@@ -732,8 +732,9 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
             shape.script_load = Some("g3d_script_field_load".into());
         }
         shape.bc = fixed || load || keep;
-        // the optimizer sets g3d_reach from its element size; this default is for the preview
-        let reach = 1.5 * crate::topopt::auto_voxel(&shape, 40_000.0);
+        // the optimizer sets g3d_reach from its element size; this default is for the preview (with
+        // the GPU solver's automatic size, the usual case)
+        let reach = 1.5 * crate::topopt::auto_voxel(&shape, crate::topopt::auto_elements(true));
         shape.files.push(sidecar);
         let idx = shape.files.len();
         shape.files.push(library_path("editor.wgsl"));

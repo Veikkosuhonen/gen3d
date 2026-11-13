@@ -401,7 +401,9 @@ ends it at once).
   come back per iteration, plus the fields when the `.vti` is written. Without one, `--solver mg` runs
   the same on the CPU in f64, multithreaded. Solves are looser while the design still moves a lot and
   reach full accuracy at the final β. CG needs about 8–13 iterations per solve at any grid size.
-  - The default voxel keeps the bounds at about 40k elements; the bracket runs 50 iterations in 1.4 s.
+  - The default element size gives about 300k elements in the bounds with the GPU solver (the bracket:
+    0.64 mm, 50 iterations in 2.7 s) and 40k with the CPU ones (1.3 mm, 7.6 s). It can be finer than
+    the shape's `//! voxel`, which is only its meshing and preview resolution.
   - Per iteration on an RTX 3080: 0.14 s at 1.2M elements, 1.0 s at 9.5M, 2.7 s at 22M, 5.6 s at
     44M.
   - CPU multigrid: 7.7 s at 1.2M; the old Jacobi-preconditioned CG (`--solver jacobi`): 76 s.

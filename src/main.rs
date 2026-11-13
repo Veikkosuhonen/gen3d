@@ -262,7 +262,8 @@ enum Cmd {
     Optimize {
         #[command(flatten)]
         s: ShapeArgs,
-        /// element size in mm (default: about 40k elements in the bounds)
+        /// element size in mm (default: about 300k elements in the bounds with the GPU solver, 40k
+        /// with the CPU ones)
         #[arg(long)]
         voxel: Option<f32>,
         /// fraction of the design domain to fill
@@ -598,8 +599,9 @@ fn run(cli: Cli) -> Result<()> {
             let defines = parse_defines(&s.define)?;
             let shape = load_shape(&s.shape, &defines)?;
             let gpu = gpu::headless()?;
+            let on_gpu = matches!(solver.solver(&gpu), topopt::Solver::Gpu(_));
             let settings = topopt::Settings {
-                voxel: voxel.unwrap_or_else(|| topopt::auto_voxel(&shape, 40_000.0)) as f64,
+                voxel: voxel.unwrap_or_else(|| topopt::auto_voxel(&shape, topopt::auto_elements(on_gpu))) as f64,
                 volfrac,
                 penal,
                 rmin,
