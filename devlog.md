@@ -3,6 +3,51 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: GPU multigrid setup 3–4× faster
+
+**Why:** per optimizer iteration, rebuilding the hierarchy took as long as the solve (4.8M elements:
+1.47 s setup against 1.93 s solve). Timing each setup dispatch showed that the level-2 Galerkin
+assembly (from the fine grid through the virtual level 1) took 956 ms of it, and the smoothers'
+λmax power iteration most of the rest.
+
+**What:**
+- **Assembly (`mg.wgsl`, `assemble`):** every thread recomputed each fine element's clamped-node mask
+  (8 reads of `free`) and re-read its `ee`, once per matrix entry: ~4,600 global reads per thread for 64
+  values per workgroup. Now each of the 64 threads loads one fine element's weight and table offset
+  into workgroup memory first. The trilinear weights `wgt(c, a, b)` (512 values, 2 × 576 calls per
+  thread) are tabulated per workgroup too. Level 2: 956 → 252 ms; stored levels: 51 → 21 ms.
+- **λmax reuse (`gpu_mg.rs`, `gpu_opt.rs`):** the power iteration is its own program, and
+  `build(estimate)` runs it only on the first iteration, after a β change and every 5 iterations.
+  λmax drifts a few % over 10 iterations (about 10% over a whole run), and the random-start estimate
+  itself varies ±2%. The Chebyshev interval reaches 1.1 λmax, so that drift is covered. If a solve
+  with an old estimate needs over 32 CG iterations, it re-estimates and continues.
+
+**Result:** same iteration and CG counts, compliance within 0.01%:
+
+| | before | after |
+|---|---|---|
+| bracket_domain (291k) | 12.0 s | 8.3 s |
+| bracket_editor | 14.2 s | 11.2 s |
+| book_stand1 | 11.0 s | 7.8 s |
+| table (--ground grip) | 34.2 s | 31.7 s |
+| 4.8M bracket, setup per iteration | 1.47 s | 0.38 s |
+
+**Tried and not kept: earlier β-stage advances.** The max density change sits at the move limit
+(0.2) in every iteration, so stages end through the 3-iteration stall check or the 25-iteration cap.
+Advancing once compliance improves < 0.5% for 2 iterations saved 15–40% of the iterations, but
+cost 0.5–2.5% compliance (book_stand1 +2.5%: its β = 2 stage keeps gaining ~0.1% per iteration for
+24 iterations). Keeping β = 1 strict and loosening only the later stages still cost 2.4% on
+book_stand1. The slow gains are real, so the rule stays as it was.
+
+**Still open:**
+- The level-2 assembly is still 2/3 of setup. P is 27/64 dense per child, so skipping its zeros
+  would roughly halve the two products.
+- The solve (Chebyshev smoothing on levels 0 and 1) is now most of each iteration.
+
+**Verified:** topopt tests pass (`kernels_match_cpu` checks the assembly against the CPU,
+`gpu_loop_matches_cpu_loop`), clippy clean, before/after runs above with the old binary.
+`prims::tests::shapes_with_primitives_compile` still fails, as before.
+
 ## 2026-11-13: Showing the exported mesh
 
 **What:**

@@ -326,6 +326,13 @@ fn fine_mask(i: u32, j: u32, k: u32, nf: vec3<u32>) -> u32 {
 
 var<workgroup> K: array<f32, 576>;
 var<workgroup> KP: array<f32, 576>;
+// virtual children: per fine element under this coarse element (index c2 · 8 + c1), its E_e h and
+// the offset of its table matrix (or a negative weight when it is outside the grid), loaded once
+// rather than once per matrix entry
+var<workgroup> FW: array<f32, 64>;
+var<workgroup> FT: array<u32, 64>;
+// wgt(c, a, b) at (c · 8 + a) · 8 + b, so the products below don't recompute it
+var<workgroup> PW: array<f32, 512>;
 
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -333,14 +340,38 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let ce = wg_flat(wg, nwg);
     let virt = P.m.x == 1u;
     let nf = P.n.xyz;
-    // the child level's grid, and the output's
+    // the child level's grid, and the output's (nf: fine grid when the children are virtual)
     var nl = nf;
     if virt { nl = (nf + vec3<u32>(1u)) / 2u; }
     let nc = (nl + vec3<u32>(1u)) / 2u;
+    // uniform across the workgroup (barriers follow)
     if ce >= nc.x * nc.y * nc.z { return; }
     let ci = ce % nc.x;
     let cj = (ce / nc.x) % nc.y;
     let ck = ce / (nc.x * nc.y);
+    for (var t = 0u; t < 8u; t++) {
+        let i = li * 8u + t;
+        PW[i] = wgt(i / 64u, (i / 8u) % 8u, i % 8u);
+    }
+    if virt {
+        // thread li loads fine element c1 = li % 8 of level-1 child c2 = li / 8
+        let c2 = li / 8u;
+        let c1 = li % 8u;
+        let fi = 2u * (2u * ci + (c2 & 1u)) + (c1 & 1u);
+        let fj = 2u * (2u * cj + ((c2 >> 1u) & 1u)) + ((c1 >> 1u) & 1u);
+        let fk = 2u * (2u * ck + ((c2 >> 2u) & 1u)) + ((c1 >> 2u) & 1u);
+        var w = 0.0;
+        var off = 0u;
+        if fi < nf.x && fj < nf.y && fk < nf.z {
+            w = ee[(fk * nf.y + fj) * nf.x + fi];
+            if w != 0.0 {
+                off = (fine_mask(fi, fj, fk, nf) * 8u + c1) * 576u;
+            }
+        }
+        FW[li] = w;
+        FT[li] = off;
+    }
+    workgroupBarrier();
     var acc: array<f32, 9>;
     for (var t = 0u; t < 9u; t++) { acc[t] = 0.0; }
     for (var c2 = 0u; c2 < 8u; c2++) {
@@ -355,14 +386,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             if inside {
                 if virt {
                     for (var c1 = 0u; c1 < 8u; c1++) {
-                        let fi = 2u * li_ + (c1 & 1u);
-                        let fj = 2u * lj + ((c1 >> 1u) & 1u);
-                        let fk = 2u * lk + ((c1 >> 2u) & 1u);
-                        if fi >= nf.x || fj >= nf.y || fk >= nf.z { continue; }
-                        let e = (fk * nf.y + fj) * nf.x + fi;
-                        let w = ee[e];
+                        let w = FW[c2 * 8u + c1];
                         if w != 0.0 {
-                            s += w * T[(fine_mask(fi, fj, fk, nf) * 8u + c1) * 576u + idx];
+                            s += w * T[FT[c2 * 8u + c1] + idx];
                         }
                     }
                 } else {
@@ -381,7 +407,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             let jj = col % 3u;
             var s = 0.0;
             for (var a = 0u; a < 8u; a++) {
-                s += K[r * 24u + 3u * a + jj] * wgt(c2, a, b);
+                s += K[r * 24u + 3u * a + jj] * PW[(c2 * 8u + a) * 8u + b];
             }
             KP[idx] = s;
         }
@@ -395,7 +421,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             let ii = row % 3u;
             var s = 0.0;
             for (var a = 0u; a < 8u; a++) {
-                s += wgt(c2, a, b) * KP[(3u * a + ii) * 24u + col];
+                s += PW[(c2 * 8u + a) * 8u + b] * KP[(3u * a + ii) * 24u + col];
             }
             acc[t] += s;
         }

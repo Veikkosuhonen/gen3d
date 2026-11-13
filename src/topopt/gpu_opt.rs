@@ -15,6 +15,12 @@ use super::output::{self, Output, Snapshot};
 use super::{CG_MAXIT, Control, IterStats, Next, Outcome, Problem, Settings};
 use crate::gpu::Gpu;
 
+/// Re-estimate the smoothers' λmax at least every this many optimizer iterations.
+const REESTIMATE_EVERY: usize = 5;
+/// CG iterations above which a solve with an old λmax estimate refreshes it (MGCG usually needs
+/// 4–16).
+const STALE_CG_ITS: usize = 32;
+
 // scalar slots (gpu_mg uses those below 80)
 const COMPL: u32 = 96;
 const LAMBDA: u32 = 97;
@@ -233,6 +239,8 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
     let mut lambda = 1.0f64;
     let mut last_change = 1.0f64;
     let target = s.volfrac * ndesign as f64;
+    // optimizer iterations since the smoothers' λmax was estimated (None: estimate next time)
+    let mut estimate_age: Option<usize> = None;
     let snapshot = || -> Result<Snapshot> {
         let ee = e.read_f32(&mg.ee, ne)?;
         let ce = e.read_f32(&mg.ce, ne)?;
@@ -250,7 +258,9 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         let t0 = Instant::now();
         let mut st = IterStats::default();
         e.run(&[&prog_stiffness])?;
-        mg.build()?;
+        let estimate = estimate_age.is_none_or(|a| a >= REESTIMATE_EVERY);
+        mg.build(estimate)?;
+        estimate_age = Some(if estimate { 0 } else { estimate_age.unwrap() + 1 });
         st.setup = t0.elapsed().as_secs_f64();
 
         let t1 = Instant::now();
@@ -262,7 +272,16 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         };
         st.cg_tol = tol;
         for c in 0..mg.us.len() {
-            let n = mg.solve(c, tol, CG_MAXIT)?;
+            let mut n = mg.solve(c, tol, CG_MAXIT)?;
+            if n > STALE_CG_ITS && estimate_age != Some(0) {
+                // an old λmax estimate may have weakened the smoother: refresh it and carry on
+                // from where CG got to
+                let t = Instant::now();
+                mg.build(true)?;
+                estimate_age = Some(0);
+                st.setup += t.elapsed().as_secs_f64();
+                n += mg.solve(c, tol, CG_MAXIT)?;
+            }
             if n >= CG_MAXIT {
                 println!("warning: CG did not converge in {CG_MAXIT} iterations");
             }
@@ -354,6 +373,8 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
             Next::Go => {}
             Next::Beta(b) => {
                 beta = b;
+                // a sharper projection changes the densities at once
+                estimate_age = None;
                 e.set_scalar(BETA, beta as f32);
                 e.run(&[&prog_project])?;
             }

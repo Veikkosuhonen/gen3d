@@ -88,7 +88,10 @@ pub(super) struct GpuMg<'a> {
     /// per load case: |f|²
     ff: Vec<f64>,
     bottom: wgpu::Buffer,
+    /// diagonals and Galerkin coarse levels
     setup: Vec<Step>,
+    /// the smoothers' λmax(D⁻¹K) estimates (power iteration)
+    estimate: Vec<Step>,
     init: Vec<Vec<Step>>,
     iter: Vec<Vec<Step>>,
     energy: Vec<Step>,
@@ -184,11 +187,13 @@ impl<'a> GpuMg<'a> {
             bottom: buf("bottom inverse", bdofs * bdofs),
             dims,
             setup: vec![],
+            estimate: vec![],
             init: vec![],
             iter: vec![],
             energy: vec![],
         };
         g.setup = g.record_setup();
+        g.estimate = g.record_estimate();
         for c in 0..g.us.len() {
             let i = g.record_init(c);
             g.init.push(i);
@@ -345,8 +350,15 @@ impl<'a> GpuMg<'a> {
                 threads(nodes(self.dims[l])),
             );
         }
-        // λmax(D⁻¹K) per smoothed level, by power iteration
-        for l in 0..last {
+        out
+    }
+
+    /// λmax(D⁻¹K) per smoothed level, by power iteration from a random start. This is most of the
+    /// setup's cost (12 mat-vecs on levels 0 and 1), and λmax drifts only a few % per optimizer
+    /// iteration, so the optimizer re-runs it only now and then (`build(estimate)`).
+    fn record_estimate(&self) -> Vec<Step> {
+        let mut out = vec![];
+        for l in 0..self.last() {
             let (v, kv, d, n) = (&self.lr[l], &self.ld[l], &self.diag[l], self.len(l));
             self.e.step(
                 &mut out,
@@ -521,12 +533,17 @@ impl<'a> GpuMg<'a> {
     pub(super) fn set_stiffness(&self, ee: &[f64]) -> Result<()> {
         let ee32: Vec<f32> = ee.iter().map(|&v| v as f32).collect();
         self.e.write_f32(&self.ee, &ee32);
-        self.build()
+        self.build(true)
     }
 
-    /// Build the hierarchy for the element stiffnesses already in `ee`.
-    pub(super) fn build(&self) -> Result<()> {
+    /// Build the hierarchy for the element stiffnesses already in `ee`. With `estimate` false the
+    /// smoothers keep their previous λmax estimates: the Chebyshev interval reaches 1.1 λmax, so a
+    /// few % of drift is harmless, and the preconditioner stays symmetric either way.
+    pub(super) fn build(&self, estimate: bool) -> Result<()> {
         self.e.run(&[&self.setup])?;
+        if estimate {
+            self.e.run(&[&self.estimate])?;
+        }
         // exact solve on the coarsest level
         let last = self.last();
         let n = self.dims[last];
