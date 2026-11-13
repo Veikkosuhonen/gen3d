@@ -74,6 +74,8 @@ pub struct Engine<'g> {
     pipes: HashMap<&'static str, wgpu::ComputePipeline>,
     pub scalars: wgpu::Buffer,
     partials: wgpu::Buffer,
+    /// bytes of storage buffers allocated through `buf`/`init`
+    allocated: std::cell::Cell<u64>,
 }
 
 impl<'g> Engine<'g> {
@@ -126,10 +128,16 @@ impl<'g> Engine<'g> {
                 usage: wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: false,
             }),
+            allocated: Default::default(),
         };
         e.scalars = e.buf("scalars", SLOTS);
         e.partials = e.buf("partials", PARTIALS);
         Ok(e)
+    }
+
+    /// Bytes allocated so far.
+    pub fn allocated(&self) -> u64 {
+        self.allocated.get()
     }
 
     /// The largest buffer one binding can hold (bytes).
@@ -140,6 +148,7 @@ impl<'g> Engine<'g> {
 
     /// A zeroed storage buffer of `len` 32-bit values.
     pub fn buf(&self, label: &str, len: usize) -> wgpu::Buffer {
+        self.allocated.set(self.allocated.get() + (len.max(1) * 4) as u64);
         self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: (len.max(1) * 4) as u64,
@@ -256,6 +265,42 @@ impl<'g> Engine<'g> {
                 ..Default::default()
             },
             &[a, b, w, &self.partials],
+            [PARTIALS as u32, 1, 1],
+        );
+        self.step(
+            out,
+            "dot_final",
+            Params {
+                m: [PARTIALS as u32, slot, max, 0],
+                ..Default::default()
+            },
+            &[&self.partials, &self.scalars],
+            [1, 1, 1],
+        );
+    }
+
+    /// S[slot] = a reduction over the design elements (flags bit 2): `Dot` gives Σ a, `MaxDiff`
+    /// max |a - b|, `Grey` the grey count.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce_design(
+        &self,
+        out: &mut Vec<Step>,
+        mode: Reduce,
+        a: &wgpu::Buffer,
+        b: &wgpu::Buffer,
+        flags: &wgpu::Buffer,
+        len: usize,
+        slot: u32,
+    ) {
+        let max = matches!(mode, Reduce::MaxDiff) as u32;
+        self.step(
+            out,
+            "reduce_design",
+            Params {
+                m: [len as u32, mode as u32, 0, 0],
+                ..Default::default()
+            },
+            &[a, b, flags, &self.partials],
             [PARTIALS as u32, 1, 1],
         );
         self.step(

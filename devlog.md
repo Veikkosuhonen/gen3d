@@ -3,6 +3,34 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: GPU optimizer memory 218 → 164 B per element (44M elements on a 10 GB card)
+
+**What:** the GPU path fits 44M elements (5.6 s per iteration) where 35M ran out of memory before.
+`optimize` prints what it allocated: "GPU memory: 7344 MB (164 B per element)".
+
+**How:**
+- Loads are lists of (DOF, value), scattered into the residual. Before, they were a dense vector per
+  load case; loads touch few nodes. −12 B/node per case.
+- The level-0 smoother no longer needs its own temporary. Chebyshev's "r −= K d" is a mode of the
+  mat-vec kernels (fine, stored levels, and level 1's restriction). Level 1, applied through the fine
+  grid, borrows two fine vectors that are idle while the V-cycle is on coarser levels. −12 B/node.
+- Coarse element matrices keep only their upper triangle (300 of 576 entries; `sym` in mg.wgsl). The
+  coarsest readback expands them. −17 B/element. Level 2 even got slightly faster (0.55 ms).
+- The filter's weight sums are computed in the filter and sensitivity kernels, which loop over the
+  neighbours anyway (no `hs` array). The design mask and the clamped-node masks come from the element
+  flags and node `free` flags (no `design`, no `emask`). −12 B/element.
+
+**Where the 164 B go:** the fine level's 7 vectors (CG r, z, p, q, the smoother's direction, the
+diagonal, u) and `free`, ~88 B; 10 per-element arrays, 40 B; level-2 matrices, 19 B; the rest
+(levels ≥ 1 vectors) ~17 B. The plan's ~100 B budget would need f16 storage for some vectors or a
+CG variant with fewer of them.
+
+**Measured:** per iteration, 2.7 s at 22.5M elements, 4.0 s at 34.6M, 5.6 s at 43.9M. Profile at 9.6M:
+CG iteration 49 ms.
+
+**Verified:** all tests pass, including the GPU-vs-CPU kernel, solve and loop tests. `bracket_editor`
+(2 load cases) is unchanged: 13.291, 4 flips against the accurate reference.
+
 ## 2026-11-13: GPU solver 2× faster (coarse-level kernels)
 
 **What:** a CG iteration at 9.6M elements went from 111 ms to 50 ms. An optimizer iteration takes

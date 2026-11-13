@@ -36,6 +36,13 @@ fn elem_node(i: u32, j: u32, k: u32, b: u32, nx: u32, ny: u32) -> u32 {
     return ((k + ((b >> 2u) & 1u)) * ny + j + ((b >> 1u) & 1u)) * nx + i + (b & 1u);
 }
 
+// position of entry (r, c) of a symmetric 24×24 matrix stored as its upper triangle (300 entries)
+fn sym(r: u32, c: u32) -> u32 {
+    let a = min(r, c);
+    let b = max(r, c);
+    return a * (49u - a) / 2u + (b - a);
+}
+
 // trilinear weight of coarse local node b at fine local node a of child c
 fn wgt(c: u32, a: u32, b: u32) -> f32 {
     var w = 1.0;
@@ -47,8 +54,8 @@ fn wgt(c: u32, a: u32, b: u32) -> f32 {
 }
 
 //// kernel apply_fine
-// y = K u on the fine grid: per node, the rows of its up to 8 elements (E_e h · ke). Non-free nodes
-// get 0.
+// y = K u (y -= K u when P.m.x == 1) on the fine grid: per node, the rows of its up to 8 elements
+// (E_e h · ke). Non-free nodes get 0.
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
 @group(0) @binding(2) var<storage, read> free: array<u32>;
 @group(0) @binding(3) var<storage, read> ke: array<f32>;
@@ -94,9 +101,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             }
         }
     }
-    y[3u * node] = acc.x;
-    y[3u * node + 1u] = acc.y;
-    y[3u * node + 2u] = acc.z;
+    // P.m.x == 1: y -= K u
+    if P.m.x == 1u {
+        y[3u * node] -= acc.x;
+        y[3u * node + 1u] -= acc.y;
+        y[3u * node + 2u] -= acc.z;
+    } else {
+        y[3u * node] = acc.x;
+        y[3u * node + 1u] = acc.y;
+        y[3u * node + 2u] = acc.z;
+    }
 }
 
 //// kernel diag_fine
@@ -138,10 +152,21 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel diag_l1
+// Level 1's diagonal from the fine `ee` and the Pᵀ (D ke D) P table (by clamped-node mask and child
+// position). P.n = fine grid.
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
-@group(0) @binding(2) var<storage, read> emask: array<u32>;
+@group(0) @binding(2) var<storage, read> free: array<u32>;
 @group(0) @binding(3) var<storage, read> T: array<f32>;
 @group(0) @binding(4) var<storage, read_write> d: array<f32>;
+
+// clamped-node mask of fine element (i, j, k): bit b set when its local node b is not free
+fn fine_mask(i: u32, j: u32, k: u32, nf: vec3<u32>) -> u32 {
+    var m = 0u;
+    for (var b = 0u; b < 8u; b++) {
+        if free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)] == 0u { m |= 1u << b; }
+    }
+    return m;
+}
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -171,7 +196,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             let fk = 2u * ek + ((c >> 2u) & 1u);
             if fi >= nf.x || fj >= nf.y || fk >= nf.z { continue; }
             let e = (fk * nf.y + fj) * nf.x + fi;
-            let base = (emask[e] * 8u + c) * 576u + (3u * a) * 25u;
+            let base = (fine_mask(fi, fj, fk, nf) * 8u + c) * 576u + (3u * a) * 25u;
             acc += ee[e] * vec3<f32>(T[base], T[base + 25u], T[base + 50u]);
         }
     }
@@ -181,8 +206,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel apply_elem
-// y = K u on a level stored as 24×24 element matrices, entry-major (mats[entry * elements + e]) so
-// that neighbouring threads read neighbouring addresses.
+// y = K u on a level stored as symmetric 24×24 element matrices: upper triangles (`sym`),
+// entry-major (mats[entry * elements + e]) so that neighbouring threads read neighbouring addresses.
 @group(0) @binding(1) var<storage, read> mats: array<f32>;
 @group(0) @binding(2) var<storage, read> u: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
@@ -213,17 +238,27 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         for (var b = 0u; b < 8u; b++) {
             let m = elem_node(ei, ej, ek, b, nx, ny);
             let um = vec3<f32>(u[3u * m], u[3u * m + 1u], u[3u * m + 2u]);
-            let r = ((3u * a) * 24u + 3u * b) * ne + e;
-            acc.x += dot(vec3<f32>(mats[r], mats[r + ne], mats[r + 2u * ne]), um);
-            let r1 = r + 24u * ne;
-            acc.y += dot(vec3<f32>(mats[r1], mats[r1 + ne], mats[r1 + 2u * ne]), um);
-            let r2 = r + 48u * ne;
-            acc.z += dot(vec3<f32>(mats[r2], mats[r2 + ne], mats[r2 + 2u * ne]), um);
+            for (var i = 0u; i < 3u; i++) {
+                let row = 3u * a + i;
+                let row3 = vec3<f32>(
+                    mats[sym(row, 3u * b) * ne + e],
+                    mats[sym(row, 3u * b + 1u) * ne + e],
+                    mats[sym(row, 3u * b + 2u) * ne + e]
+                );
+                acc[i] += dot(row3, um);
+            }
         }
     }
-    y[3u * node] = acc.x;
-    y[3u * node + 1u] = acc.y;
-    y[3u * node + 2u] = acc.z;
+    // P.m.x == 1: y -= K u
+    if P.m.x == 1u {
+        y[3u * node] -= acc.x;
+        y[3u * node + 1u] -= acc.y;
+        y[3u * node + 2u] -= acc.z;
+    } else {
+        y[3u * node] = acc.x;
+        y[3u * node + 1u] = acc.y;
+        y[3u * node + 2u] = acc.z;
+    }
 }
 
 //// kernel diag_elem
@@ -252,8 +287,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         let ek = k - dk;
         if ei >= n.x || ej >= n.y || ek >= n.z { continue; }
         let ne = n.x * n.y * n.z;
-        let r = ((3u * a) * 25u) * ne + (ek * n.y + ej) * n.x + ei;
-        acc += vec3<f32>(mats[r], mats[r + 25u * ne], mats[r + 50u * ne]);
+        let e = (ek * n.y + ej) * n.x + ei;
+        let r = 3u * a;
+        acc += vec3<f32>(mats[sym(r, r) * ne + e], mats[sym(r + 1u, r + 1u) * ne + e], mats[sym(r + 2u, r + 2u) * ne + e]);
     }
     d[3u * node] = acc.x;
     d[3u * node + 1u] = acc.y;
@@ -266,10 +302,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 // children are level-1 elements computed on the fly from the fine grid (P.n = fine grid, the output
 // is level 2); otherwise they are stored matrices (P.n = the child level's grid).
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
-@group(0) @binding(2) var<storage, read> emask: array<u32>;
+@group(0) @binding(2) var<storage, read> free: array<u32>;
 @group(0) @binding(3) var<storage, read> T: array<f32>;
 @group(0) @binding(4) var<storage, read> child: array<f32>;
 @group(0) @binding(5) var<storage, read_write> out: array<f32>;
+
+// clamped-node mask of fine element (i, j, k): bit b set when its local node b is not free
+fn fine_mask(i: u32, j: u32, k: u32, nf: vec3<u32>) -> u32 {
+    var m = 0u;
+    for (var b = 0u; b < 8u; b++) {
+        if free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)] == 0u { m |= 1u << b; }
+    }
+    return m;
+}
 
 var<workgroup> K: array<f32, 576>;
 var<workgroup> KP: array<f32, 576>;
@@ -309,11 +354,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                         let e = (fk * nf.y + fj) * nf.x + fi;
                         let w = ee[e];
                         if w != 0.0 {
-                            s += w * T[(emask[e] * 8u + c1) * 576u + idx];
+                            s += w * T[(fine_mask(fi, fj, fk, nf) * 8u + c1) * 576u + idx];
                         }
                     }
                 } else {
-                    s = child[idx * (nl.x * nl.y * nl.z) + (lk * nl.y + lj) * nl.x + li_];
+                    s = child[sym(idx / 24u, idx % 24u) * (nl.x * nl.y * nl.z) + (lk * nl.y + lj) * nl.x + li_];
                 }
             }
             K[idx] = s;
@@ -348,10 +393,15 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         }
         workgroupBarrier();
     }
-    // entry-major, like apply_elem reads it
+    // upper triangle, entry-major, like apply_elem reads it
     let nce = nc.x * nc.y * nc.z;
     for (var t = 0u; t < 9u; t++) {
-        out[(li + 64u * t) * nce + ce] = acc[t];
+        let idx = li + 64u * t;
+        let row = idx / 24u;
+        let col = idx % 24u;
+        if row <= col {
+            out[sym(row, col) * nce + ce] = acc[t];
+        }
     }
 }
 
@@ -389,9 +439,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             }
         }
     }
-    rc[3u * m] = acc.x;
-    rc[3u * m + 1u] = acc.y;
-    rc[3u * m + 2u] = acc.z;
+    // P.m.x == 1: rc -= Pᵀ r
+    if P.m.x == 1u {
+        rc[3u * m] -= acc.x;
+        rc[3u * m + 1u] -= acc.y;
+        rc[3u * m + 2u] -= acc.z;
+    } else {
+        rc[3u * m] = acc.x;
+        rc[3u * m + 1u] = acc.y;
+        rc[3u * m + 2u] = acc.z;
+    }
 }
 
 //// kernel prolong
@@ -620,4 +677,54 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         }
     }
     if P.m.x == 1u { ce[e] += s; } else { ce[e] = s; }
+}
+
+//// kernel scatter_add
+// y[idx[i]] += val[i] for the P.m.x entries (indices distinct)
+@group(0) @binding(1) var<storage, read> idx: array<u32>;
+@group(0) @binding(2) var<storage, read> val: array<f32>;
+@group(0) @binding(3) var<storage, read_write> y: array<f32>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let i = flat(wg, nwg, li);
+    if i >= P.m.x { return; }
+    y[idx[i]] += val[i];
+}
+
+//// kernel reduce_design
+// Like dot_partial, over design elements only (bit 2 of the element flags). P.m.y: 0 Σ a, 2 max
+// |a - b|, 3 count of 0.1 < a < 0.9.
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read> flags: array<u32>;
+@group(0) @binding(4) var<storage, read_write> partials: array<f32>;
+
+var<workgroup> sh: array<f32, 128>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let n = P.m.x;
+    let mode = P.m.y;
+    let is_max = mode == 2u;
+    var s = 0.0;
+    for (var i = wg.x * WG + li; i < n; i += nwg.x * WG) {
+        if (flags[i] & 4u) == 0u { continue; }
+        switch mode {
+            case 0u: { s += a[i]; }
+            case 2u: { s = max(s, abs(a[i] - b[i])); }
+            default: { if a[i] > 0.1 && a[i] < 0.9 { s += 1.0; } }
+        }
+    }
+    sh[li] = s;
+    workgroupBarrier();
+    for (var k = 64u; k > 0u; k >>= 1u) {
+        if li < k {
+            if is_max { sh[li] = max(sh[li], sh[li + k]); } else { sh[li] += sh[li + k]; }
+        }
+        workgroupBarrier();
+    }
+    if li == 0u { partials[wg.x] = sh[0]; }
 }

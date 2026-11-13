@@ -25,15 +25,40 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 //// kernel sens
 // Compliance and volume sensitivities of the design elements through the projection, divided by
 // the filter weight sums (ready for the filter's transpose); 0 elsewhere.
-// P.f = (E_min, E0, p, h), P.g.y = η, β = S[P.m.y]
+// P.f = (E_min, E0, p, h), P.g.y = η, P.g.z = rmin, β = S[P.m.y]
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
 @group(0) @binding(2) var<storage, read> xphys: array<f32>;
 @group(0) @binding(3) var<storage, read> xtilde: array<f32>;
 @group(0) @binding(4) var<storage, read> ce: array<f32>;
-@group(0) @binding(5) var<storage, read> hs: array<f32>;
-@group(0) @binding(6) var<storage, read> S: array<f32>;
-@group(0) @binding(7) var<storage, read_write> dcs: array<f32>;
-@group(0) @binding(8) var<storage, read_write> dvs: array<f32>;
+@group(0) @binding(5) var<storage, read> S: array<f32>;
+@group(0) @binding(6) var<storage, read_write> dcs: array<f32>;
+@group(0) @binding(7) var<storage, read_write> dvs: array<f32>;
+
+// the filter's weight sum at element e (Σ rmin - distance over domain elements within rmin)
+fn weight_sum(e: u32) -> f32 {
+    let n = vec3<i32>(P.n.xyz);
+    let ie = i32(e);
+    let p = vec3<i32>(ie % n.x, (ie / n.x) % n.y, ie / (n.x * n.y));
+    let rmin = P.g.z;
+    let r = i32(ceil(rmin));
+    var s = 0.0;
+    for (var dk = -r; dk <= r; dk++) {
+        let k = p.z + dk;
+        if k < 0 || k >= n.z { continue; }
+        for (var dj = -r; dj <= r; dj++) {
+            let j = p.y + dj;
+            if j < 0 || j >= n.y { continue; }
+            for (var di = -r; di <= r; di++) {
+                let i = p.x + di;
+                if i < 0 || i >= n.x { continue; }
+                let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
+                if w <= 0.0 { continue; }
+                if (flags[u32((k * n.y + j) * n.x + i)] & 1u) != 0u { s += w; }
+            }
+        }
+    }
+    return s;
+}
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -52,8 +77,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         }
         let x = xphys[e];
         let xp = select(0.0, pow(x, P.f.z - 1.0), x > 0.0);
-        dc = -P.f.z * xp * (P.f.y - P.f.x) * P.f.w * ce[e] * dproj / hs[e];
-        dv = dproj / hs[e];
+        let hs = weight_sum(e);
+        dc = -P.f.z * xp * (P.f.y - P.f.x) * P.f.w * ce[e] * dproj / hs;
+        dv = dproj / hs;
     }
     dcs[e] = dc;
     dvs[e] = dv;
@@ -61,11 +87,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 
 //// kernel filter
 // Cone filter over domain elements within P.f.x voxels (weights rmin - distance). P.m.y: 0 the raw
-// weighted sum on domain elements; 1 densities: kept-solid 1, domain sum / hs, else 0.
+// weighted sum on domain elements; 1 densities: kept-solid 1, domain the weighted mean, else 0.
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
-@group(0) @binding(2) var<storage, read> hs: array<f32>;
-@group(0) @binding(3) var<storage, read> inp: array<f32>;
-@group(0) @binding(4) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(2) var<storage, read> inp: array<f32>;
+@group(0) @binding(3) var<storage, read_write> outp: array<f32>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -87,6 +112,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let rmin = P.f.x;
     let r = i32(ceil(rmin));
     var s = 0.0;
+    var ws = 0.0;
     for (var dk = -r; dk <= r; dk++) {
         let k = p.z + dk;
         if k < 0 || k >= n.z { continue; }
@@ -99,11 +125,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                 let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
                 if w <= 0.0 { continue; }
                 let m = u32((k * n.y + j) * n.x + i);
-                if (flags[m] & 1u) != 0u { s += w * inp[m]; }
+                if (flags[m] & 1u) != 0u {
+                    s += w * inp[m];
+                    ws += w;
+                }
             }
         }
     }
-    if P.m.y == 1u { s /= hs[e]; }
+    if P.m.y == 1u { s /= ws; }
     outp[e] = s;
 }
 

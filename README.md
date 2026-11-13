@@ -399,10 +399,11 @@ watch the design form; **Stop** ends the run and keeps the last iteration.
   the same on the CPU in f64, multithreaded. Solves are looser while the design still moves a lot and
   reach full accuracy at the final β. CG needs about 8–13 iterations per solve at any grid size.
   - The default voxel keeps the bounds at about 40k elements; the bracket runs 50 iterations in 1.4 s.
-  - Per iteration on an RTX 3080: 0.14 s at 1.2M elements, 1.0 s at 9.5M, 2.7 s at 22M.
+  - Per iteration on an RTX 3080: 0.14 s at 1.2M elements, 1.0 s at 9.5M, 2.7 s at 22M, 5.6 s at
+    44M.
   - CPU multigrid: 7.7 s at 1.2M; the old Jacobi-preconditioned CG (`--solver jacobi`): 76 s.
-  - A 10 GB GPU holds about 25–30M elements (~230 B each). Past that, `optimize` says it doesn't
-    fit. The CPU solver allows 8M (~1.2 kB each).
+  - The GPU path needs 164 B per element (`optimize` prints it), so a 10 GB card holds about 45M.
+    Past that, `optimize` says it doesn't fit. The CPU solver allows 8M (~1.2 kB each).
 - **Shortcuts in this version:**
   - The `.vti` is written at full resolution, which takes seconds at tens of millions of elements;
     it is throttled to ~10% of the run time.

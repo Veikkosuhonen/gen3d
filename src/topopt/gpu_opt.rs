@@ -28,8 +28,6 @@ const MAX_CASES: usize = 24;
 /// Element arrays on the GPU.
 struct Fields {
     flags: wgpu::Buffer,
-    design: wgpu::Buffer,
-    hs: wgpu::Buffer,
     x: wgpu::Buffer,
     xnew: wgpu::Buffer,
     xtilde: wgpu::Buffer,
@@ -77,7 +75,6 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
             d as u32 | (k as u32) << 1 | ((d && !k) as u32) << 2
         })
         .collect();
-    let design: Vec<f32> = flags.iter().map(|f| (f & 4 != 0) as u32 as f32).collect();
     let x0: Vec<f32> = (0..ne)
         .map(|i| {
             if p.passive[i] {
@@ -92,8 +89,6 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
     let f = gpu
         .alloc_scoped(|| Fields {
             flags: e.init("flags", bytemuck::cast_slice(&flags)),
-            design: e.init("design", bytemuck::cast_slice(&design)),
-            hs: e.buf("hs", ne),
             x: e.init("x", bytemuck::cast_slice(&x0)),
             xnew: e.buf("xnew", ne),
             xtilde: e.buf("xtilde", ne),
@@ -104,7 +99,12 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
             dv: e.buf("dv", ne),
         })
         .map_err(oom)?;
-    drop((flags, design, x0));
+    drop((flags, x0));
+    println!(
+        "GPU memory: {:.0} MB ({:.0} B per element)",
+        e.allocated() as f64 / 1e6,
+        e.allocated() as f64 / ne as f64
+    );
     let emin = s.e0 * s.emin;
     let elem = |out: &mut Vec<Step>, kernel: &str, pf: [f32; 4], m: [u32; 4], bufs: &[&wgpu::Buffer]| {
         e.step(
@@ -114,7 +114,7 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
                 n: dims4(p.n),
                 m: [ne as u32, m[1], m[2], m[3]],
                 f: pf,
-                g: [0.0, 0.5, 0.0, 0.0], // η = 0.5
+                g: [0.0, 0.5, s.rmin as f32, 0.0], // η = 0.5, rmin
             },
             bufs,
             threads(ne),
@@ -124,7 +124,7 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
     let rmin = [s.rmin as f32, 0.0, 0.0, 0.0];
     // filter: mode 0 raw sums, 1 densities
     let filter = |out: &mut Vec<Step>, mode: u32, inp: &wgpu::Buffer, outp: &wgpu::Buffer| {
-        elem(out, "filter", rmin, [0, mode, 0, 0], &[&f.flags, &f.hs, inp, outp])
+        elem(out, "filter", rmin, [0, mode, 0, 0], &[&f.flags, inp, outp])
     };
     // xin -> xtilde -> xphys
     let densities = |out: &mut Vec<Step>, xin: &wgpu::Buffer| {
@@ -138,14 +138,6 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         );
     };
 
-    // filter weight sums: the raw filter of ones
-    {
-        let ones = e.init("ones", bytemuck::cast_slice(&vec![1f32; ne]));
-        let mut prog = vec![];
-        // mode 0 doesn't read hs; bind `ones` in its place so hs is only written
-        elem(&mut prog, "filter", rmin, [0; 4], &[&f.flags, &ones, &ones, &f.hs]);
-        e.run(&[&prog])?;
-    }
     let mut prog_init = vec![];
     densities(&mut prog_init, &f.x);
     let mut prog_stiffness = vec![];
@@ -172,13 +164,11 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         "sens",
         material,
         [0, BETA, 0, 0],
-        &[
-            &f.flags, &f.xphys, &f.xtilde, &mg.ce, &f.hs, &e.scalars, &f.xnew, &f.dvs,
-        ],
+        &[&f.flags, &f.xphys, &f.xtilde, &mg.ce, &e.scalars, &f.xnew, &f.dvs],
     );
     filter(&mut prog_sens, 0, &f.xnew, &f.dc);
     filter(&mut prog_sens, 0, &f.dvs, &f.dv);
-    e.reduce(&mut prog_sens, Reduce::Grey, &f.xphys, &f.xphys, &f.design, ne, GREY);
+    e.reduce_design(&mut prog_sens, Reduce::Grey, &f.xphys, &f.xphys, &f.flags, ne, GREY);
     let nn = active.len();
     for (c, u) in mg.us.iter().enumerate() {
         e.reduce(&mut prog_sens, Reduce::MaxNorm, u, u, u, nn, MAXD + c as u32);
@@ -192,9 +182,9 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         &[&f.flags, &f.x, &f.dc, &f.dv, &e.scalars, &f.xnew],
     );
     densities(&mut prog_oc, &f.xnew);
-    e.dot(&mut prog_oc, &f.xphys, &f.design, None, ne, VOL);
+    e.reduce_design(&mut prog_oc, Reduce::Dot, &f.xphys, &f.xphys, &f.flags, ne, VOL);
     let mut prog_accept = vec![];
-    e.reduce(&mut prog_accept, Reduce::MaxDiff, &f.xnew, &f.x, &f.design, ne, CHANGE);
+    e.reduce_design(&mut prog_accept, Reduce::MaxDiff, &f.xnew, &f.x, &f.flags, ne, CHANGE);
     e.lin(&mut prog_accept, &f.x, &f.xnew, None, (0.0, NONE), (1.0, NONE), ne);
     let mut prog_project = vec![];
     elem(
