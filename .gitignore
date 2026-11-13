@@ -3,3 +3,6 @@
 
 # gen3d outputs
 out/
+
+.DS_Store
+
