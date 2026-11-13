@@ -3,6 +3,48 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: Smoother meshes of optimized results
+
+**Why blocky:** the optimizer wrote only the projected density. At β = 32 that is nearly binary, so
+marching cubes put every vertex at an edge midpoint: voxel terraces with 45° chamfers at any
+resolution.
+
+**What:**
+- **Mesh the filtered density.** Full .vti writes gain a cell array `density_filtered`: x̃ before the
+  Heaviside projection, NaN outside the design domain. The projection maps x̃ = 0.5 to 0.5, so its 0.5
+  surface is the same design boundary, but x̃ varies smoothly across it. When `density` is shown,
+  `Volume` takes the surface (preview and mesh) from x̃; the histogram stays on `density`. Live
+  previews on large grids stay density-only. Older files without the array mesh as before.
+- **Flat faces on the domain's edge.** Between a domain cell and a non-domain cell (or the padding
+  beyond the grid), x̃ doesn't locate the surface: it depends on the material nearby, and meshing it
+  gave wavy faces inset by up to 1/3 cell (the bracket lost 1 cm³ that way). Marching-cubes vertices
+  on those edges now go to the edge midpoint, the cell face. Before this, the grid box cap sat 0–1/3
+  cell short of the box.
+- **Taubin smoothing** (`Mesh::smooth`, λ = 0.5, μ = −0.53, uniform weights): `export --smooth N` for
+  .vti grids (default 10, 0 = off), and a "smoothing" slider in the app's Print step for grids.
+- **Kept inside the domain.** μ steps overshoot at convex rims and pushed flat domain faces outward by
+  ~0.1 cell, past the domain. After each pass, vertices outside the 0.5 level of the trilinear domain
+  indicator are moved back onto it by Newton steps (`Volume::domain_constraint`). This is one-sided:
+  vertices may still move inward.
+
+**Result (bracket_editor, 0.71 mm, 79k triangles):** p90 dihedral angle between neighbouring faces
+39° before, 21° with x̃, 10° with x̃ and 10 passes. Size and volume unchanged (76.04 × 24.14 × 39.76 mm,
+26.7 cm³). Smoothing takes 0.01 s.
+
+**Still open:**
+- Free design surfaces (not on the domain's edge) can still overshoot ~0.1 cell at rims: the pin
+  boss's end face moved out 0.07 mm.
+- Kept-solid (passive) regions are smoothed like the rest. Their crisp edges should come from the
+  design's own SDF.
+- Faint dimples remain where x̃ itself has features a few cells wide. Projecting vertices back onto the
+  x̃ surface would bound their deviation from it.
+
+**Verified:** tests `smoothing_evens_out_steps_and_keeps_volume` (voxel-stepped sphere: radius spread
+halved, volume within 1%, watertight) and `filtered_density_gives_a_smooth_surface_inside_the_domain`
+(slope on its plane within 0.02 voxel, flat face exactly on the domain's edge, smoothing stays inside
+it). `gpu_loop_matches_cpu_loop` passes. Renders before and after compared by eye. clippy clean.
+`prims::tests::shapes_with_primitives_compile` fails, as it already did before this change.
+
 ## 2026-11-13: Default element count 300k on the GPU
 
 **What:** with the GPU solver, the automatic element size now aims for ~300k elements in the bounds,

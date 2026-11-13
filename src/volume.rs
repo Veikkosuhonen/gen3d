@@ -52,6 +52,11 @@ pub struct Volume {
     dims: [usize; 3],
     /// the shown array on its lattice (vector arrays as magnitudes)
     values: Vec<f32>,
+    /// the field the surface is taken from when it is not `values` (`FILTERED` for `density`, with
+    /// 0 outside the domain)
+    surf: Option<Vec<f32>>,
+    /// samples in the design domain (from `FILTERED`'s NaNs); `None` = all
+    domain: Option<Vec<bool>>,
     pub range: (f32, f32),
     /// smooth signed distance per sample
     pub sd: Vec<f32>,
@@ -66,6 +71,13 @@ pub struct Volume {
     /// histogram of the shown array over `range`
     pub hist: Vec<u32>,
 }
+
+/// The optimizer's filtered densities (x̃ before the Heaviside projection). Where a file has it, the
+/// surface of `density` is taken from it: x̃ = 0.5 is the same boundary as density = 0.5 (the
+/// projection maps 0.5 to 0.5), but x̃ varies smoothly across it, so the surface is placed between
+/// samples instead of following the voxels in steps. It is NaN outside the design domain, which
+/// keeps mesh smoothing inside the domain (`Volume::domain_constraint`).
+pub const FILTERED: &str = "density_filtered";
 
 /// Histogram bins for the Volume panel.
 pub const HIST_BINS: usize = 64;
@@ -116,6 +128,8 @@ impl Volume {
             spacing: [1.0; 3],
             dims: [1; 3],
             values: vec![],
+            surf: None,
+            domain: None,
             range: (0.0, 0.0),
             sd: vec![],
             blk: vec![],
@@ -145,6 +159,25 @@ impl Volume {
         (self.origin, self.dims) = self.file.lattice(a.cell);
         self.spacing = self.file.spacing.map(f64::abs);
         self.values = scalars(a);
+        self.surf = (a.name == "density")
+            .then(|| {
+                self.file
+                    .arrays
+                    .iter()
+                    .find(|f| f.name == FILTERED && f.cell == a.cell && f.comps == 1 && f.data.len() == a.data.len())
+            })
+            .flatten()
+            .map(scalars);
+        self.domain = self
+            .surf
+            .as_ref()
+            .filter(|f| f.iter().any(|v| v.is_nan()))
+            .map(|f| f.iter().map(|v| !v.is_nan()).collect());
+        if let Some(f) = &mut self.surf {
+            for v in f.iter_mut().filter(|v| v.is_nan()) {
+                *v = 0.0;
+            }
+        }
         self.range = finite_range(&self.values);
         let (lo, hi) = self.range;
         self.hist = vec![0; HIST_BINS];
@@ -165,6 +198,11 @@ impl Volume {
         self.color.map(|c| self.file.arrays[c].name.as_str())
     }
 
+    /// The values the surface is taken from (see `FILTERED`).
+    fn field(&self) -> &[f32] {
+        self.surf.as_deref().unwrap_or(&self.values)
+    }
+
     fn inside(&self, v: f32) -> bool {
         if self.below { v < self.iso } else { v > self.iso }
     }
@@ -178,7 +216,7 @@ impl Volume {
         let [nx, ny, nz] = self.dims;
         let s = self.spacing;
         let n = self.count();
-        let inside: Vec<bool> = self.values.iter().map(|&v| self.inside(v)).collect();
+        let inside: Vec<bool> = self.field().iter().map(|&v| self.inside(v)).collect();
         self.inside_count = inside.iter().filter(|b| **b).count();
         let outside: Vec<bool> = inside.iter().map(|b| !b).collect();
         let to_in = edt(&inside, self.dims, s);
@@ -193,7 +231,7 @@ impl Volume {
         let smin = s.iter().cloned().fold(f64::MAX, f64::min) as f32;
         let diag = s.iter().map(|v| v * v).sum::<f64>().sqrt() as f32;
         let idx = |x: usize, y: usize, z: usize| (z * ny + y) * nx + x;
-        let vals = &self.values;
+        let vals = self.field();
         let sign_out = if self.below { 1.0 } else { -1.0 }; // (v - iso) * sign_out > 0 outside
         let mut sd = vec![0f32; n];
         for z in 0..nz {
@@ -338,6 +376,9 @@ impl Volume {
         let op = if self.below { "<" } else { ">" };
         let mode = if self.blocky { "blocky" } else { "smooth" };
         let mut s = format!("{} {op} {:.4} ({mode})", self.array_name(), self.iso);
+        if self.surf.is_some() && !self.blocky {
+            s += &format!(" surface from {FILTERED}");
+        }
         if let Some(c) = self.color_name() {
             let (a, b) = self.crange();
             s += &format!(" colour: {c} {a:.3}..{b:.3}");
@@ -349,6 +390,12 @@ impl Volume {
 impl Volume {
     /// Marching-cubes mesh of the threshold surface (linear interpolation of the array, like the
     /// smooth view). The grid is padded with an outside layer so the mesh is always closed.
+    ///
+    /// For cell arrays the samples are cell centres and each is a cell of the design domain or not
+    /// (`domain`; the padding is not). Where the solid ends at the domain's edge, the field doesn't
+    /// say where between the two samples the surface is (x̃ there depends on the material nearby),
+    /// but the domain does: on the cell face. So vertices on such edges go to the edge's midpoint,
+    /// and the part ends in flat faces on the domain boundary and the grid box.
     pub fn mesh(&self) -> Result<crate::mesh::Mesh> {
         if self.inside_count == 0 {
             bail!(
@@ -359,12 +406,13 @@ impl Volume {
         }
         let [nx, ny, nz] = self.dims;
         let p = [nx + 2, ny + 2, nz + 2];
+        let field = self.field();
         // f < 0 inside; mc wants z-fastest order
         let mut vol = vec![1f32; p[0] * p[1] * p[2]];
         for z in 0..nz {
             for y in 0..ny {
                 for x in 0..nx {
-                    let v = self.values[(z * ny + y) * nx + x];
+                    let v = field[(z * ny + y) * nx + x];
                     let f = if self.below { v - self.iso } else { self.iso - v };
                     vol[((x + 1) * p[1] + y + 1) * p[2] + z + 1] = if f.is_finite() { f } else { 1.0 };
                 }
@@ -378,12 +426,84 @@ impl Volume {
             step: 1.0,
         };
         let mut mesh = crate::mesher::polygonize(grid)?;
+        if self.file.arrays[self.array].cell {
+            let in_domain = |i: [i64; 3]| {
+                (0..3).all(|k| i[k] >= 0 && i[k] < self.dims[k] as i64)
+                    && self
+                        .domain
+                        .as_ref()
+                        .is_none_or(|d| d[((i[2] as usize) * ny + i[1] as usize) * nx + i[0] as usize])
+            };
+            for v in &mut mesh.verts {
+                // a marching-cubes vertex lies on a lattice edge: two whole coordinates
+                let frac: Vec<usize> = (0..3).filter(|&k| (v[k] - v[k].round()).abs() > 1e-4).collect();
+                let &[k] = frac.as_slice() else { continue };
+                let mut a: [i64; 3] = std::array::from_fn(|j| v[j].round() as i64);
+                a[k] = v[k].floor() as i64;
+                let mut b = a;
+                b[k] += 1;
+                if in_domain(a) != in_domain(b) {
+                    v[k] = a[k] as f32 + 0.5;
+                }
+            }
+        }
         for v in &mut mesh.verts {
             for (k, c) in v.iter_mut().enumerate() {
                 *c = (self.origin[k] + *c as f64 * self.spacing[k]) as f32;
             }
         }
         Ok(mesh)
+    }
+
+    /// For `Mesh::smooth` of a cell array's mesh: moves a vertex that left the region it may occupy
+    /// (the design domain, else the grid box) back onto its boundary. The region is the 0.5 level of
+    /// the trilinear domain indicator (1 in, 0 out, 0 beyond the grid), which runs along the cell
+    /// faces: the same place `mesh` puts the surface where the solid meets the domain's edge. A few
+    /// Newton steps along the indicator's gradient; vertices inside are left alone.
+    pub fn domain_constraint(&self) -> Option<impl Fn(&mut [f32; 3]) + Sync + use<>> {
+        if !self.file.arrays[self.array].cell {
+            return None;
+        }
+        let [nx, ny, nz] = self.dims;
+        let p = [nx + 2, ny + 2, nz + 2];
+        let mut g = vec![0f32; p[0] * p[1] * p[2]];
+        for z in 0..nz {
+            for y in 0..ny {
+                for x in 0..nx {
+                    let i = (z * ny + y) * nx + x;
+                    if self.domain.as_ref().is_none_or(|d| d[i]) {
+                        g[((z + 1) * p[1] + y + 1) * p[0] + x + 1] = 1.0;
+                    }
+                }
+            }
+        }
+        let (o, h) = (self.origin, self.spacing);
+        Some(move |v: &mut [f32; 3]| {
+            // padded lattice coordinates
+            let mut q: [f64; 3] = std::array::from_fn(|k| (v[k] as f64 - o[k]) / h[k] + 1.0);
+            let mut moved = false;
+            for _ in 0..4 {
+                let (val, grad) = trilinear_grad(&g, p, q);
+                if val >= 0.5 {
+                    break;
+                }
+                let gg: f64 = grad.iter().map(|c| c * c).sum();
+                if gg < 1e-12 {
+                    break;
+                }
+                // aim slightly inside, so the vertex isn't left a rounding error outside
+                let s = (0.5 + 1e-4 - val) / gg;
+                for k in 0..3 {
+                    q[k] += s * grad[k];
+                }
+                moved = true;
+            }
+            if moved {
+                for k in 0..3 {
+                    v[k] = (o[k] + (q[k] - 1.0) * h[k]) as f32;
+                }
+            }
+        })
     }
 }
 
@@ -413,6 +533,32 @@ fn trilinear(v: &[f32], d: [usize; 3], q: [f64; 3]) -> f32 {
     let lerp = |a: f32, b: f32, t: f32| a + (b - a) * t;
     let c = |dy: usize, dz: usize| lerp(at(x, y + dy, z + dz), at(x + 1, y + dy, z + dz), f[0]);
     lerp(lerp(c(0, 0), c(1, 0), f[1]), lerp(c(0, 1), c(1, 1), f[1]), f[2])
+}
+
+/// Trilinear value and gradient (per lattice unit) of an x-fastest grid at lattice point `q`;
+/// 0 outside the grid.
+fn trilinear_grad(v: &[f32], d: [usize; 3], q: [f64; 3]) -> (f64, [f64; 3]) {
+    if (0..3).any(|k| q[k] < 0.0 || q[k] > (d[k] - 1) as f64) {
+        return (0.0, [0.0; 3]);
+    }
+    let i: [usize; 3] = std::array::from_fn(|k| (q[k].floor() as usize).min(d[k] - 2));
+    let t: [f64; 3] = std::array::from_fn(|k| q[k] - i[k] as f64);
+    let at = |a: usize, b: usize, c: usize| v[((i[2] + c) * d[1] + i[1] + b) * d[0] + i[0] + a] as f64;
+    let (mut val, mut g) = (0.0, [0.0; 3]);
+    for c in 0..2 {
+        for b in 0..2 {
+            for a in 0..2 {
+                let f = at(a, b, c);
+                let w = |k: usize, s: usize| if s == 1 { t[k] } else { 1.0 - t[k] };
+                let dw = |s: usize| if s == 1 { 1.0 } else { -1.0 };
+                val += f * w(0, a) * w(1, b) * w(2, c);
+                g[0] += f * dw(a) * w(1, b) * w(2, c);
+                g[1] += f * w(0, a) * dw(b) * w(2, c);
+                g[2] += f * w(0, a) * w(1, b) * dw(c);
+            }
+        }
+    }
+    (val, g)
 }
 
 /// Exact Euclidean distance from every sample to the nearest sample with `seed` set (separable
@@ -627,5 +773,79 @@ mod tests {
             assert!((got as f64 - want).abs() < 1e-4, "{i}: {got} vs {want}");
         }
         assert!(edt(&vec![false; n], dims, sp).iter().all(|v| v.is_infinite()));
+    }
+
+    /// An optimizer-style result: a solid under the slope z = 0.3 x + 3, binary `density` and a
+    /// linear `density_filtered`, with cells x >= 20 outside the domain (NaN).
+    fn slope_vti(path: &Path) {
+        let n = [24usize, 16, 16];
+        let plane = |x: f32| 0.3 * x + 3.0;
+        let (mut dens, mut filt) = (vec![], vec![]);
+        for k in 0..n[2] {
+            for _j in 0..n[1] {
+                for i in 0..n[0] {
+                    let (x, z) = (i as f32 + 0.5, k as f32 + 0.5);
+                    let t = (0.5 + (plane(x) - z) / 3.0).clamp(0.0, 1.0);
+                    let inside_domain = i < 20;
+                    dens.push(if inside_domain && t > 0.5 { 1.0 } else { 0.0 });
+                    filt.push(if inside_domain { t } else { f32::NAN });
+                }
+            }
+        }
+        let arr = |name, data| crate::vti::GridArray {
+            name,
+            cell: true,
+            comps: 1,
+            data,
+        };
+        crate::vti::write_grid(
+            path,
+            [0.0; 3],
+            1.0,
+            n.map(|v| v + 1),
+            &[arr("density", &dens), arr(FILTERED, &filt)],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn filtered_density_gives_a_smooth_surface_inside_the_domain() {
+        let dir = std::env::temp_dir().join(format!("gen3d-slope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slope.vti");
+        slope_vti(&path);
+        let vol = Volume::load(&path, &VolumeOpts::default()).unwrap();
+        assert!(vol.label().contains(FILTERED), "{}", vol.label());
+        let mut m = vol.mesh().unwrap();
+        assert!(m.is_watertight());
+
+        // the slope away from the edges: on the plane (binary density would leave 0.5-voxel steps)
+        let off_plane = |m: &crate::mesh::Mesh| {
+            m.verts
+                .iter()
+                .filter(|v| v[0] > 3.0 && v[0] < 17.0 && v[1] > 3.0 && v[1] < 13.0 && v[2] > 1.0)
+                .map(|v| (v[2] - (0.3 * v[0] + 3.0)).abs())
+                .fold(0.0f32, f32::max)
+        };
+        assert!(off_plane(&m) < 0.02, "{}", off_plane(&m));
+        // where it reaches the domain's edge: a flat face on the cell faces at x = 20
+        let x_max = m.verts.iter().map(|v| v[0]).fold(f32::MIN, f32::max);
+        assert!((x_max - 20.0).abs() < 1e-4, "{x_max}");
+        assert!(
+            m.verts
+                .iter()
+                .filter(|v| v[0] > 19.5)
+                .all(|v| (v[0] - 20.0).abs() < 1e-4)
+        );
+
+        let v0 = m.volume();
+        let c = vol.domain_constraint().unwrap();
+        m.smooth(10, Some(&c));
+        assert!(m.is_watertight());
+        let x_max = m.verts.iter().map(|v| v[0]).fold(f32::MIN, f32::max);
+        assert!(x_max < 20.0 + 1e-3, "smoothing left the domain: x = {x_max}");
+        assert!(off_plane(&m) < 0.05, "{}", off_plane(&m));
+        assert!((m.volume() / v0 - 1.0).abs() < 0.01, "volume {v0} -> {}", m.volume());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

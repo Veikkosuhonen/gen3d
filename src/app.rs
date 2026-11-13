@@ -189,6 +189,8 @@ struct PrintUi {
     voxel: Option<f32>,
     /// keep this fraction of triangles; None = the shape's `//! decimate` (or all)
     decimate: Option<f32>,
+    /// Taubin smoothing passes for a grid's mesh; None = the default (`mesher::DEFAULT_SMOOTH`)
+    smooth: Option<u32>,
     three_mf: bool,
     /// None = automatic (the shape's `//! slicer`, else printers/default.ini, else slicer defaults)
     profile: Option<PathBuf>,
@@ -204,6 +206,7 @@ impl Default for PrintUi {
         PrintUi {
             voxel: None,
             decimate: None,
+            smooth: None,
             three_mf: false,
             profile: None,
             profiles: vec![],
@@ -1667,6 +1670,9 @@ impl App {
                 Some(false) => a.push("--above".into()),
                 None => {}
             }
+            if let Some(n) = self.print.smooth {
+                a.extend(["--smooth".into(), n.to_string()]);
+            }
         } else {
             for (k, v) in &self.defines {
                 a.extend(["-D".into(), format!("{k}={v}")]);
@@ -2775,6 +2781,23 @@ impl App {
             } else {
                 ui.weak("(change the threshold in Optimize)");
             }
+            ui.horizontal(|ui| {
+                ui.label("smoothing");
+                let mut n = self.print.smooth.unwrap_or(crate::mesher::DEFAULT_SMOOTH);
+                if ui
+                    .add(egui::Slider::new(&mut n, 0..=50).suffix(" passes"))
+                    .on_hover_text(
+                        "Taubin smoothing of the mesh: evens out the voxel steps without shrinking the part; \
+                         faces on the design domain's edge stay in place (0 = off)",
+                    )
+                    .changed()
+                {
+                    self.print.smooth = Some(n);
+                }
+                if self.print.smooth.is_some() && ui.small_button("default").clicked() {
+                    self.print.smooth = None;
+                }
+            });
         } else if let Some(shape) = self.design_shape.clone() {
             egui::Grid::new("mesh").num_columns(2).show(ui, |ui| {
                 ui.label("voxel");

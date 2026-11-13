@@ -239,6 +239,9 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         let h3 = (p.h * p.h * p.h) as f32;
         Ok(Snapshot {
             density: e.read_f32(&f.xused, ne)?,
+            // x̃ of the same densities during the run (the OC step hasn't replaced it yet); after
+            // the loop it is one OC update newer than `xused`, a small difference
+            filtered: output::filtered_out(p, e.read_f32(&f.xtilde, ne)?.into_iter()),
             energy: ee.iter().zip(&ce).map(|(a, b)| 0.5 * a * b / h3).collect(),
             disps: (0..mg.us.len()).map(|c| mg.displacement(c)).collect::<Result<_>>()?,
         })
@@ -289,6 +292,7 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
                 // a preview: only the densities come back
                 output.live(Snapshot {
                     density: e.read_f32(&f.xused, ne)?,
+                    filtered: vec![],
                     energy: vec![],
                     disps: vec![],
                 });

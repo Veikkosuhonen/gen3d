@@ -681,8 +681,8 @@ const CG_MAXIT: usize = 20_000;
 /// z = M⁻¹ r
 type Precond<'a> = dyn FnMut(&[f64], &mut [f64]) + 'a;
 
-/// Run the optimization, writing the design to `out` (cell `density`, cell `energy` in MPa, point
-/// `displacement` in mm). The file is rewritten as often as keeps writing under ~10% of the run
+/// Run the optimization, writing the design to `out` (cell `density`, cell `density_filtered` (x̃,
+/// what gets meshed), cell `energy` in MPa, point `displacement` in mm). The file is rewritten as often as keeps writing under ~10% of the run
 /// time (every iteration on small grids), and always after the last iteration.
 pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Result<Outcome> {
     output::catch_stop();
@@ -840,6 +840,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         let dc = filter.sensitivities(p, &dc);
         let dv = filter.sensitivities(p, &dproj);
         let used_xphys = xphys.clone();
+        let used_xtilde = xtilde.clone();
 
         // optimality criteria: bisect the Lagrange multiplier to meet the volume. With dc scaled by
         // the compliance, λ is O(1) and moves little between iterations, so the search starts from
@@ -905,6 +906,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         let t3 = Instant::now();
         let snap = Snapshot {
             density: used_xphys.iter().map(|&v| v as f32).collect(),
+            filtered: output::filtered_out(p, used_xtilde.iter().map(|&v| v as f32)),
             energy: (0..ne)
                 .map(|e| (0.5 * fem.ee[e] * ce[e] / p.h.powi(3)) as f32)
                 .collect(),
@@ -917,6 +919,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
             } else {
                 output.live(Snapshot {
                     density: snap.density.clone(),
+                    filtered: vec![],
                     energy: vec![],
                     disps: vec![],
                 });

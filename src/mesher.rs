@@ -234,6 +234,9 @@ pub fn build_mesh(shape: &Shape, voxel: Option<f32>, decimate: Option<f32>) -> R
     Ok(decimate_checked(mesh, decimate))
 }
 
+/// Taubin smoothing passes for meshes of .vti grids (`Mesh::smooth`).
+pub const DEFAULT_SMOOTH: u32 = 10;
+
 /// Decimate to fraction `decimate` of the triangles, unless that breaks watertightness.
 pub fn decimate_checked(mut mesh: Mesh, decimate: Option<f32>) -> Mesh {
     if let Some(f) = decimate.filter(|f| *f > 0.0 && *f < 1.0) {

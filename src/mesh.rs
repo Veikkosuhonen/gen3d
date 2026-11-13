@@ -6,6 +6,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+/// Applied to each vertex after a smoothing pass (`Mesh::smooth`).
+pub type VertexConstraint = dyn Fn(&mut [f32; 3]) + Sync;
+
 #[derive(Default, Clone)]
 pub struct Mesh {
     pub verts: Vec<[f32; 3]>,
@@ -171,6 +174,74 @@ impl Mesh {
         }
     }
 
+    /// Taubin λ|μ smoothing (Taubin 1995): `passes` pairs of a shrinking Laplacian step (λ) and an
+    /// inflating one (μ < -λ). Together they remove the high-frequency ripple of marching cubes on a
+    /// voxel grid while keeping the shape's size, unlike plain Laplacian smoothing, which shrinks
+    /// it. Uniform weights, so the steps also even out the triangles' sizes along the surface.
+    ///
+    /// `constrain` is applied to every vertex after each pass, e.g. to keep it inside a region: the
+    /// inflating step overshoots at convex rims, pushing flat faces next to them outward by a
+    /// fraction of an edge. Only vertices move: the connectivity, and with it watertightness, is
+    /// unchanged.
+    pub fn smooth(&mut self, passes: u32, constrain: Option<&VertexConstraint>) {
+        use rayon::prelude::*;
+        const LAMBDA: f32 = 0.5;
+        const MU: f32 = -0.53;
+        if passes == 0 || self.tris.is_empty() {
+            return;
+        }
+        let nv = self.verts.len();
+        // neighbours of each vertex (CSR), from the edges of the triangles
+        let mut edges: Vec<(u32, u32)> = Vec::with_capacity(self.tris.len() * 6);
+        for t in &self.tris {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                edges.push((a, b));
+                edges.push((b, a));
+            }
+        }
+        edges.par_sort_unstable();
+        edges.dedup();
+        let mut start = vec![0usize; nv + 1];
+        for &(a, _) in &edges {
+            start[a as usize + 1] += 1;
+        }
+        for i in 0..nv {
+            start[i + 1] += start[i];
+        }
+        let nbrs: Vec<u32> = edges.iter().map(|e| e.1).collect();
+        drop(edges);
+        let mut next = self.verts.clone();
+        for _ in 0..passes {
+            for f in [LAMBDA, MU] {
+                let cur = &self.verts;
+                next.par_iter_mut().enumerate().for_each(|(i, out)| {
+                    let ns = &nbrs[start[i]..start[i + 1]];
+                    let v = cur[i];
+                    if ns.is_empty() {
+                        *out = v;
+                        return;
+                    }
+                    let mut c = [0f32; 3];
+                    for &n in ns {
+                        let q = cur[n as usize];
+                        for k in 0..3 {
+                            c[k] += q[k];
+                        }
+                    }
+                    let inv = 1.0 / ns.len() as f32;
+                    for k in 0..3 {
+                        out[k] = v[k] + f * (c[k] * inv - v[k]);
+                    }
+                });
+                std::mem::swap(&mut self.verts, &mut next);
+            }
+            if let Some(c) = constrain {
+                self.verts.par_iter_mut().for_each(c);
+            }
+        }
+    }
+
     /// Edge collapses can squash a thin region into two back-to-back triangles on the same three
     /// vertices, leaving non-manifold edges around them. Deleting both triangles of each such pair
     /// removes the zero-volume fold and usually restores a closed 2-manifold.
@@ -320,5 +391,43 @@ impl Mesh {
         drop(w);
         zip.finish()?.flush()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Marching cubes of a sphere from a voxel-quantized field (each sample rounded to whole
+    /// voxels, so the surface has voxel steps): smoothing removes the steps without shrinking it.
+    #[test]
+    fn smoothing_evens_out_steps_and_keeps_volume() {
+        let n = 40;
+        let c = 19.5;
+        let r = 14.0f32;
+        let mut vol = vec![0f32; n * n * n];
+        for x in 0..n {
+            for y in 0..n {
+                for z in 0..n {
+                    let p = [x, y, z].map(|v| v as f32 - c);
+                    let d = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt() - r;
+                    vol[(x * n + y) * n + z] = if d < 0.0 { -0.5 } else { 0.5 };
+                }
+            }
+        }
+        let mut m = crate::mc::polygonize(&vol, [n, n, n], [0.0; 3], 1.0);
+        let spread = |m: &super::Mesh| {
+            let rs: Vec<f32> = m
+                .verts
+                .iter()
+                .map(|v| v.iter().map(|q| (q - c) * (q - c)).sum::<f32>().sqrt())
+                .collect();
+            let mean = rs.iter().sum::<f32>() / rs.len() as f32;
+            (rs.iter().map(|r| (r - mean).powi(2)).sum::<f32>() / rs.len() as f32).sqrt()
+        };
+        let (s0, v0) = (spread(&m), m.volume());
+        m.smooth(10, None);
+        let (s1, v1) = (spread(&m), m.volume());
+        assert!(m.is_watertight());
+        assert!(s1 < 0.5 * s0, "radius spread {s0} -> {s1}");
+        assert!((v1 / v0 - 1.0).abs() < 0.01, "volume {v0} -> {v1}");
     }
 }

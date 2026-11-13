@@ -186,6 +186,9 @@ struct MeshArgs {
     /// keep this fraction of triangles (0-1)
     #[arg(long)]
     decimate: Option<f32>,
+    /// .vti: Taubin smoothing passes on the mesh (0 = off; default 10)
+    #[arg(long)]
+    smooth: Option<u32>,
     #[arg(long, value_enum, default_value = "stl")]
     format: Format,
 }
@@ -423,6 +426,9 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
     if ext.is_some() && m.format == Format::Vti {
         bail!("--format vti only applies to `export`");
     }
+    if m.smooth.is_some() {
+        bail!("--smooth applies to .vti grids (shapes are meshed from their exact distance field)");
+    }
     let decimate = m.decimate.or(shape.decimate());
     let mesh = mesher::build_mesh(&shape, m.voxel, decimate)?;
     mesher::report(&mesh);
@@ -460,12 +466,20 @@ fn export_volume(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option
         vol.inside_count,
         vol.count()
     );
-    let mesh = mesher::decimate_checked(vol.mesh()?, m.decimate);
+    let mut mesh = vol.mesh()?;
     println!(
         "marching cubes in {:.2}s: {} triangles",
         t0.elapsed().as_secs_f64(),
         mesh.tris.len()
     );
+    let passes = m.smooth.unwrap_or(mesher::DEFAULT_SMOOTH);
+    if passes > 0 {
+        let t1 = std::time::Instant::now();
+        let constraint = vol.domain_constraint();
+        mesh.smooth(passes, constraint.as_ref().map(|c| c as &mesh::VertexConstraint));
+        println!("smoothed ({passes} passes) in {:.2}s", t1.elapsed().as_secs_f64());
+    }
+    let mesh = mesher::decimate_checked(mesh, m.decimate);
     mesher::report(&mesh);
     let shape = vol.shape(&s.shape);
     let out = match (ext, output) {

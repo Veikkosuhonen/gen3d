@@ -41,6 +41,14 @@ pub(super) fn catch_stop() {
     }
 }
 
+/// x̃ as written: NaN outside the domain (see `Snapshot::filtered`).
+pub(super) fn filtered_out(p: &Problem, xtilde: impl Iterator<Item = f32>) -> Vec<f32> {
+    xtilde
+        .zip(&p.domain)
+        .map(|(v, &d)| if d { v } else { f32::NAN })
+        .collect()
+}
+
 pub(super) fn stop_requested() -> bool {
     STOP.load(Ordering::SeqCst)
 }
@@ -55,9 +63,14 @@ struct Grid {
     names: Vec<String>,
 }
 
-/// One iteration's output fields (`energy` and `disps` empty for a density-only preview).
+/// One iteration's output fields (`filtered`, `energy` and `disps` empty for a density-only
+/// preview).
 pub(super) struct Snapshot {
     pub density: Vec<f32>,
+    /// the filtered densities x̃ before projection: smooth where `density` is nearly binary, with
+    /// the same 0.5 surface (the projection's threshold), so it is what the mesher polygonizes.
+    /// NaN outside the design domain, which tells the mesher where the domain ends.
+    pub filtered: Vec<f32>,
     pub energy: Vec<f32>,
     pub disps: Vec<Vec<f32>>,
 }
@@ -90,6 +103,14 @@ impl Grid {
             comps: 1,
             data: &s.density,
         }];
+        if !s.filtered.is_empty() {
+            arrays.push(crate::vti::GridArray {
+                name: crate::volume::FILTERED,
+                cell: true,
+                comps: 1,
+                data: &s.filtered,
+            });
+        }
         if !s.energy.is_empty() {
             arrays.push(crate::vti::GridArray {
                 name: "energy",
@@ -217,6 +238,7 @@ impl Output {
                 g.write(
                     &Snapshot {
                         density: d,
+                        filtered: vec![],
                         energy: vec![],
                         disps: vec![],
                     },
