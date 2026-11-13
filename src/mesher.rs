@@ -282,7 +282,7 @@ pub fn save(mesh: &Mesh, out: &Path) -> Result<()> {
     Ok(())
 }
 
-fn fmt_count(n: usize) -> String {
+pub fn fmt_count(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {

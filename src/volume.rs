@@ -272,6 +272,35 @@ impl Volume {
                 }
             }
         }
+        // where the solid meets the domain's edge, x̃ doesn't locate the surface (see `mesh`): it is
+        // on the cell face, halfway between the two samples
+        if let Some(dom) = &self.domain {
+            let half = 0.5 * smin;
+            for z in 0..nz {
+                for y in 0..ny {
+                    for x in 0..nx {
+                        let i = idx(x, y, z);
+                        if !dom[i] {
+                            continue;
+                        }
+                        let nbrs = [
+                            (x > 0).then(|| idx(x - 1, y, z)),
+                            (x + 1 < nx).then(|| idx(x + 1, y, z)),
+                            (y > 0).then(|| idx(x, y - 1, z)),
+                            (y + 1 < ny).then(|| idx(x, y + 1, z)),
+                            (z > 0).then(|| idx(x, y, z - 1)),
+                            (z + 1 < nz).then(|| idx(x, y, z + 1)),
+                        ];
+                        for j in nbrs.into_iter().flatten() {
+                            if !dom[j] && inside[i] {
+                                sd[i] = -half;
+                                sd[j] = half;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         self.sd = sd;
         self.update_color();
     }

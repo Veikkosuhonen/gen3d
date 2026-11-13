@@ -191,6 +191,10 @@ struct PrintUi {
     decimate: Option<f32>,
     /// Taubin smoothing passes for a grid's mesh; None = the default (`mesher::DEFAULT_SMOOTH`)
     smooth: Option<u32>,
+    /// show the exported mesh in the viewport instead of the raymarched shape
+    show_mesh: bool,
+    /// with `show_mesh`: draw the triangle edges
+    edges: bool,
     three_mf: bool,
     /// None = automatic (the shape's `//! slicer`, else printers/default.ini, else slicer defaults)
     profile: Option<PathBuf>,
@@ -207,6 +211,8 @@ impl Default for PrintUi {
             voxel: None,
             decimate: None,
             smooth: None,
+            show_mesh: false,
+            edges: false,
             three_mf: false,
             profile: None,
             profiles: vec![],
@@ -253,6 +259,15 @@ struct OsWindow {
     egui_state: egui_winit::State,
 }
 
+/// The exported mesh shown in the Print step (`PrintUi::show_mesh`).
+struct ShownMesh {
+    path: PathBuf,
+    mtime: Option<SystemTime>,
+    /// the mesh on the GPU, or why it couldn't be loaded
+    gpu: Result<crate::meshview::MeshGpu, String>,
+    tris: usize,
+}
+
 struct Win {
     os: Option<OsWindow>,
     gpu: Arc<Gpu>,
@@ -270,6 +285,9 @@ struct Win {
     renderer: egui_wgpu::Renderer,
     viewport: Viewport,
     title: String,
+    /// mesh drawing, made when a mesh is first shown
+    meshr: Option<crate::meshview::MeshRenderer>,
+    mesh: Option<ShownMesh>,
 }
 
 impl Win {
@@ -302,6 +320,8 @@ impl Win {
             renderer,
             viewport: Viewport { view, size: (1, 1), id },
             title: String::new(),
+            meshr: None,
+            mesh: None,
         }
     }
 }
@@ -1632,6 +1652,64 @@ impl App {
     // ------------------------------------------------------------------------------------ jobs
 
     /// The file the Print step meshes: the design, or the optimization result.
+    /// The mesh file the viewport should show instead of the shape: the Print step's exported mesh
+    /// when "show the mesh" is on and the file exists.
+    fn wanted_mesh(&self) -> Option<PathBuf> {
+        if self.step != Step::Print || !self.print.show_mesh {
+            return None;
+        }
+        Some(self.mesh_path(&self.print_source()?)).filter(|p| p.exists())
+    }
+
+    /// Load the wanted mesh onto the GPU when it changed on disk (not while an export is writing
+    /// it), or drop it when none is wanted.
+    fn sync_mesh(&mut self) {
+        let want = self.wanted_mesh();
+        let job = self.out_job.get();
+        let Some(win) = &mut self.win else { return };
+        let Some(path) = want else {
+            win.mesh = None;
+            return;
+        };
+        if job.running && job.target == path {
+            return;
+        }
+        let m = mtime(&path);
+        if win.mesh.as_ref().is_some_and(|s| s.path == path && s.mtime == m) {
+            return;
+        }
+        if win.meshr.is_none() {
+            match crate::meshview::MeshRenderer::new(&win.gpu, VIEW_FORMAT, &win.ubuf) {
+                Ok(r) => win.meshr = Some(r),
+                Err(e) => {
+                    win.mesh = Some(ShownMesh {
+                        path,
+                        mtime: m,
+                        gpu: Err(format!("{e:#}")),
+                        tris: 0,
+                    });
+                    return;
+                }
+            }
+        }
+        let r = win.meshr.as_ref().unwrap();
+        let loaded = crate::mesh::Mesh::load(&path).and_then(|mesh| Ok((r.upload(&win.gpu, &mesh)?, mesh.tris.len())));
+        win.mesh = Some(match loaded {
+            Ok((g, tris)) => ShownMesh {
+                path,
+                mtime: m,
+                gpu: Ok(g),
+                tris,
+            },
+            Err(e) => ShownMesh {
+                path,
+                mtime: m,
+                gpu: Err(format!("{e:#}")),
+                tris: 0,
+            },
+        });
+    }
+
     fn print_source(&self) -> Option<PathBuf> {
         if self.print_result
             && let Some(r) = self.existing_result()
@@ -2119,7 +2197,15 @@ impl App {
         }
 
         // what is shown, top left; frame rate and modes, top right
-        let what = if self.volume.is_some() && Some(&self.shown) != self.design.as_ref() {
+        let shown_mesh = self
+            .win
+            .as_ref()
+            .and_then(|w| w.mesh.as_ref())
+            .filter(|m| m.gpu.is_ok())
+            .map(|m| m.path.clone());
+        let what = if let Some(m) = shown_mesh {
+            format!("exported mesh · {}", file_name(&m))
+        } else if self.volume.is_some() && Some(&self.shown) != self.design.as_ref() {
             format!("optimization result · {}", file_name(&self.shown))
         } else {
             file_name(&self.shown)
@@ -2871,6 +2957,31 @@ impl App {
         let mesh = self.mesh_path(&src);
         let mut notice = self.notice.take();
         file_line(ui, &mesh, &inputs, &mut notice);
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.print.show_mesh, "show the mesh")
+                .on_hover_text("draw the exported mesh in the view instead of the shape");
+            if self.print.show_mesh {
+                ui.checkbox(&mut self.print.edges, "edges")
+                    .on_hover_text("outline every triangle");
+                let shown = self
+                    .win
+                    .as_ref()
+                    .and_then(|w| w.mesh.as_ref())
+                    .filter(|m| m.path == mesh);
+                match shown.map(|m| (&m.gpu, m.tris)) {
+                    _ if !mesh.exists() => {
+                        ui.weak("export it first");
+                    }
+                    Some((Ok(_), n)) => {
+                        ui.weak(format!("{} triangles", crate::mesher::fmt_count(n)));
+                    }
+                    Some((Err(e), _)) => {
+                        ui.colored_label(ui.visuals().warn_fg_color, e.as_str());
+                    }
+                    None => {}
+                }
+            }
+        });
         if job.cmd != "open"
             && job.target == mesh
             && let Some(r) = mesh_report(&job.log)
@@ -3031,6 +3142,9 @@ impl App {
 
     /// Draw the preview and the UI into `target` (`None`: only apply egui's texture changes).
     fn paint(&mut self, mut out: egui::FullOutput, target: Option<(&wgpu::TextureView, [u32; 2])>) {
+        if target.is_some() {
+            self.sync_mesh();
+        }
         let Some(win) = &mut self.win else { return };
         // egui's texture uploads must be applied (and frees honoured) even if this frame isn't drawn
         for (id, deltas) in out.textures_delta.set.drain() {
@@ -3053,9 +3167,25 @@ impl App {
                 win.viewport.id,
             );
         }
-        let u = uniforms(&self.shape, &self.cam, &self.opts, win.viewport.size, true);
-        win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
-        let preview = draw(&win.gpu, win.pipeline.as_ref(), &win.viewport.view);
+        let mesh = win.mesh.as_ref().and_then(|m| m.gpu.as_ref().ok());
+        let preview = match (mesh, &mut win.meshr) {
+            (Some(m), Some(r)) => {
+                let u = crate::viewer::ViewUniforms::for_mesh(
+                    self.shape.bounds,
+                    &self.cam,
+                    win.viewport.size,
+                    true,
+                    self.print.edges,
+                );
+                win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
+                r.draw(&win.gpu, m, &win.viewport.view, win.viewport.size)
+            }
+            _ => {
+                let u = uniforms(&self.shape, &self.cam, &self.opts, win.viewport.size, true);
+                win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
+                draw(&win.gpu, win.pipeline.as_ref(), &win.viewport.view)
+            }
+        };
 
         let (device, queue) = (&win.gpu.device, &win.gpu.queue);
         let jobs = win
@@ -3301,6 +3431,9 @@ pub struct SnapshotSetup {
     pub section: bool,
     /// select this primitive (Design step)
     pub select: Option<usize>,
+    /// Print step: show the exported mesh (with its edges)
+    pub mesh: bool,
+    pub edges: bool,
 }
 
 /// Draw the app's window offscreen, without opening one, and save it as a PNG: for checking the
@@ -3328,6 +3461,8 @@ pub fn snapshot(
     }
     app.print_result = setup.print_result;
     app.opts.section = setup.section;
+    app.print.show_mesh = setup.mesh;
+    app.print.edges = setup.edges;
     match setup.step.as_str() {
         "design" => {}
         "optimize" => app.set_step(Step::Optimize),

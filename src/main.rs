@@ -7,6 +7,7 @@ mod jobs;
 mod mc;
 mod mesh;
 mod mesher;
+mod meshview;
 mod prims;
 mod shape;
 mod slicer;
@@ -242,7 +243,7 @@ enum Cmd {
     },
     /// create a new shape from a template
     New { name: String },
-    /// render a preview image (PNG) headlessly
+    /// render a preview image (PNG) headlessly, of a shape, a .vti grid or a mesh (.stl/.3mf/.obj)
     Render {
         #[command(flatten)]
         s: ShapeArgs,
@@ -260,6 +261,9 @@ enum Cmd {
         /// hide the `field_*` region overlays
         #[arg(long)]
         no_fields: bool,
+        /// mesh files (.stl, .3mf, .obj): draw the triangle edges
+        #[arg(long)]
+        edges: bool,
     },
     /// topology optimization (SIMP, minimum compliance) of the shape's design domain; see README
     Optimize {
@@ -337,6 +341,12 @@ enum Cmd {
         /// select primitive N of the shape's editor
         #[arg(long)]
         select: Option<usize>,
+        /// in the Print step, show the exported mesh
+        #[arg(long)]
+        mesh: bool,
+        /// with --mesh: draw the triangle edges
+        #[arg(long)]
+        edges: bool,
         #[arg(long, num_args = 2, value_names = ["W", "H"], default_values_t = [1440u32, 900])]
         size: Vec<u32>,
         #[arg(short, long, default_value = "out/snapshot.png")]
@@ -505,6 +515,8 @@ fn run(cli: Cli) -> Result<()> {
             browser,
             section,
             select,
+            mesh,
+            edges,
             size,
             output,
         } => {
@@ -514,6 +526,8 @@ fn run(cli: Cli) -> Result<()> {
                 browser,
                 section,
                 select,
+                mesh,
+                edges,
             };
             app::snapshot(
                 file.as_deref(),
@@ -575,9 +589,15 @@ fn run(cli: Cli) -> Result<()> {
             yaw,
             pitch,
             no_fields,
+            edges,
         } => {
             let defines = parse_defines(&s.define)?;
             let out = output.unwrap_or_else(|| default_out(&s.shape, ".png", &defines));
+            if meshview::is_mesh(&s.shape) {
+                meshview::render_png(&s.shape, &out, (size[0], size[1]), yaw, pitch, edges)?;
+                println!("wrote {}", out.display());
+                return Ok(());
+            }
             let view = viewer::RenderView {
                 size: (size[0], size[1]),
                 section,

@@ -268,25 +268,162 @@ impl Mesh {
         });
     }
 
+    /// Read a mesh file: STL (binary or ASCII), 3MF (the first object's mesh) or OBJ. STL's
+    /// triangles don't share vertices; the others keep their indexing.
+    pub fn load(path: &Path) -> Result<Mesh> {
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let ctx = || format!("cannot read {}", path.display());
+        let m = match ext.as_str() {
+            "stl" => Mesh::from_stl(&std::fs::read(path).with_context(ctx)?),
+            "3mf" => {
+                let file = File::open(path).with_context(ctx)?;
+                let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file)).with_context(ctx)?;
+                let name = (0..zip.len())
+                    .filter_map(|i| zip.name_for_index(i).and_then(|n| n.ok()).map(|n| n.to_string()))
+                    .find(|n| n.starts_with("3D/") && n.ends_with(".model"))
+                    .with_context(|| format!("{}: no 3D model in the archive", path.display()))?;
+                let mut xml = String::new();
+                std::io::Read::read_to_string(&mut zip.by_name(&name)?, &mut xml).with_context(ctx)?;
+                Mesh::from_3mf_model(&xml)
+            }
+            "obj" => Mesh::from_obj(&std::fs::read_to_string(path).with_context(ctx)?),
+            _ => bail!("cannot show .{ext} files (use stl, 3mf or obj)"),
+        }
+        .with_context(ctx)?;
+        if let Some(t) = m.tris.iter().flatten().find(|&&i| i as usize >= m.verts.len()) {
+            bail!("{}: triangle refers to vertex {t} of {}", path.display(), m.verts.len());
+        }
+        Ok(m)
+    }
+
+    fn from_stl(data: &[u8]) -> Result<Mesh> {
+        let binary_len = |n: usize| 84 + 50 * n;
+        let n = data
+            .get(80..84)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize);
+        let mut m = Mesh::default();
+        if let Some(n) = n.filter(|&n| data.len() == binary_len(n)) {
+            m.verts.reserve(3 * n);
+            for rec in data[84..].as_chunks::<50>().0 {
+                for k in 0..3 {
+                    let f = |j: usize| {
+                        let o = 12 + 12 * k + 4 * j;
+                        f32::from_le_bytes(rec[o..o + 4].try_into().unwrap())
+                    };
+                    m.verts.push([f(0), f(1), f(2)]);
+                }
+            }
+        } else {
+            let text = std::str::from_utf8(data).context("neither a binary nor an ASCII STL")?;
+            for line in text.lines() {
+                let mut w = line.split_whitespace();
+                if w.next() == Some("vertex") {
+                    let v: Vec<f32> = w.map(str::parse).collect::<std::result::Result<_, _>>()?;
+                    if v.len() != 3 {
+                        bail!("bad vertex line: {line}");
+                    }
+                    m.verts.push([v[0], v[1], v[2]]);
+                }
+            }
+            if m.verts.len() % 3 != 0 {
+                bail!("the vertices don't make whole triangles");
+            }
+        }
+        let n = m.verts.len() as u32 / 3;
+        m.tris = (0..n).map(|t| [3 * t, 3 * t + 1, 3 * t + 2]).collect();
+        Ok(m)
+    }
+
+    /// The `<vertex>` and `<triangle>` elements of a 3MF model (of its first mesh).
+    fn from_3mf_model(xml: &str) -> Result<Mesh> {
+        let attr = |tag: &str, name: &str| -> Result<f64> {
+            let key = format!(" {name}=\"");
+            let at = tag.find(&key).with_context(|| format!("no {name} in <{tag}>"))? + key.len();
+            let end = tag[at..].find('"').context("unterminated attribute")?;
+            Ok(tag[at..at + end].parse()?)
+        };
+        let mut m = Mesh::default();
+        let body = xml.split("</mesh>").next().unwrap_or(xml);
+        for piece in body.split('<').skip(1) {
+            let tag = piece.split('>').next().unwrap_or("");
+            if tag.starts_with("vertex ") {
+                m.verts
+                    .push([attr(tag, "x")? as f32, attr(tag, "y")? as f32, attr(tag, "z")? as f32]);
+            } else if tag.starts_with("triangle ") {
+                m.tris.push([
+                    attr(tag, "v1")? as u32,
+                    attr(tag, "v2")? as u32,
+                    attr(tag, "v3")? as u32,
+                ]);
+            }
+        }
+        Ok(m)
+    }
+
+    /// `v` and `f` lines of an OBJ (polygons fanned into triangles).
+    fn from_obj(text: &str) -> Result<Mesh> {
+        let mut m = Mesh::default();
+        for line in text.lines() {
+            let mut w = line.split_whitespace();
+            match w.next() {
+                Some("v") => {
+                    let v: Vec<f32> = w.take(3).map(str::parse).collect::<std::result::Result<_, _>>()?;
+                    if v.len() != 3 {
+                        bail!("bad vertex line: {line}");
+                    }
+                    m.verts.push([v[0], v[1], v[2]]);
+                }
+                Some("f") => {
+                    let nv = m.verts.len() as i64;
+                    let idx: Vec<u32> = w
+                        .map(|t| -> Result<u32> {
+                            let i: i64 = t.split('/').next().unwrap_or("").parse()?;
+                            // 1-based, or negative counting back from the last vertex
+                            Ok(if i < 0 { nv + i } else { i - 1 } as u32)
+                        })
+                        .collect::<Result<_>>()?;
+                    for k in 1..idx.len().saturating_sub(1) {
+                        m.tris.push([idx[0], idx[k], idx[k + 1]]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(m)
+    }
+
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        let file = File::create(path).with_context(|| format!("cannot write {}", path.display()))?;
-        let mut w = BufWriter::with_capacity(1 << 20, file);
-        match ext.as_str() {
-            "stl" => self.write_stl(&mut w)?,
-            "obj" => self.write_obj(&mut w)?,
-            "ply" => self.write_ply(&mut w)?,
-            "3mf" => {
-                drop(w);
-                self.write_3mf(path)?;
-                return Ok(());
-            }
-            _ => bail!("unsupported mesh format: .{ext} (use stl, 3mf, obj or ply)"),
+        if !["stl", "obj", "ply", "3mf"].contains(&ext.as_str()) {
+            bail!("unsupported mesh format: .{ext} (use stl, 3mf, obj or ply)");
         }
-        w.flush()?;
+        // written under a temporary name and renamed into place, so a viewer reloading the file
+        // never reads half of it
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".part");
+        let tmp = std::path::PathBuf::from(tmp);
+        let write = || -> Result<()> {
+            if ext == "3mf" {
+                return self.write_3mf(&tmp);
+            }
+            let file = File::create(&tmp).with_context(|| format!("cannot write {}", path.display()))?;
+            let mut w = BufWriter::with_capacity(1 << 20, file);
+            match ext.as_str() {
+                "stl" => self.write_stl(&mut w)?,
+                "obj" => self.write_obj(&mut w)?,
+                _ => self.write_ply(&mut w)?,
+            }
+            w.flush()?;
+            Ok(())
+        };
+        if let Err(e) = write() {
+            std::fs::remove_file(&tmp).ok();
+            return Err(e);
+        }
+        std::fs::rename(&tmp, path).with_context(|| format!("cannot write {}", path.display()))?;
         Ok(())
     }
 
@@ -396,6 +533,43 @@ impl Mesh {
 
 #[cfg(test)]
 mod tests {
+    use super::Mesh;
+
+    /// What `save` writes, `load` reads back: the same triangles at the same positions.
+    #[test]
+    fn saved_meshes_load_back() {
+        let mut vol = vec![0.5f32; 6 * 6 * 6];
+        for x in 1..5 {
+            for y in 1..5 {
+                for z in 1..4 {
+                    vol[(x * 6 + y) * 6 + z] = -0.5;
+                }
+            }
+        }
+        let m = crate::mc::polygonize(&vol, [6, 6, 6], [0.25, -1.0, 2.0], 0.5);
+        let corners = |m: &Mesh| {
+            let mut t: Vec<[[i64; 3]; 3]> = m
+                .tris
+                .iter()
+                .map(|t| t.map(|i| m.verts[i as usize].map(|c| (c * 1e4).round() as i64)))
+                .collect();
+            t.sort_unstable();
+            t
+        };
+        let dir = std::env::temp_dir().join(format!("gen3d-meshio-{}", std::process::id()));
+        for ext in ["stl", "3mf", "obj"] {
+            let path = dir.join(format!("m.{ext}"));
+            m.save(&path).unwrap();
+            let back = Mesh::load(&path).unwrap();
+            assert_eq!(corners(&back), corners(&m), "{ext}");
+        }
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 3, "temporary files left: {names:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
     /// Marching cubes of a sphere from a voxel-quantized field (each sample rounded to whole
     /// voxels, so the surface has voxel steps): smoothing removes the steps without shrinking it.
     #[test]

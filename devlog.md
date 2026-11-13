@@ -3,6 +3,42 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: Showing the exported mesh
+
+**What:**
+- **App:** the Print step has a "show the mesh" option, plus "edges". The view then draws the exported
+  STL/3MF instead of the raymarched shape, with the same camera, so switching back and forth compares
+  them in place. The file is reloaded when an export rewrites it. Faces seen from behind are blue,
+  which shows holes and inverted triangles.
+- **CLI:** `gen3d render model.stl [--edges]` (also .3mf and .obj), and
+  `gen3d snapshot --step print --mesh [--edges]`.
+
+**How:**
+- `meshview.rs` has two pipelines in one pass with a depth buffer. A fullscreen pass draws the
+  preview's sky and ground grid, without shadows. Then the mesh is rasterized from storage buffers
+  (non-indexed draw, three invocations per triangle), flat shaded with the preview's lights.
+- The projection is the raymarcher's (uv = 1.8 (x, y) / z in view heights), so the two line up
+  exactly.
+- `Mesh::load` reads binary/ASCII STL, our 3MF and OBJ.
+- `Mesh::save` now writes to `NAME.part` and renames it into place, so the app never reads half a
+  file.
+
+**Also fixed:** the raymarched preview of a result with `density_filtered` had wavy faces where the
+solid meets the domain's edge, the same problem the mesher fixed in the previous entry. Samples on
+either side of such a face now get ∓ half a voxel, which puts the surface on the cell face. Curved
+domain boundaries (the bracket's sloped top) therefore show their voxel steps in the preview again.
+They looked smooth before only because of that same artifact. The exported mesh smooths them, and
+the mesh view shows that.
+
+**Still open:**
+- Section, bounds and clip don't apply to the mesh view.
+- Meshes load on the UI thread: about instant for a few MB; a multi-million-triangle mesh stalls a
+  frame.
+
+**Verified:** `saved_meshes_load_back` (STL, 3MF and OBJ round trips, no temporary files left).
+Snapshots of the bracket result: raymarched and mesh views line up, labels and triangle count are
+right, and the edges overlay works. clippy clean.
+
 ## 2026-11-13: Smoother meshes of optimized results
 
 **Why blocky:** the optimizer wrote only the projected density. At β = 32 that is nearly binary, so

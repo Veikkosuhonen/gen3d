@@ -296,7 +296,11 @@ pub struct Camera {
 
 impl Camera {
     pub fn framing(shape: &Shape) -> Camera {
-        let (lo, hi) = shape.bounds;
+        Camera::framing_bounds(shape.bounds)
+    }
+
+    /// The default view of a box: from the front left, above, the whole box in view.
+    pub fn framing_bounds((lo, hi): ([f32; 3], [f32; 3])) -> Camera {
         let target = [0, 1, 2].map(|k| (lo[k] + hi[k]) / 2.0);
         let diag = (0..3).map(|k| (hi[k] - lo[k]).powi(2)).sum::<f32>().sqrt();
         Camera {
@@ -363,6 +367,32 @@ pub fn uniforms(shape: &Shape, cam: &Camera, o: &Options, size: (u32, u32), gamm
         flags: [o.clip as u32, o.section as u32, o.show_bounds as u32, gamma as u32],
         fmask: [o.fields, 0, 0, 0],
         misc: [o.time, 0.5 * shape.voxel, 0.0, 0.0],
+    }
+}
+
+impl ViewUniforms {
+    /// Uniforms for drawing a mesh (`meshview`) with bounds `(lo, hi)`; `edges` overlays the
+    /// triangle edges.
+    pub fn for_mesh(
+        (lo, hi): ([f32; 3], [f32; 3]),
+        cam: &Camera,
+        size: (u32, u32),
+        gamma: bool,
+        edges: bool,
+    ) -> ViewUniforms {
+        let e = cam.eye();
+        ViewUniforms {
+            res: [size.0 as f32, size.1 as f32],
+            relax: 1.0,
+            cut: 0.0,
+            eye: [e[0], e[1], e[2], 0.0],
+            target: [cam.target[0], cam.target[1], cam.target[2], 0.0],
+            bmin: [lo[0], lo[1], lo[2], 0.0],
+            bmax: [hi[0], hi[1], hi[2], 0.0],
+            flags: [0, 0, 0, gamma as u32],
+            fmask: [0; 4],
+            misc: [0.0, 0.0, edges as u32 as f32, 0.0],
+        }
     }
 }
 
