@@ -3,6 +3,34 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: GPU solver 2× faster (coarse-level kernels)
+
+**What:** a CG iteration at 9.6M elements went from 111 ms to 50 ms. An optimizer iteration takes
+1.02 s at 9.5M elements (was 2.1 s) and 2.66 s at 22.5M (was 5.6 s).
+
+**How:** an ignored test, `profile_kernels` (`cargo test --release profile_kernels -- --ignored
+--nocapture`), times each piece on a 9.6M-element box. The fine mat-vec was fine at 4 ms. Two coarse
+levels cost far more than their size:
+- **Level 2 (stored matrices), 8.7 ms for 1/64 of the elements.** Each thread read rows of 8 matrices
+  laid out 576 floats apart, so the loads didn't coalesce. Storing them entry-major
+  (`mats[entry · elements + e]`) brings it to 0.7 ms. Assembly writes that layout, and the coarsest
+  readback converts it back.
+- **Level 1 (on the fly), 12 ms.** Moving the Pᵀ ke P table into workgroup memory didn't help. What
+  did: applying level 1 as Pᵀ (D K D) P u through the fine grid (prolong, fine mat-vec, restrict). It's
+  the same operator, at 4.8 ms. Its two fine-size temporaries are level 0's smoother scratch, which
+  is idle while the V-cycle works on coarser levels. The on-the-fly kernel is gone; the table still
+  builds level 1's diagonal and level 2.
+
+Tried and dropped: staging `ke` in workgroup memory for the fine mat-vec (no change), and a
+27-neighbour form that loads each displacement once instead of 64 times (2.7× slower: a dynamically
+indexed per-thread array plus branching costs more than the redundant, cached loads). The fine
+mat-vec moves ~270 MB in 4 ms, about 60 GB/s, far below the 760 GB/s the card can do. So it's
+compute- or latency-bound, and the next lever is probably fewer, fused passes (each Chebyshev step is
+a separate `lin` pass over the vectors).
+
+**Verified:** all GPU tests pass, including the loop-against-CPU test. Bench compliances are identical
+before and after.
+
 ## 2026-11-13: The whole optimizer iteration on the GPU (scaling plan step 4)
 
 **What:** with `--solver gpu` (the default on hardware GPUs) every per-element step runs on the GPU

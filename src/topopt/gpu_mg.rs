@@ -2,9 +2,12 @@
 //! resident on the GPU.
 //!
 //! - Level 0 (fine) is matrix-free.
-//! - Level 1 is also never stored: it is computed on the fly from the fine `ee` and a table of
-//!   Pᵀ (D ke D) P per clamped-node mask and child position (`mg::masked_ptkp_table`). That costs
-//!   about a fine mat-vec in arithmetic, but no memory per element.
+//! - Level 1 is never stored: K1 u = Pᵀ (D K D) P u is applied through the fine grid (prolong,
+//!   fine mat-vec, restrict), which costs about a fine mat-vec and no memory per element. Its
+//!   diagonal and level 2 are built from a table of Pᵀ (D ke D) P per clamped-node mask and child
+//!   position (`mg::masked_ptkp_table`).
+//! - Stored matrices are entry-major (`mats[entry · elements + e]`), so neighbouring threads read
+//!   neighbouring addresses.
 //! - Levels ≥ 2 are assembled on the GPU as 24×24 element matrices (Galerkin, one workgroup per
 //!   coarse element).
 //! - The coarsest level is solved with a dense inverse, computed on the CPU once per optimizer
@@ -240,16 +243,33 @@ impl<'a> GpuMg<'a> {
                 &[&self.ee, &self.free, &self.ke, u, y],
                 t,
             ),
-            1 => self.e.step(
-                out,
-                "apply_l1",
-                Params {
-                    n: dims4(self.dims[0]),
-                    ..Default::default()
-                },
-                &[&self.ee, &self.emask, &self.table, u, y],
-                t,
-            ),
+            1 => {
+                // Pᵀ (D K D) P u through the fine grid, using level 0's smoother scratch (free
+                // whenever level 1 is worked on). Cheaper than the on-the-fly element matrices.
+                let (pu, kpu) = (&self.lt[0], &self.ld[0]);
+                self.e.step(
+                    out,
+                    "prolong",
+                    Params {
+                        n: dims4(self.dims[0]),
+                        m: [1, 0, 0, 0],
+                        ..Default::default()
+                    },
+                    &[u, &self.diag[0], pu],
+                    threads(nodes(self.dims[0])),
+                );
+                self.apply(out, 0, pu, kpu);
+                self.e.step(
+                    out,
+                    "restrict",
+                    Params {
+                        n: dims4(self.dims[0]),
+                        ..Default::default()
+                    },
+                    &[kpu, y],
+                    t,
+                );
+            }
             _ => self.e.step(
                 out,
                 "apply_elem",
@@ -491,10 +511,14 @@ impl<'a> GpuMg<'a> {
         // exact solve on the coarsest level
         let last = self.last();
         let n = self.dims[last];
-        let mats = self
-            .e
-            .read_f32(self.mats[last].as_ref().unwrap(), 576 * n.iter().product::<usize>())?;
-        let inv = mg::dense_inverse(n, mats.iter().map(|&v| v as f64).collect());
+        let ne: usize = n.iter().product();
+        let soa = self.e.read_f32(self.mats[last].as_ref().unwrap(), 576 * ne)?;
+        // entry-major on the GPU, element-major on the CPU
+        let mut mats = vec![0.0; 576 * ne];
+        for (k, v) in soa.iter().enumerate() {
+            mats[(k % ne) * 576 + k / ne] = *v as f64;
+        }
+        let inv = mg::dense_inverse(n, mats);
         let inv32: Vec<f32> = inv.iter().map(|&v| v as f32).collect();
         self.e.write_f32(&self.bottom, &inv32);
         Ok(())
@@ -768,5 +792,72 @@ mod tests {
         eprintln!("{its} GPU CG iterations; compliance {c_gpu:.6e} vs {c_cpu:.6e}");
         assert!((c_gpu - c_cpu).abs() < 1e-4 * c_cpu, "compliance {c_gpu} vs {c_cpu}");
         close(&ug, &u, "GPU u");
+    }
+
+    /// Timings of the solver's pieces on a 9.6M-element box (run with --ignored --nocapture).
+    #[test]
+    #[ignore]
+    fn profile_kernels() {
+        let gpu = crate::gpu::headless().unwrap();
+        let n = [200, 120, 400];
+        let mut p = problem(n);
+        p.domain.fill(true);
+        let ke = super::super::hex_ke(0.3);
+        let active = p.active_nodes();
+        let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
+        let ee: Vec<f64> = (0..p.domain.len())
+            .map(|e| if e % 3 == 0 { 1e-6 } else { 1.0 })
+            .collect();
+        let eng = Engine::new(&gpu).unwrap();
+        let g = GpuMg::new(&eng, &p, &ke, &free, &MgSettings::default()).unwrap();
+        let t = std::time::Instant::now();
+        g.set_stiffness(&ee).unwrap();
+        eprintln!("levels {:?}", g.dims);
+        eprintln!(
+            "setup (incl. upload, coarsest inverse): {:.1} ms",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        let time = |name: &str, prog: &[Step]| {
+            let reps = 10;
+            let batch: Vec<&[Step]> = vec![prog; reps];
+            g.e.run(&batch).unwrap();
+            g.e.read_scalars().unwrap();
+            let t = std::time::Instant::now();
+            g.e.run(&batch).unwrap();
+            g.e.read_scalars().unwrap();
+            eprintln!(
+                "{name:>24}: {:7.2} ms ({} dispatches)",
+                t.elapsed().as_secs_f64() * 1e3 / reps as f64,
+                prog.len()
+            );
+        };
+        time("setup program", &g.setup);
+        for l in 0..g.levels() - 1 {
+            let mut prog = vec![];
+            g.apply(&mut prog, l, &g.lr[l], &g.lt[l]);
+            time(&format!("apply level {l}"), &prog);
+        }
+        let n0 = g.len(0);
+        let mut prog = vec![];
+        g.e.lin(&mut prog, &g.p, &g.z, None, (1.0, NONE), (1.0, NONE), n0);
+        time("lin (fine)", &prog);
+        let mut prog = vec![];
+        g.e.dot(&mut prog, &g.p, &g.z, None, n0, 20);
+        time("dot (fine)", &prog);
+        for l in 0..g.levels() - 1 {
+            let mut prog = vec![];
+            g.smooth(
+                &mut prog,
+                l,
+                g.lb[l.max(1)].as_ref().unwrap_or(&g.r),
+                if l == 0 { &g.z } else { g.lx[l].as_ref().unwrap() },
+                false,
+            );
+            time(&format!("smooth level {l}"), &prog);
+        }
+        let mut prog = vec![];
+        g.vcycle(&mut prog, 0, &g.r, &g.z);
+        time("V-cycle", &prog);
+        time("CG iteration", &g.iter[0]);
     }
 }

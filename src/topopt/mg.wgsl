@@ -137,65 +137,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     d[3u * node + 2u] = acc.z;
 }
 
-//// kernel apply_l1
-// y = K1 u on level 1, computed on the fly: K_E = Σ_c ee_c T[mask_c][c], where T holds Pᵀ (D ke D) P
-// per clamped-node mask (8 bits) and child position. P.n = fine grid; level 1 is ceil(n / 2).
-@group(0) @binding(1) var<storage, read> ee: array<f32>;
-@group(0) @binding(2) var<storage, read> emask: array<u32>;
-@group(0) @binding(3) var<storage, read> T: array<f32>;
-@group(0) @binding(4) var<storage, read> u: array<f32>;
-@group(0) @binding(5) var<storage, read_write> y: array<f32>;
-
-@compute @workgroup_size(128)
-fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
-        @builtin(local_invocation_index) li: u32) {
-    let node = flat(wg, nwg, li);
-    let nf = P.n.xyz;
-    let n = (nf + vec3<u32>(1u)) / 2u;
-    if node >= node_count(n) { return; }
-    let nx = n.x + 1u;
-    let ny = n.y + 1u;
-    let i = node % nx;
-    let j = (node / nx) % ny;
-    let k = node / (nx * ny);
-    var acc = vec3<f32>(0.0);
-    var ue: array<f32, 24>;
-    for (var a = 0u; a < 8u; a++) {
-        let di = a & 1u;
-        let dj = (a >> 1u) & 1u;
-        let dk = (a >> 2u) & 1u;
-        if i < di || j < dj || k < dk { continue; }
-        let ei = i - di;
-        let ej = j - dj;
-        let ek = k - dk;
-        if ei >= n.x || ej >= n.y || ek >= n.z { continue; }
-        for (var b = 0u; b < 8u; b++) {
-            let m = elem_node(ei, ej, ek, b, nx, ny);
-            ue[3u * b] = u[3u * m];
-            ue[3u * b + 1u] = u[3u * m + 1u];
-            ue[3u * b + 2u] = u[3u * m + 2u];
-        }
-        for (var c = 0u; c < 8u; c++) {
-            let fi = 2u * ei + (c & 1u);
-            let fj = 2u * ej + ((c >> 1u) & 1u);
-            let fk = 2u * ek + ((c >> 2u) & 1u);
-            if fi >= nf.x || fj >= nf.y || fk >= nf.z { continue; }
-            let e = (fk * nf.y + fj) * nf.x + fi;
-            let s = ee[e];
-            if s == 0.0 { continue; }
-            let base = (emask[e] * 8u + c) * 576u + (3u * a) * 24u;
-            var r = vec3<f32>(0.0);
-            for (var q = 0u; q < 24u; q++) {
-                r += vec3<f32>(T[base + q], T[base + 24u + q], T[base + 48u + q]) * ue[q];
-            }
-            acc += s * r;
-        }
-    }
-    y[3u * node] = acc.x;
-    y[3u * node + 1u] = acc.y;
-    y[3u * node + 2u] = acc.z;
-}
-
 //// kernel diag_l1
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
 @group(0) @binding(2) var<storage, read> emask: array<u32>;
@@ -240,7 +181,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel apply_elem
-// y = K u on a level stored as 24×24 element matrices.
+// y = K u on a level stored as 24×24 element matrices, entry-major (mats[entry * elements + e]) so
+// that neighbouring threads read neighbouring addresses.
 @group(0) @binding(1) var<storage, read> mats: array<f32>;
 @group(0) @binding(2) var<storage, read> u: array<f32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
@@ -251,6 +193,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let node = flat(wg, nwg, li);
     let n = P.n.xyz;
     if node >= node_count(n) { return; }
+    let ne = n.x * n.y * n.z;
     let nx = n.x + 1u;
     let ny = n.y + 1u;
     let i = node % nx;
@@ -266,14 +209,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         let ej = j - dj;
         let ek = k - dk;
         if ei >= n.x || ej >= n.y || ek >= n.z { continue; }
-        let base = ((ek * n.y + ej) * n.x + ei) * 576u + (3u * a) * 24u;
+        let e = (ek * n.y + ej) * n.x + ei;
         for (var b = 0u; b < 8u; b++) {
             let m = elem_node(ei, ej, ek, b, nx, ny);
             let um = vec3<f32>(u[3u * m], u[3u * m + 1u], u[3u * m + 2u]);
-            let r = base + 3u * b;
-            acc.x += dot(vec3<f32>(mats[r], mats[r + 1u], mats[r + 2u]), um);
-            acc.y += dot(vec3<f32>(mats[r + 24u], mats[r + 25u], mats[r + 26u]), um);
-            acc.z += dot(vec3<f32>(mats[r + 48u], mats[r + 49u], mats[r + 50u]), um);
+            let r = ((3u * a) * 24u + 3u * b) * ne + e;
+            acc.x += dot(vec3<f32>(mats[r], mats[r + ne], mats[r + 2u * ne]), um);
+            let r1 = r + 24u * ne;
+            acc.y += dot(vec3<f32>(mats[r1], mats[r1 + ne], mats[r1 + 2u * ne]), um);
+            let r2 = r + 48u * ne;
+            acc.z += dot(vec3<f32>(mats[r2], mats[r2 + ne], mats[r2 + 2u * ne]), um);
         }
     }
     y[3u * node] = acc.x;
@@ -306,8 +251,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         let ej = j - dj;
         let ek = k - dk;
         if ei >= n.x || ej >= n.y || ek >= n.z { continue; }
-        let r = ((ek * n.y + ej) * n.x + ei) * 576u + (3u * a) * 25u;
-        acc += vec3<f32>(mats[r], mats[r + 25u], mats[r + 50u]);
+        let ne = n.x * n.y * n.z;
+        let r = ((3u * a) * 25u) * ne + (ek * n.y + ej) * n.x + ei;
+        acc += vec3<f32>(mats[r], mats[r + 25u * ne], mats[r + 50u * ne]);
     }
     d[3u * node] = acc.x;
     d[3u * node + 1u] = acc.y;
@@ -315,7 +261,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel assemble
-// Galerkin coarsening, one workgroup per coarse element: out_E = Σ_c P_cᵀ K_c P_c. With P.m.x == 1 the
+// Galerkin coarsening, one workgroup per coarse element: out_E = Σ_c P_cᵀ K_c P_c (stored
+// entry-major). With P.m.x == 1 the
 // children are level-1 elements computed on the fly from the fine grid (P.n = fine grid, the output
 // is level 2); otherwise they are stored matrices (P.n = the child level's grid).
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
@@ -366,7 +313,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                         }
                     }
                 } else {
-                    s = child[((lk * nl.y + lj) * nl.x + li_) * 576u + idx];
+                    s = child[idx * (nl.x * nl.y * nl.z) + (lk * nl.y + lj) * nl.x + li_];
                 }
             }
             K[idx] = s;
@@ -401,8 +348,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         }
         workgroupBarrier();
     }
+    // entry-major, like apply_elem reads it
+    let nce = nc.x * nc.y * nc.z;
     for (var t = 0u; t < 9u; t++) {
-        out[ce * 576u + li + 64u * t] = acc[t];
+        out[(li + 64u * t) * nce + ce] = acc[t];
     }
 }
 
@@ -446,7 +395,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel prolong
-// x += P xc on the grid P.n, kept to DOFs with a positive diagonal.
+// x += P xc on the grid P.n (x = P xc when P.m.x == 1), kept to DOFs with a positive diagonal.
 @group(0) @binding(1) var<storage, read> xc: array<f32>;
 @group(0) @binding(2) var<storage, read> diag: array<f32>;
 @group(0) @binding(3) var<storage, read_write> x: array<f32>;
@@ -483,7 +432,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         acc += w * vec3<f32>(xc[o], xc[o + 1u], xc[o + 2u]);
     }
     for (var d = 0u; d < 3u; d++) {
-        if diag[3u * m + d] > 0.0 {
+        let keep = diag[3u * m + d] > 0.0;
+        if P.m.x == 1u {
+            x[3u * m + d] = select(0.0, acc[d], keep);
+        } else if keep {
             x[3u * m + d] += acc[d];
         }
     }
