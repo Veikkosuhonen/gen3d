@@ -3,6 +3,30 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: Optimizer output at large grids: background writes, previews, full result on Stop
+
+**What:**
+- The `.vti` is written on a background thread, so the solver no longer waits for the disk.
+- On grids over 4M elements the live file is a preview: density only, averaged over k³ blocks to
+  ≤ 4M cells. At 44M elements a full file with every field is ~900 MB, and the viewer would reload it
+  each time. The full fields are written at the end.
+- The app's Stop sends SIGTERM. `optimize` now catches it, finishes the current iteration and writes
+  that iteration's full result. A second SIGTERM kills it as before.
+
+**How:** `src/topopt/output.rs` (`Output`, `Snapshot`) is shared by the CPU and GPU loops.
+- Throttle: a live write starts only when the writer thread is idle and writing has stayed under ~10%
+  of the time. Small grids still update every iteration.
+- On the GPU path a preview reads back only the densities (4 B per element); the full fields are read
+  back only for the final write.
+- The signal handler only sets an atomic flag and restores the default handler. Using `libc`, which
+  was already in the dependency tree, adds no new crate.
+
+**Verified:**
+- 9.5M elements (preview 2×): mid-run, the file is 201×121×101 with density only (4.8 MB). SIGTERM
+  after iteration 5 prints "stopped: writing the result of iteration 5", exits 0, and leaves
+  401×121×201 with density, energy and displacement.
+- Decimation test. 33 tests pass; clippy is clean.
+
 ## 2026-11-13: GPU optimizer memory 218 → 164 B per element (44M elements on a 10 GB card)
 
 **What:** the GPU path fits 44M elements (5.6 s per iteration) where 35M ran out of memory before.

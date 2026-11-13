@@ -31,11 +31,13 @@ use rayon::prelude::*;
 use crate::gpu::Gpu;
 use crate::mesher::{Grid, sample_field};
 use crate::shape::Shape;
+use output::Snapshot;
 
 mod gpu_engine;
 mod gpu_mg;
 mod gpu_opt;
 pub mod mg;
+mod output;
 
 /// Linear solver for K u = f.
 #[derive(Clone, Copy, Debug)]
@@ -676,6 +678,7 @@ type Precond<'a> = dyn FnMut(&[f64], &mut [f64]) + 'a;
 /// `displacement` in mm). The file is rewritten as often as keeps writing under ~10% of the run
 /// time (every iteration on small grids), and always after the last iteration.
 pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Result<Outcome> {
+    output::catch_stop();
     if let Solver::Gpu(ms) = &s.solver {
         let Some(gpu) = gpu else {
             bail!("the GPU solver needs a GPU");
@@ -740,8 +743,9 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         }
     );
     // the last iteration's output, until it is written
+    // the last iteration's full fields, until written
     let mut pending: Option<Snapshot> = None;
-    let mut throttle = Throttle::default();
+    let mut output = output::Output::new(p, out);
     // OC's Lagrange multiplier, for the next iteration's bracket
     let mut lambda = 1.0;
     let mut last_change = 1.0f64;
@@ -892,24 +896,27 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
 
         // the densities this solve used, with their energy density and displacements
         let t3 = Instant::now();
-        pending = Some(Snapshot {
+        let snap = Snapshot {
             density: used_xphys.iter().map(|&v| v as f32).collect(),
             energy: (0..ne)
                 .map(|e| (0.5 * fem.ee[e] * ce[e] / p.h.powi(3)) as f32)
                 .collect(),
             disps: us.iter().map(|u| u.iter().map(|&v| v as f32).collect()).collect(),
-            iteration: it,
-        });
-        if throttle.due() {
-            let bytes = pending.take().unwrap().write(p, out)?;
-            throttle.wrote(t3);
-            if it == 1 {
-                println!(
-                    "wrote {} ({:.1} MB, updated as it runs)",
-                    out.display(),
-                    bytes as f64 / 1e6
-                );
+        };
+        if output.due()? {
+            if output.live_is_full() {
+                output.live(snap);
+                pending = None;
+            } else {
+                output.live(Snapshot {
+                    density: snap.density.clone(),
+                    energy: vec![],
+                    disps: vec![],
+                });
+                pending = Some(snap);
             }
+        } else {
+            pending = Some(snap);
         }
         st.io = t3.elapsed().as_secs_f64();
 
@@ -918,6 +925,10 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         result.compliance = compliance;
         result.max_disp = max_disp;
         result.stats.push(st);
+        if output::stop_requested() {
+            println!("stopped: writing the result of iteration {it}");
+            break;
+        }
         match control.next(s, proj.beta, compliance, change) {
             Next::Go => {}
             Next::Beta(b) => {
@@ -927,8 +938,11 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
             Next::Stop => break,
         }
     }
-    if let Some(snap) = pending {
-        snap.write(p, out)?;
+    match pending {
+        Some(snap) => {
+            output.finish(snap)?;
+        }
+        None => output.wait()?,
     }
     print_done(&result, t_start, out);
     Ok(result)
@@ -1020,71 +1034,6 @@ impl Control {
             return Next::Stop;
         }
         Next::Go
-    }
-}
-
-/// Keeps .vti writes under ~10% of the run time.
-#[derive(Default)]
-struct Throttle {
-    last: Option<(Instant, f64)>,
-}
-
-impl Throttle {
-    fn due(&self) -> bool {
-        self.last.is_none_or(|(t, dur)| t.elapsed().as_secs_f64() >= 10.0 * dur)
-    }
-
-    fn wrote(&mut self, started: Instant) {
-        self.last = Some((Instant::now(), started.elapsed().as_secs_f64()));
-    }
-}
-
-/// One iteration's output fields.
-struct Snapshot {
-    density: Vec<f32>,
-    energy: Vec<f32>,
-    disps: Vec<Vec<f32>>,
-    #[allow(dead_code)]
-    iteration: usize,
-}
-
-impl Snapshot {
-    fn write(&self, p: &Problem, out: &Path) -> Result<u64> {
-        let names: Vec<String> = p
-            .cases
-            .iter()
-            .enumerate()
-            .map(|(k, c)| {
-                if k == 0 {
-                    "displacement".to_string()
-                } else {
-                    format!("displacement_{c}")
-                }
-            })
-            .collect();
-        let mut arrays = vec![
-            crate::vti::GridArray {
-                name: "density",
-                cell: true,
-                comps: 1,
-                data: &self.density,
-            },
-            crate::vti::GridArray {
-                name: "energy",
-                cell: true,
-                comps: 1,
-                data: &self.energy,
-            },
-        ];
-        for (name, data) in names.iter().zip(&self.disps) {
-            arrays.push(crate::vti::GridArray {
-                name,
-                cell: false,
-                comps: 3,
-                data,
-            });
-        }
-        crate::vti::write_grid(out, p.origin, p.h, p.nodes(), &arrays)
     }
 }
 

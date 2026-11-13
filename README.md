@@ -366,8 +366,11 @@ holes, and the pin hole loaded down (case 1) and sideways (case 2). For both cas
 hollow, closed box section; a closed section is what stands up to the sideways load's twist.
 
 In the app, the **Optimize** step runs the same thing in the background and shows the result in the
-viewport while it is still running. The file is rewritten after every iteration, atomically, so you
-watch the design form; **Stop** ends the run and keeps the last iteration.
+viewport while it is still running. The file is rewritten as it runs (atomically, in the background,
+at most ~10% of the time; every iteration on small grids), so you watch the design form. On grids
+over 4M elements the live file is a preview: the density averaged over k×k×k blocks. The full fields
+come at the end. **Stop** finishes the current iteration and writes its full result (stopping twice
+ends it at once).
 
 - **Output:** cell arrays `density` (0..1) and `energy` (strain energy density, MPa: where the part
   works hardest), and point array `displacement` (mm). Colour by `energy` or `displacement` to see how
@@ -405,8 +408,6 @@ watch the design form; **Stop** ends the run and keeps the last iteration.
   - The GPU path needs 164 B per element (`optimize` prints it), so a 10 GB card holds about 45M.
     Past that, `optimize` says it doesn't fit. The CPU solver allows 8M (~1.2 kB each).
 - **Shortcuts in this version:**
-  - The `.vti` is written at full resolution, which takes seconds at tens of millions of elements;
-    it is throttled to ~10% of the run time.
   - No symmetry or overhang (printability) constraints.
 
 ## Mesh quality notes
@@ -461,4 +462,5 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32) |
 | `src/topopt/gpu_opt.rs`, `opt.wgsl` | the optimizer loop on the GPU: stiffness, sensitivities, filter, projection, OC |
 | `src/topopt/gpu_engine.rs` | GPU kernels as recorded dispatch programs, reductions, scalars, readback |
+| `src/topopt/output.rs` | writing the result as it runs: background writes, decimated previews, full result on Stop |
 | `src/wgsl/sdf.wgsl` | the SDF library |

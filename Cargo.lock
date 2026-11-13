@@ -918,6 +918,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "flate2",
+ "libc",
  "meshopt",
  "naga",
  "png",

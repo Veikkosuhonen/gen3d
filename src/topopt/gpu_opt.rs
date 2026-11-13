@@ -11,7 +11,8 @@ use anyhow::{Result, bail};
 use super::gpu_engine::{Engine, NONE, Params, Reduce, Step, dims4, threads};
 use super::gpu_mg::GpuMg;
 use super::mg::MgSettings;
-use super::{CG_MAXIT, Control, IterStats, Next, Outcome, Problem, Settings, Snapshot, Throttle};
+use super::output::{self, Output, Snapshot};
+use super::{CG_MAXIT, Control, IterStats, Next, Outcome, Problem, Settings};
 use crate::gpu::Gpu;
 
 // scalar slots (gpu_mg uses those below 80)
@@ -220,7 +221,7 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
     );
     let t_start = Instant::now();
     let mut control = Control::default();
-    let mut throttle = Throttle::default();
+    let mut output = Output::new(p, out);
     let mut result = Outcome {
         iterations: 0,
         compliance: 0.0,
@@ -240,7 +241,6 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
             density: e.read_f32(&f.xused, ne)?,
             energy: ee.iter().zip(&ce).map(|(a, b)| 0.5 * a * b / h3).collect(),
             disps: (0..mg.us.len()).map(|c| mg.displacement(c)).collect::<Result<_>>()?,
-            iteration: 0,
         })
     };
     for it in 1..=s.iters {
@@ -281,16 +281,18 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
 
         // the fields of this solve, before the update replaces the densities
         let t3 = Instant::now();
-        if throttle.due() {
-            let bytes = snapshot()?.write(p, out)?;
-            throttle.wrote(t3);
-            pending = false;
-            if it == 1 {
-                println!(
-                    "wrote {} ({:.1} MB, updated as it runs)",
-                    out.display(),
-                    bytes as f64 / 1e6
-                );
+        if output.due()? {
+            if output.live_is_full() {
+                output.live(snapshot()?);
+                pending = false;
+            } else {
+                // a preview: only the densities come back
+                output.live(Snapshot {
+                    density: e.read_f32(&f.xused, ne)?,
+                    energy: vec![],
+                    disps: vec![],
+                });
+                pending = true;
             }
         } else {
             pending = true;
@@ -340,6 +342,10 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         result.compliance = compliance;
         result.max_disp = max_disp;
         result.stats.push(st);
+        if output::stop_requested() {
+            println!("stopped: writing the result of iteration {it}");
+            break;
+        }
         match control.next(s, beta, compliance, change) {
             Next::Go => {}
             Next::Beta(b) => {
@@ -351,7 +357,9 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         }
     }
     if pending {
-        snapshot()?.write(p, out)?;
+        output.finish(snapshot()?)?;
+    } else {
+        output.wait()?;
     }
     super::print_done(&result, t_start, out);
     Ok(result)
