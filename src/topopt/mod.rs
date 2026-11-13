@@ -11,9 +11,9 @@
 //! objective is the sum of the cases' compliances (each solved separately).
 //!
 //! Each iteration solves K(ρ) u = f with a conjugate gradient (warm-started, matrix-free on the fine
-//! grid) preconditioned by a geometric multigrid V-cycle: on the GPU in f32 (`gpu_mg`), or on the
-//! CPU (`mg`, multithreaded; also the reference the GPU path is tested against). Jacobi-
-//! preconditioned CG is kept as a fallback. It then computes the compliance sensitivities, applies a density filter and updates the
+//! grid) preconditioned by a geometric multigrid V-cycle. The whole iteration runs either on the GPU
+//! in f32 (`gpu_opt`, `gpu_mg`) or on the CPU (`optimize` below with `mg`, multithreaded; the
+//! reference the GPU path is tested against). Jacobi-preconditioned CG is kept as a fallback. It then computes the compliance sensitivities, applies a density filter and updates the
 //! densities with the optimality-criteria method under a volume constraint. The current design is
 //! written to a .vti as it runs, so `gen3d view` can watch it live.
 //!
@@ -32,7 +32,9 @@ use crate::gpu::Gpu;
 use crate::mesher::{Grid, sample_field};
 use crate::shape::Shape;
 
+mod gpu_engine;
 mod gpu_mg;
+mod gpu_opt;
 pub mod mg;
 
 /// Linear solver for K u = f.
@@ -674,6 +676,12 @@ type Precond<'a> = dyn FnMut(&[f64], &mut [f64]) + 'a;
 /// `displacement` in mm). The file is rewritten as often as keeps writing under ~10% of the run
 /// time (every iteration on small grids), and always after the last iteration.
 pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Result<Outcome> {
+    if let Solver::Gpu(ms) = &s.solver {
+        let Some(gpu) = gpu else {
+            bail!("the GPU solver needs a GPU");
+        };
+        return gpu_opt::optimize_gpu(p, s, ms, out, gpu);
+    }
     let ke = hex_ke(s.nu);
     let ne = p.domain.len();
     let design: Vec<usize> = (0..ne).filter(|&e| p.domain[e] && !p.passive[e]).collect();
@@ -684,23 +692,6 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
     let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
     let fs: Vec<Vec<f64>> = p.loads.iter().map(|l| l.iter().flatten().copied().collect()).collect();
     let emin = s.e0 * s.emin;
-    let gpu_mg = match (&s.solver, gpu) {
-        (Solver::Gpu(ms), Some(gpu)) => {
-            let g = gpu_mg::GpuMg::new(gpu, p, &ke, &free, ms)?;
-            let c = g.coarsest();
-            println!(
-                "GPU multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
-                g.levels(),
-                c[0],
-                c[1],
-                c[2],
-                ms.smoother
-            );
-            Some(g)
-        }
-        (Solver::Gpu(_), None) => bail!("the GPU solver needs a GPU"),
-        _ => None,
-    };
     let filter = Filter::new(p, s.rmin);
     let mut proj = Projection {
         beta: if s.beta_max > 0.0 { 1.0 } else { 0.0 },
@@ -722,8 +713,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
     let mut xphys = proj.densities(p, &xtilde);
     let mut us: Vec<Vec<f64>> = fs.iter().map(|f| vec![0.0; f.len()]).collect();
     let t_start = Instant::now();
-    let mut stalled = 0;
-    let mut stage_its = 0;
+    let mut control = Control::default();
     let mut result = Outcome {
         iterations: 0,
         compliance: 0.0,
@@ -751,7 +741,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
     );
     // the last iteration's output, until it is written
     let mut pending: Option<Snapshot> = None;
-    let mut last_write: Option<(Instant, f64)> = None;
+    let mut throttle = Throttle::default();
     // OC's Lagrange multiplier, for the next iteration's bracket
     let mut lambda = 1.0;
     let mut last_change = 1.0f64;
@@ -781,23 +771,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         st.cg_tol = tol;
         let mut ce = vec![0.0; ne];
         let t1;
-        if let Some(g) = &gpu_mg {
-            // everything on the GPU; the energies and displacements come back
-            g.set_stiffness(&fem.ee)?;
-            st.setup = t0.elapsed().as_secs_f64();
-            t1 = Instant::now();
-            for (c, u) in us.iter_mut().enumerate() {
-                let n = g.solve(c, tol, CG_MAXIT)?;
-                if n >= CG_MAXIT {
-                    println!("warning: CG did not converge in {CG_MAXIT} iterations");
-                }
-                st.cg.push(n);
-                *u = g.displacement(c)?.iter().map(|&v| v as f64).collect();
-            }
-            for (a, b) in ce.iter_mut().zip(g.energies()?) {
-                *a = b as f64;
-            }
-        } else {
+        {
             // one preconditioner, shared by the load cases
             let mut precond: Box<Precond> = match &s.solver {
                 Solver::Multigrid(ms) => {
@@ -926,11 +900,9 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
             disps: us.iter().map(|u| u.iter().map(|&v| v as f32).collect()).collect(),
             iteration: it,
         });
-        // keep writing under ~10% of the time
-        let due = last_write.is_none_or(|(t, dur)| t.elapsed().as_secs_f64() >= 10.0 * dur);
-        if due {
+        if throttle.due() {
             let bytes = pending.take().unwrap().write(p, out)?;
-            last_write = Some((Instant::now(), t3.elapsed().as_secs_f64()));
+            throttle.wrote(t3);
             if it == 1 {
                 println!(
                     "wrote {} ({:.1} MB, updated as it runs)",
@@ -941,56 +913,28 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         }
         st.io = t3.elapsed().as_secs_f64();
 
-        let beta = if proj.beta > 0.0 {
-            format!(", beta {}", proj.beta)
-        } else {
-            String::new()
-        };
-        println!(
-            "it {it:3}: compliance {compliance:.4e} N·mm, max displacement {max_disp:.4} mm, change {change:.3}, grey {:.0}%{beta}, {} CG its, {:.1} s [setup {:.2} solve {:.2} update {:.2} io {:.2}]",
-            grey * 100.0,
-            st.cg.iter().sum::<usize>(),
-            t0.elapsed().as_secs_f64(),
-            st.setup,
-            st.solve,
-            st.update,
-            st.io,
-        );
-        // the max density change often hovers at the move limit while the design no longer
-        // improves, so also stop once compliance has stagnated
-        let improvement = (result.compliance - compliance) / compliance;
-        stalled = if stage_its > 0 && improvement.abs() < 1e-3 {
-            stalled + 1
-        } else {
-            0
-        };
-        stage_its += 1;
+        print_iteration(it, compliance, max_disp, change, grey, proj.beta, &st, t0);
         result.iterations = it;
         result.compliance = compliance;
         result.max_disp = max_disp;
         result.stats.push(st);
-        let converged = change < s.tol || stalled >= 3;
-        // continuation: sharpen the projection each time the design settles (or after 25 iterations)
-        if proj.beta > 0.0 && proj.beta < s.beta_max && (converged || stage_its >= 25) {
-            proj.beta = (proj.beta * 2.0).min(s.beta_max);
-            println!("beta -> {}", proj.beta);
-            xphys = proj.densities(p, &xtilde);
-            stalled = 0;
-            stage_its = 0;
-            continue;
-        }
-        if change < s.tol {
-            println!("converged (density change < {})", s.tol);
-            break;
-        }
-        if stalled >= 3 {
-            println!("converged (compliance changed < 0.1% for 3 iterations)");
-            break;
+        match control.next(s, proj.beta, compliance, change) {
+            Next::Go => {}
+            Next::Beta(b) => {
+                proj.beta = b;
+                xphys = proj.densities(p, &xtilde);
+            }
+            Next::Stop => break,
         }
     }
     if let Some(snap) = pending {
         snap.write(p, out)?;
     }
+    print_done(&result, t_start, out);
+    Ok(result)
+}
+
+fn print_done(result: &Outcome, t_start: Instant, out: &Path) {
     println!(
         "done in {:.1} s: {} iterations, compliance {:.4e} N·mm, max displacement {:.4} mm",
         t_start.elapsed().as_secs_f64(),
@@ -999,7 +943,100 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         result.max_disp
     );
     println!("wrote {} (iteration {})", out.display(), result.iterations);
-    Ok(result)
+}
+
+/// The iteration line (`jobs::opt_progress` parses it).
+#[allow(clippy::too_many_arguments)]
+fn print_iteration(
+    it: usize,
+    compliance: f64,
+    max_disp: f64,
+    change: f64,
+    grey: f64,
+    beta: f64,
+    st: &IterStats,
+    t0: Instant,
+) {
+    let beta = if beta > 0.0 {
+        format!(", beta {beta}")
+    } else {
+        String::new()
+    };
+    println!(
+        "it {it:3}: compliance {compliance:.4e} N·mm, max displacement {max_disp:.4} mm, change {change:.3}, grey {:.0}%{beta}, {} CG its, {:.1} s [setup {:.2} solve {:.2} update {:.2} io {:.2}]",
+        grey * 100.0,
+        st.cg.iter().sum::<usize>(),
+        t0.elapsed().as_secs_f64(),
+        st.setup,
+        st.solve,
+        st.update,
+        st.io,
+    );
+}
+
+/// What to do after an iteration.
+enum Next {
+    Go,
+    /// sharpen the projection to this β
+    Beta(f64),
+    Stop,
+}
+
+/// Convergence and β continuation, shared by the CPU and GPU loops.
+#[derive(Default)]
+struct Control {
+    stalled: usize,
+    stage_its: usize,
+    last_compliance: f64,
+}
+
+impl Control {
+    fn next(&mut self, s: &Settings, beta: f64, compliance: f64, change: f64) -> Next {
+        // the max density change often hovers at the move limit while the design no longer
+        // improves, so also stop once compliance has stagnated
+        let improvement = (self.last_compliance - compliance) / compliance;
+        self.last_compliance = compliance;
+        self.stalled = if self.stage_its > 0 && improvement.abs() < 1e-3 {
+            self.stalled + 1
+        } else {
+            0
+        };
+        self.stage_its += 1;
+        let converged = change < s.tol || self.stalled >= 3;
+        // continuation: sharpen the projection each time the design settles (or after 25 iterations)
+        if beta > 0.0 && beta < s.beta_max && (converged || self.stage_its >= 25) {
+            let b = (beta * 2.0).min(s.beta_max);
+            println!("beta -> {b}");
+            self.stalled = 0;
+            self.stage_its = 0;
+            return Next::Beta(b);
+        }
+        if change < s.tol {
+            println!("converged (density change < {})", s.tol);
+            return Next::Stop;
+        }
+        if self.stalled >= 3 {
+            println!("converged (compliance changed < 0.1% for 3 iterations)");
+            return Next::Stop;
+        }
+        Next::Go
+    }
+}
+
+/// Keeps .vti writes under ~10% of the run time.
+#[derive(Default)]
+struct Throttle {
+    last: Option<(Instant, f64)>,
+}
+
+impl Throttle {
+    fn due(&self) -> bool {
+        self.last.is_none_or(|(t, dur)| t.elapsed().as_secs_f64() >= 10.0 * dur)
+    }
+
+    fn wrote(&mut self, started: Instant) {
+        self.last = Some((Instant::now(), started.elapsed().as_secs_f64()));
+    }
 }
 
 /// One iteration's output fields.

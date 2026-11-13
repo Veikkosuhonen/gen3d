@@ -15,33 +15,14 @@
 //! Each phase (setup, CG start, CG iteration, energies) is recorded once as a list of dispatches
 //! with fixed bind groups and replayed.
 
-use std::collections::HashMap;
-
-use anyhow::{Result, anyhow, bail};
-use wgpu::util::DeviceExt;
+use anyhow::{Result, bail};
 
 use super::Problem;
+use super::gpu_engine::{Engine, NONE, Params, Step, dims4, groups, threads};
 use super::mg::{self, MgSettings, Smoother};
-use crate::gpu::Gpu;
 
-const SRC: &str = include_str!("mg.wgsl");
-
-/// Kernel workgroup size for one-thread-per-item kernels (matches `WG` in mg.wgsl).
-const WG: usize = 128;
-/// Workgroups of the first reduction pass.
-const PARTIALS: usize = 1024;
 /// CG iterations between convergence checks.
 const CHECK_EVERY: usize = 4;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
-struct Params {
-    n: [u32; 4],
-    m: [u32; 4],
-    f: [f32; 4],
-}
-
-const NONE: u32 = u32::MAX;
 
 // scalar slots
 const RR: u32 = 0;
@@ -58,38 +39,12 @@ const SC: u32 = 10;
 /// λmax of level l at LAM + l, its inverse at INVL + l
 const LAM: u32 = 16;
 const INVL: u32 = 48;
-const SLOTS: usize = 80;
 
 // scalar kernel ops
 const OP_DIV: u32 = 0;
 const OP_COPY: u32 = 1;
 const OP_RSQRT: u32 = 2;
 const OP_RECIP: u32 = 3;
-
-const KERNELS: [&str; 16] = [
-    "apply_fine",
-    "diag_fine",
-    "apply_l1",
-    "diag_l1",
-    "apply_elem",
-    "diag_elem",
-    "assemble",
-    "restrict",
-    "prolong",
-    "lin",
-    "dot_partial",
-    "dot_final",
-    "scalar",
-    "fill_random",
-    "bottom",
-    "energy",
-];
-
-struct Step {
-    kernel: &'static str,
-    bind: wgpu::BindGroup,
-    groups: [u32; 3],
-}
 
 fn nodes(n: [usize; 3]) -> usize {
     n.iter().map(|v| v + 1).product()
@@ -99,36 +54,17 @@ fn coarse(n: [usize; 3]) -> [usize; 3] {
     n.map(|v| v.div_ceil(2))
 }
 
-fn groups(items: usize) -> [u32; 3] {
-    if items <= 65535 {
-        [items.max(1) as u32, 1, 1]
-    } else {
-        [65535, items.div_ceil(65535) as u32, 1]
-    }
-}
-
-fn threads(n: usize) -> [u32; 3] {
-    groups(n.div_ceil(WG))
-}
-
-fn dims4(n: [usize; 3]) -> [u32; 4] {
-    [n[0] as u32, n[1] as u32, n[2] as u32, 0]
-}
-
-pub(super) struct GpuMg<'g> {
-    gpu: &'g Gpu,
-    pipes: HashMap<&'static str, wgpu::ComputePipeline>,
+pub(super) struct GpuMg<'a> {
+    e: &'a Engine<'a>,
     /// elements per axis, per level (0 = fine)
     dims: Vec<[usize; 3]>,
     smoother: Smoother,
-    ee: wgpu::Buffer,
+    pub(super) ee: wgpu::Buffer,
     emask: wgpu::Buffer,
     free: wgpu::Buffer,
     ke: wgpu::Buffer,
     table: wgpu::Buffer,
-    scalars: wgpu::Buffer,
-    partials: wgpu::Buffer,
-    ce: wgpu::Buffer,
+    pub(super) ce: wgpu::Buffer,
     diag: Vec<wgpu::Buffer>,
     /// element matrices, levels ≥ 2 (index = level)
     mats: Vec<Option<wgpu::Buffer>>,
@@ -143,7 +79,7 @@ pub(super) struct GpuMg<'g> {
     z: wgpu::Buffer,
     p: wgpu::Buffer,
     q: wgpu::Buffer,
-    us: Vec<wgpu::Buffer>,
+    pub(super) us: Vec<wgpu::Buffer>,
     fs: Vec<wgpu::Buffer>,
     bottom: wgpu::Buffer,
     setup: Vec<Step>,
@@ -152,10 +88,15 @@ pub(super) struct GpuMg<'g> {
     energy: Vec<Step>,
 }
 
-impl<'g> GpuMg<'g> {
+impl<'a> GpuMg<'a> {
     /// Buffers and programs for a problem. `free` per node, as in `Fem`.
-    pub(super) fn new(gpu: &'g Gpu, p: &Problem, ke: &[[f64; 24]; 24], free: &[bool], s: &MgSettings) -> Result<Self> {
-        let dev = &gpu.device;
+    pub(super) fn new(
+        e: &'a Engine<'a>,
+        p: &Problem,
+        ke: &[[f64; 24]; 24],
+        free: &[bool],
+        s: &MgSettings,
+    ) -> Result<Self> {
         // levels: at least fine, level 1 (virtual) and one stored level
         let mut dims = vec![p.n, coarse(p.n), coarse(coarse(p.n))];
         loop {
@@ -168,10 +109,7 @@ impl<'g> GpuMg<'g> {
         let last = dims.len() - 1;
         let ne: usize = p.n.iter().product();
         let nf = 3 * nodes(p.n);
-        let limit = dev
-            .limits()
-            .max_storage_buffer_binding_size
-            .min(dev.limits().max_buffer_size);
+        let limit = e.max_binding();
         let bytes2 = 576 * 4 * dims[2].iter().product::<usize>() as u64;
         if (nf * 4) as u64 > limit || bytes2 > limit {
             bail!(
@@ -182,52 +120,8 @@ impl<'g> GpuMg<'g> {
             );
         }
 
-        let mut pipes = HashMap::new();
-        let prelude_at = SRC.find("//// prelude").ok_or_else(|| anyhow!("mg.wgsl: no prelude"))?;
-        let parts: Vec<&str> = SRC[prelude_at..].split("//// kernel ").collect();
-        let prelude = parts[0].trim_start_matches("//// prelude");
-        for part in &parts[1..] {
-            let (name, body) = part.split_once('\n').unwrap_or((part, ""));
-            let name = KERNELS
-                .iter()
-                .find(|k| **k == name.trim())
-                .ok_or_else(|| anyhow!("mg.wgsl: unknown kernel `{name}`"))?;
-            let src = format!("{prelude}\n{body}");
-            let pipe = gpu
-                .scoped(|| {
-                    let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-                        label: Some(name),
-                        source: wgpu::ShaderSource::Wgsl(src.into()),
-                    });
-                    dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                        label: Some(name),
-                        layout: None,
-                        module: &module,
-                        entry_point: Some("main"),
-                        compilation_options: Default::default(),
-                        cache: None,
-                    })
-                })
-                .map_err(|e| anyhow!("kernel {name}: {e}"))?;
-            pipes.insert(*name, pipe);
-        }
-
-        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
-        let buf = |label: &str, len: usize| {
-            dev.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size: (len.max(1) * 4) as u64,
-                usage,
-                mapped_at_creation: false,
-            })
-        };
-        let init = |label: &str, data: &[u8]| {
-            dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: data,
-                usage,
-            })
-        };
+        let buf = |label: &str, len: usize| e.buf(label, len);
+        let init = |label: &str, data: &[u8]| e.init(label, data);
         let ke32: Vec<f32> = ke.iter().flatten().map(|&v| v as f32).collect();
         let table: Vec<f32> = mg::masked_ptkp_table(ke).iter().map(|&v| v as f32).collect();
         let free32: Vec<u32> = free.iter().map(|&f| f as u32).collect();
@@ -256,17 +150,15 @@ impl<'g> GpuMg<'g> {
             })
             .collect();
         let bdofs = len(last);
+        let q = buf("cg q", nf);
         let mut g = GpuMg {
-            gpu,
-            pipes,
+            e,
             smoother: s.smoother,
             ee: buf("ee", ne),
             emask: init("emask", bytemuck::cast_slice(&emask)),
             free: init("free", bytemuck::cast_slice(&free32)),
             ke: init("ke", bytemuck::cast_slice(&ke32)),
             table: init("ptkp table", bytemuck::cast_slice(&table)),
-            scalars: buf("scalars", SLOTS),
-            partials: buf("partials", PARTIALS),
             ce: buf("ce", ne),
             diag: (0..=last).map(|l| buf("diag", len(l))).collect(),
             mats: (0..=last)
@@ -274,13 +166,16 @@ impl<'g> GpuMg<'g> {
                 .collect(),
             lb: (0..=last).map(|l| (l >= 1).then(|| buf("b", len(l)))).collect(),
             lx: (0..=last).map(|l| (l >= 1).then(|| buf("x", len(l)))).collect(),
-            lr: (0..last).map(|l| buf("r", len(l))).collect(),
+            // level 0's smoother residual shares CG's q, which is free during the V-cycle
+            lr: (0..last)
+                .map(|l| if l == 0 { q.clone() } else { buf("r", len(l)) })
+                .collect(),
             lt: (0..last).map(|l| buf("t", len(l))).collect(),
             ld: (0..last).map(|l| buf("d", len(l))).collect(),
             r: buf("cg r", nf),
             z: buf("cg z", nf),
             p: buf("cg p", nf),
-            q: buf("cg q", nf),
+            q,
             us: p.loads.iter().map(|_| buf("u", nf)).collect(),
             fs,
             bottom: buf("bottom inverse", bdofs * bdofs),
@@ -299,7 +194,7 @@ impl<'g> GpuMg<'g> {
         }
         for c in 0..g.us.len() {
             let mut e = vec![];
-            g.step(
+            g.e.step(
                 &mut e,
                 "energy",
                 Params {
@@ -331,36 +226,11 @@ impl<'g> GpuMg<'g> {
         3 * nodes(self.dims[l])
     }
 
-    fn step(&self, out: &mut Vec<Step>, kernel: &'static str, p: Params, bufs: &[&wgpu::Buffer], groups: [u32; 3]) {
-        let dev = &self.gpu.device;
-        let uniform = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some(kernel),
-            contents: bytemuck::bytes_of(&p),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-        let mut entries = vec![wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform.as_entire_binding(),
-        }];
-        for (i, b) in bufs.iter().enumerate() {
-            entries.push(wgpu::BindGroupEntry {
-                binding: i as u32 + 1,
-                resource: b.as_entire_binding(),
-            });
-        }
-        let bind = dev.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(kernel),
-            layout: &self.pipes[kernel].get_bind_group_layout(0),
-            entries: &entries,
-        });
-        out.push(Step { kernel, bind, groups });
-    }
-
     /// y = K_l u
     fn apply(&self, out: &mut Vec<Step>, l: usize, u: &wgpu::Buffer, y: &wgpu::Buffer) {
         let t = threads(nodes(self.dims[l]));
         match l {
-            0 => self.step(
+            0 => self.e.step(
                 out,
                 "apply_fine",
                 Params {
@@ -370,7 +240,7 @@ impl<'g> GpuMg<'g> {
                 &[&self.ee, &self.free, &self.ke, u, y],
                 t,
             ),
-            1 => self.step(
+            1 => self.e.step(
                 out,
                 "apply_l1",
                 Params {
@@ -380,7 +250,7 @@ impl<'g> GpuMg<'g> {
                 &[&self.ee, &self.emask, &self.table, u, y],
                 t,
             ),
-            _ => self.step(
+            _ => self.e.step(
                 out,
                 "apply_elem",
                 Params {
@@ -393,80 +263,10 @@ impl<'g> GpuMg<'g> {
         }
     }
 
-    /// y = a y + c x (x / w where w > 0 when `w` is given); a and c optionally times a scalar slot
-    #[allow(clippy::too_many_arguments)]
-    fn lin(
-        &self,
-        out: &mut Vec<Step>,
-        y: &wgpu::Buffer,
-        x: &wgpu::Buffer,
-        w: Option<&wgpu::Buffer>,
-        a: (f32, u32),
-        c: (f32, u32),
-        len: usize,
-    ) {
-        self.step(
-            out,
-            "lin",
-            Params {
-                m: [len as u32, a.1, c.1, w.is_some() as u32],
-                f: [a.0, c.0, 0.0, 0.0],
-                ..Default::default()
-            },
-            &[&self.scalars, x, w.unwrap_or(x), y],
-            threads(len),
-        );
-    }
-
-    /// S[slot] = Σ a b (w)
-    fn dot(
-        &self,
-        out: &mut Vec<Step>,
-        a: &wgpu::Buffer,
-        b: &wgpu::Buffer,
-        w: Option<&wgpu::Buffer>,
-        len: usize,
-        slot: u32,
-    ) {
-        self.step(
-            out,
-            "dot_partial",
-            Params {
-                m: [len as u32, w.is_some() as u32, 0, 0],
-                ..Default::default()
-            },
-            &[a, b, w.unwrap_or(a), &self.partials],
-            [PARTIALS as u32, 1, 1],
-        );
-        self.step(
-            out,
-            "dot_final",
-            Params {
-                m: [PARTIALS as u32, slot, 0, 0],
-                ..Default::default()
-            },
-            &[&self.partials, &self.scalars],
-            [1, 1, 1],
-        );
-    }
-
-    fn scalar(&self, out: &mut Vec<Step>, op: u32, a: u32, b: u32, dst: u32) {
-        self.step(
-            out,
-            "scalar",
-            Params {
-                m: [op, a, b, dst],
-                ..Default::default()
-            },
-            &[&self.scalars],
-            [1, 1, 1],
-        );
-    }
-
     fn record_setup(&self) -> Vec<Step> {
         let mut out = vec![];
         let last = self.last();
-        self.step(
+        self.e.step(
             &mut out,
             "diag_fine",
             Params {
@@ -476,7 +276,7 @@ impl<'g> GpuMg<'g> {
             &[&self.ee, &self.free, &self.ke, &self.diag[0]],
             threads(nodes(self.dims[0])),
         );
-        self.step(
+        self.e.step(
             &mut out,
             "diag_l1",
             Params {
@@ -493,7 +293,7 @@ impl<'g> GpuMg<'g> {
             } else {
                 (self.dims[l - 1], 0, self.mats[l - 1].as_ref().unwrap())
             };
-            self.step(
+            self.e.step(
                 &mut out,
                 "assemble",
                 Params {
@@ -504,7 +304,7 @@ impl<'g> GpuMg<'g> {
                 &[&self.ee, &self.emask, &self.table, child, mats],
                 groups(self.dims[l].iter().product()),
             );
-            self.step(
+            self.e.step(
                 &mut out,
                 "diag_elem",
                 Params {
@@ -518,7 +318,7 @@ impl<'g> GpuMg<'g> {
         // λmax(D⁻¹K) per smoothed level, by power iteration
         for l in 0..last {
             let (v, kv, d, n) = (&self.lr[l], &self.lt[l], &self.diag[l], self.len(l));
-            self.step(
+            self.e.step(
                 &mut out,
                 "fill_random",
                 Params {
@@ -530,15 +330,15 @@ impl<'g> GpuMg<'g> {
             );
             for _ in 0..12 {
                 self.apply(&mut out, l, v, kv);
-                self.dot(&mut out, v, kv, None, n, NUM);
-                self.dot(&mut out, v, v, Some(d), n, DEN);
-                self.scalar(&mut out, OP_DIV, NUM, DEN, LAM + l as u32);
-                self.lin(&mut out, v, kv, Some(d), (0.0, NONE), (1.0, NONE), n);
-                self.dot(&mut out, v, v, Some(d), n, NRM);
-                self.scalar(&mut out, OP_RSQRT, NRM, NRM, SC);
-                self.lin(&mut out, v, kv, None, (1.0, SC), (0.0, NONE), n);
+                self.e.dot(&mut out, v, kv, None, n, NUM);
+                self.e.dot(&mut out, v, v, Some(d), n, DEN);
+                self.e.scalar(&mut out, OP_DIV, NUM, DEN, LAM + l as u32);
+                self.e.lin(&mut out, v, kv, Some(d), (0.0, NONE), (1.0, NONE), n);
+                self.e.dot(&mut out, v, v, Some(d), n, NRM);
+                self.e.scalar(&mut out, OP_RSQRT, NRM, NRM, SC);
+                self.e.lin(&mut out, v, kv, None, (1.0, SC), (0.0, NONE), n);
             }
-            self.scalar(&mut out, OP_RECIP, LAM + l as u32, 0, INVL + l as u32);
+            self.e.scalar(&mut out, OP_RECIP, LAM + l as u32, 0, INVL + l as u32);
         }
         out
     }
@@ -549,10 +349,10 @@ impl<'g> GpuMg<'g> {
         // r = b - K x
         let residual = |out: &mut Vec<Step>, zero: bool| {
             if zero {
-                self.lin(out, r, b, None, (0.0, NONE), (1.0, NONE), n);
+                self.e.lin(out, r, b, None, (0.0, NONE), (1.0, NONE), n);
             } else {
                 self.apply(out, l, x, r);
-                self.lin(out, r, b, None, (-1.0, NONE), (1.0, NONE), n);
+                self.e.lin(out, r, b, None, (-1.0, NONE), (1.0, NONE), n);
             }
         };
         match self.smoother {
@@ -561,7 +361,7 @@ impl<'g> GpuMg<'g> {
                     let zero = zero_start && k == 0;
                     residual(out, zero);
                     let a = if zero { 0.0 } else { 1.0 };
-                    self.lin(out, x, r, Some(diag), (a, NONE), (omega as f32, invl), n);
+                    self.e.lin(out, x, r, Some(diag), (a, NONE), (omega as f32, invl), n);
                 }
             }
             Smoother::Chebyshev { degree } => {
@@ -569,17 +369,18 @@ impl<'g> GpuMg<'g> {
                 let sigma = 1.2f64;
                 let mut rho = 1.0 / sigma;
                 residual(out, zero_start);
-                self.lin(out, d, r, Some(diag), (0.0, NONE), ((1.0 / 0.6) as f32, invl), n);
+                self.e
+                    .lin(out, d, r, Some(diag), (0.0, NONE), ((1.0 / 0.6) as f32, invl), n);
                 for k in 1..=degree {
                     let a = if zero_start && k == 1 { 0.0 } else { 1.0 };
-                    self.lin(out, x, d, None, (a, NONE), (1.0, NONE), n);
+                    self.e.lin(out, x, d, None, (a, NONE), (1.0, NONE), n);
                     if k == degree {
                         break;
                     }
                     self.apply(out, l, d, t);
-                    self.lin(out, r, t, None, (1.0, NONE), (-1.0, NONE), n);
+                    self.e.lin(out, r, t, None, (1.0, NONE), (-1.0, NONE), n);
                     let rho_new = 1.0 / (2.0 * sigma - rho);
-                    self.lin(
+                    self.e.lin(
                         out,
                         d,
                         r,
@@ -597,7 +398,7 @@ impl<'g> GpuMg<'g> {
     fn vcycle(&self, out: &mut Vec<Step>, l: usize, b: &wgpu::Buffer, x: &wgpu::Buffer) {
         if l == self.last() {
             let n = self.len(l);
-            self.step(
+            self.e.step(
                 out,
                 "bottom",
                 Params {
@@ -613,9 +414,9 @@ impl<'g> GpuMg<'g> {
         self.smooth(out, l, b, x, true);
         let r = &self.lr[l];
         self.apply(out, l, x, r);
-        self.lin(out, r, b, None, (-1.0, NONE), (1.0, NONE), n);
+        self.e.lin(out, r, b, None, (-1.0, NONE), (1.0, NONE), n);
         let (cb, cx) = (self.lb[l + 1].as_ref().unwrap(), self.lx[l + 1].as_ref().unwrap());
-        self.step(
+        self.e.step(
             out,
             "restrict",
             Params {
@@ -626,7 +427,7 @@ impl<'g> GpuMg<'g> {
             threads(nodes(self.dims[l + 1])),
         );
         self.vcycle(out, l + 1, cb, cx);
-        self.step(
+        self.e.step(
             out,
             "prolong",
             Params {
@@ -644,13 +445,15 @@ impl<'g> GpuMg<'g> {
         let n = self.len(0);
         let (u, f) = (&self.us[c], &self.fs[c]);
         self.apply(&mut out, 0, u, &self.q);
-        self.lin(&mut out, &self.r, f, None, (0.0, NONE), (1.0, NONE), n);
-        self.lin(&mut out, &self.r, &self.q, None, (1.0, NONE), (-1.0, NONE), n);
-        self.dot(&mut out, &self.r, &self.r, None, n, RR);
-        self.dot(&mut out, f, f, None, n, FF);
+        self.e.lin(&mut out, &self.r, f, None, (0.0, NONE), (1.0, NONE), n);
+        self.e
+            .lin(&mut out, &self.r, &self.q, None, (1.0, NONE), (-1.0, NONE), n);
+        self.e.dot(&mut out, &self.r, &self.r, None, n, RR);
+        self.e.dot(&mut out, f, f, None, n, FF);
         self.vcycle(&mut out, 0, &self.r, &self.z);
-        self.lin(&mut out, &self.p, &self.z, None, (0.0, NONE), (1.0, NONE), n);
-        self.dot(&mut out, &self.r, &self.z, None, n, RZ);
+        self.e
+            .lin(&mut out, &self.p, &self.z, None, (0.0, NONE), (1.0, NONE), n);
+        self.e.dot(&mut out, &self.r, &self.z, None, n, RZ);
         out
     }
 
@@ -659,61 +462,49 @@ impl<'g> GpuMg<'g> {
         let n = self.len(0);
         let u = &self.us[c];
         self.apply(&mut out, 0, &self.p, &self.q);
-        self.dot(&mut out, &self.p, &self.q, None, n, PQ);
-        self.scalar(&mut out, OP_DIV, RZ, PQ, ALPHA);
-        self.lin(&mut out, u, &self.p, None, (1.0, NONE), (1.0, ALPHA), n);
-        self.lin(&mut out, &self.r, &self.q, None, (1.0, NONE), (-1.0, ALPHA), n);
+        self.e.dot(&mut out, &self.p, &self.q, None, n, PQ);
+        self.e.scalar(&mut out, OP_DIV, RZ, PQ, ALPHA);
+        self.e.lin(&mut out, u, &self.p, None, (1.0, NONE), (1.0, ALPHA), n);
+        self.e
+            .lin(&mut out, &self.r, &self.q, None, (1.0, NONE), (-1.0, ALPHA), n);
         self.vcycle(&mut out, 0, &self.r, &self.z);
-        self.dot(&mut out, &self.r, &self.z, None, n, RZN);
-        self.scalar(&mut out, OP_DIV, RZN, RZ, BETA);
-        self.scalar(&mut out, OP_COPY, RZN, RZN, RZ);
-        self.lin(&mut out, &self.p, &self.z, None, (1.0, BETA), (1.0, NONE), n);
-        self.dot(&mut out, &self.r, &self.r, None, n, RR);
+        self.e.dot(&mut out, &self.r, &self.z, None, n, RZN);
+        self.e.scalar(&mut out, OP_DIV, RZN, RZ, BETA);
+        self.e.scalar(&mut out, OP_COPY, RZN, RZN, RZ);
+        self.e
+            .lin(&mut out, &self.p, &self.z, None, (1.0, BETA), (1.0, NONE), n);
+        self.e.dot(&mut out, &self.r, &self.r, None, n, RR);
         out
     }
 
-    fn run(&self, programs: &[&[Step]]) {
-        let mut enc = self.gpu.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = enc.begin_compute_pass(&Default::default());
-            for prog in programs {
-                for s in prog.iter() {
-                    pass.set_pipeline(&self.pipes[s.kernel]);
-                    pass.set_bind_group(0, &s.bind, &[]);
-                    pass.dispatch_workgroups(s.groups[0], s.groups[1], s.groups[2]);
-                }
-            }
-        }
-        self.gpu.queue.submit([enc.finish()]);
-    }
-
-    fn read_f32(&self, b: &wgpu::Buffer, len: usize) -> Result<Vec<f32>> {
-        let bytes = self.gpu.read_buffer(b, (len * 4) as u64)?;
-        Ok(bytemuck::cast_slice(&bytes).to_vec())
-    }
-
     /// Build the hierarchy for element stiffnesses `ee` (E_e h per fine element).
+    #[cfg(test)]
     pub(super) fn set_stiffness(&self, ee: &[f64]) -> Result<()> {
         let ee32: Vec<f32> = ee.iter().map(|&v| v as f32).collect();
-        self.gpu.queue.write_buffer(&self.ee, 0, bytemuck::cast_slice(&ee32));
-        self.run(&[&self.setup]);
+        self.e.write_f32(&self.ee, &ee32);
+        self.build()
+    }
+
+    /// Build the hierarchy for the element stiffnesses already in `ee`.
+    pub(super) fn build(&self) -> Result<()> {
+        self.e.run(&[&self.setup])?;
         // exact solve on the coarsest level
         let last = self.last();
         let n = self.dims[last];
-        let mats = self.read_f32(self.mats[last].as_ref().unwrap(), 576 * n.iter().product::<usize>())?;
+        let mats = self
+            .e
+            .read_f32(self.mats[last].as_ref().unwrap(), 576 * n.iter().product::<usize>())?;
         let inv = mg::dense_inverse(n, mats.iter().map(|&v| v as f64).collect());
         let inv32: Vec<f32> = inv.iter().map(|&v| v as f32).collect();
-        self.gpu
-            .queue
-            .write_buffer(&self.bottom, 0, bytemuck::cast_slice(&inv32));
+        self.e.write_f32(&self.bottom, &inv32);
         Ok(())
     }
 
     /// Solve load case `c` from its previous solution to relative residual `tol`. Returns the CG
     /// iterations (a multiple of the check interval).
     pub(super) fn solve(&self, c: usize, tol: f64, maxit: usize) -> Result<usize> {
-        self.run(&[&self.init[c]]);
-        let s = self.read_f32(&self.scalars, SLOTS)?;
+        self.e.run(&[&self.init[c]])?;
+        let s = self.e.read_scalars()?;
         let target = (tol * tol) as f32 * s[FF as usize];
         if s[RR as usize] <= target {
             return Ok(0);
@@ -721,9 +512,9 @@ impl<'g> GpuMg<'g> {
         let mut its = 0;
         let batch: Vec<&[Step]> = vec![&self.iter[c]; CHECK_EVERY];
         while its < maxit {
-            self.run(&batch);
+            self.e.run(&batch)?;
             its += CHECK_EVERY;
-            let rr = self.read_f32(&self.scalars, SLOTS)?[RR as usize];
+            let rr = self.e.read_scalars()?[RR as usize];
             if !rr.is_finite() {
                 bail!("GPU CG diverged (residual {rr})");
             }
@@ -734,20 +525,19 @@ impl<'g> GpuMg<'g> {
         Ok(its)
     }
 
-    /// Per fine element: Σ over load cases of u_eᵀ ke u_e.
-    pub(super) fn energies(&self) -> Result<Vec<f32>> {
-        self.run(&[&self.energy]);
-        self.read_f32(&self.ce, self.dims[0].iter().product())
+    /// `ce` = per fine element, Σ over load cases of u_eᵀ ke u_e (stays on the GPU).
+    pub(super) fn compute_energies(&self) -> Result<()> {
+        self.e.run(&[&self.energy])
     }
 
     pub(super) fn displacement(&self, c: usize) -> Result<Vec<f32>> {
-        self.read_f32(&self.us[c], self.len(0))
+        self.e.read_f32(&self.us[c], self.len(0))
     }
 
     /// Scalar slot (tests): λmax estimate of level l.
     #[cfg(test)]
     fn lambda(&self, l: usize) -> Result<f32> {
-        Ok(self.read_f32(&self.scalars, SLOTS)?[(LAM + l as u32) as usize])
+        Ok(self.e.read_scalars()?[(LAM + l as u32) as usize])
     }
 }
 
@@ -823,7 +613,8 @@ mod tests {
                 .collect(),
             free: free.clone(),
         };
-        let g = GpuMg::new(&gpu, &p, &ke, &free, &MgSettings::default()).unwrap();
+        let eng = Engine::new(&gpu).unwrap();
+        let g = GpuMg::new(&eng, &p, &ke, &free, &MgSettings::default()).unwrap();
         g.set_stiffness(&fem.ee).unwrap();
         let write = |b: &wgpu::Buffer, v: &[f64]| {
             let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
@@ -842,13 +633,13 @@ mod tests {
         write(&g.p, &u);
         let mut prog = vec![];
         g.apply(&mut prog, 0, &g.p, &g.q);
-        g.run(&[&prog]);
+        g.e.run(&[&prog]).unwrap();
         let mut want = vec![0.0; n0];
         fem.matvec(&u, &mut want);
-        close(&g.read_f32(&g.q, n0).unwrap(), &want, "fine K u");
+        close(&g.e.read_f32(&g.q, n0).unwrap(), &want, "fine K u");
         let inv = fem.inv_diag();
         let d: Vec<f64> = inv.iter().map(|&v| if v > 0.0 { 1.0 / v } else { 0.0 }).collect();
-        close(&g.read_f32(&g.diag[0], n0).unwrap(), &d, "fine diagonal");
+        close(&g.e.read_f32(&g.diag[0], n0).unwrap(), &d, "fine diagonal");
 
         // level 1: Pᵀ K P against the CPU's assembled level
         let c1 = mg::tests_api::level1(&fem);
@@ -857,13 +648,13 @@ mod tests {
         write(g.lb[1].as_ref().unwrap(), &v);
         let mut prog = vec![];
         g.apply(&mut prog, 1, g.lb[1].as_ref().unwrap(), g.lx[1].as_ref().unwrap());
-        g.run(&[&prog]);
+        g.e.run(&[&prog]).unwrap();
         close(
-            &g.read_f32(g.lx[1].as_ref().unwrap(), n1).unwrap(),
+            &g.e.read_f32(g.lx[1].as_ref().unwrap(), n1).unwrap(),
             &c1.0(&v),
             "level-1 K u",
         );
-        close(&g.read_f32(&g.diag[1], n1).unwrap(), &c1.1, "level-1 diagonal");
+        close(&g.e.read_f32(&g.diag[1], n1).unwrap(), &c1.1, "level-1 diagonal");
 
         // level 2, assembled on the GPU
         let c2 = mg::tests_api::level2(&fem);
@@ -872,9 +663,9 @@ mod tests {
         write(g.lb[2].as_ref().unwrap(), &v);
         let mut prog = vec![];
         g.apply(&mut prog, 2, g.lb[2].as_ref().unwrap(), g.lx[2].as_ref().unwrap());
-        g.run(&[&prog]);
+        g.e.run(&[&prog]).unwrap();
         close(
-            &g.read_f32(g.lx[2].as_ref().unwrap(), n2).unwrap(),
+            &g.e.read_f32(g.lx[2].as_ref().unwrap(), n2).unwrap(),
             &c2(&v),
             "level-2 K u",
         );
@@ -882,7 +673,7 @@ mod tests {
         // transfers
         write(&g.lr[0], &u);
         let mut prog = vec![];
-        g.step(
+        g.e.step(
             &mut prog,
             "restrict",
             Params {
@@ -892,15 +683,15 @@ mod tests {
             &[&g.lr[0], g.lb[1].as_ref().unwrap()],
             threads(nodes(g.dims[1])),
         );
-        g.run(&[&prog]);
+        g.e.run(&[&prog]).unwrap();
         let mut want = vec![0.0; n1];
         mg::tests_api::restrict(p.n, &u, &mut want);
-        close(&g.read_f32(g.lb[1].as_ref().unwrap(), n1).unwrap(), &want, "restrict");
+        close(&g.e.read_f32(g.lb[1].as_ref().unwrap(), n1).unwrap(), &want, "restrict");
         let v = pseudo(n1, 4);
         write(g.lx[1].as_ref().unwrap(), &v);
         write(&g.z, &u);
         let mut prog = vec![];
-        g.step(
+        g.e.step(
             &mut prog,
             "prolong",
             Params {
@@ -910,10 +701,10 @@ mod tests {
             &[g.lx[1].as_ref().unwrap(), &g.diag[0], &g.z],
             threads(nodes(g.dims[0])),
         );
-        g.run(&[&prog]);
+        g.e.run(&[&prog]).unwrap();
         let mut want = u.clone();
         mg::tests_api::prolong_add(p.n, &v, &mut want, &inv);
-        close(&g.read_f32(&g.z, n0).unwrap(), &want, "prolong");
+        close(&g.e.read_f32(&g.z, n0).unwrap(), &want, "prolong");
 
         // λmax estimates are positive and of the CPU's size
         for l in 0..g.last() {
@@ -967,7 +758,8 @@ mod tests {
         let mut m = mg::Multigrid::new(&fem, &MgSettings::default());
         let mut u = vec![0.0; f.len()];
         fem.solve(&f, &mut u, 1e-10, 1000, &mut |r, z| m.precondition(r, z));
-        let g = GpuMg::new(&gpu, &p, &ke, &free, &MgSettings::default()).unwrap();
+        let eng = Engine::new(&gpu).unwrap();
+        let g = GpuMg::new(&eng, &p, &ke, &free, &MgSettings::default()).unwrap();
         g.set_stiffness(&fem.ee).unwrap();
         let its = g.solve(0, 1e-5, 1000).unwrap();
         let ug = g.displacement(0).unwrap();

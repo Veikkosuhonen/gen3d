@@ -10,6 +10,7 @@ struct Params {
     n: vec4<u32>,
     m: vec4<u32>,
     f: vec4<f32>,
+    g: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> P: Params;
 
@@ -518,7 +519,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel dot_partial
-// partials[g] = Σ a b (× w when P.m.y == 1) over a grid-stride share of the P.m.x entries.
+// partials[g] = a reduction over a grid-stride share of the P.m.x entries. P.m.y: 0 Σ a b, 1 Σ a b w,
+// 2 max |a - b| where w > 0, 3 count of 0.1 < a < 0.9 where w > 0, 4 max |a_i| of 3-vectors (P.m.x =
+// vectors).
 @group(0) @binding(1) var<storage, read> a: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
 @group(0) @binding(3) var<storage, read> w: array<f32>;
@@ -530,23 +533,31 @@ var<workgroup> sh: array<f32, 128>;
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
     let n = P.m.x;
+    let mode = P.m.y;
+    let is_max = mode == 2u || mode == 4u;
     var s = 0.0;
     for (var i = wg.x * WG + li; i < n; i += nwg.x * WG) {
-        var t = a[i] * b[i];
-        if P.m.y == 1u { t *= w[i]; }
-        s += t;
+        switch mode {
+            case 0u: { s += a[i] * b[i]; }
+            case 1u: { s += a[i] * b[i] * w[i]; }
+            case 2u: { if w[i] > 0.0 { s = max(s, abs(a[i] - b[i])); } }
+            case 3u: { if w[i] > 0.0 && a[i] > 0.1 && a[i] < 0.9 { s += 1.0; } }
+            default: { s = max(s, length(vec3<f32>(a[3u * i], a[3u * i + 1u], a[3u * i + 2u]))); }
+        }
     }
     sh[li] = s;
     workgroupBarrier();
     for (var k = 64u; k > 0u; k >>= 1u) {
-        if li < k { sh[li] += sh[li + k]; }
+        if li < k {
+            if is_max { sh[li] = max(sh[li], sh[li + k]); } else { sh[li] += sh[li + k]; }
+        }
         workgroupBarrier();
     }
     if li == 0u { partials[wg.x] = sh[0]; }
 }
 
 //// kernel dot_final
-// S[P.m.y] = Σ partials[0 .. P.m.x]
+// S[P.m.y] = Σ (or max, when P.m.z == 1) of partials[0 .. P.m.x]
 @group(0) @binding(1) var<storage, read> partials: array<f32>;
 @group(0) @binding(2) var<storage, read_write> S: array<f32>;
 
@@ -554,12 +565,17 @@ var<workgroup> sh: array<f32, 128>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(local_invocation_index) li: u32) {
+    let is_max = P.m.z == 1u;
     var s = 0.0;
-    for (var i = li; i < P.m.x; i += WG) { s += partials[i]; }
+    for (var i = li; i < P.m.x; i += WG) {
+        if is_max { s = max(s, partials[i]); } else { s += partials[i]; }
+    }
     sh[li] = s;
     workgroupBarrier();
     for (var k = 64u; k > 0u; k >>= 1u) {
-        if li < k { sh[li] += sh[li + k]; }
+        if li < k {
+            if is_max { sh[li] = max(sh[li], sh[li + k]); } else { sh[li] += sh[li + k]; }
+        }
         workgroupBarrier();
     }
     if li == 0u { S[P.m.y] = sh[0]; }

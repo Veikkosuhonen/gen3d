@@ -393,16 +393,19 @@ watch the design form; **Stop** ends the run and keeps the last iteration.
   part. `--no-projection` gives the faster, softer-edged grey result.
 - **Speed:** each iteration solves the stiffness system with conjugate gradient preconditioned by
   geometric multigrid (a V-cycle with Chebyshev smoothing and Galerkin coarse levels; the fine level
-  is matrix-free), warm-started. It runs on the GPU in f32 (`--solver gpu`, the default with a
-  hardware GPU) or on the CPU in f64 (`--solver mg`, multithreaded). Solves are looser while the
-  design still moves a lot and reach full accuracy at the final β. CG needs about 8–12 iterations per
-  solve at any grid size. The default voxel keeps the bounds at about 40k elements, where the bracket
-  runs 50 iterations in about 3 s. At 0.4 mm (1.2M domain elements) the GPU solve takes 0.16 s per
-  iteration (CPU multigrid 5 s, the old Jacobi-preconditioned CG `--solver jacobi` 74 s). Density
-  filter and update still run on the CPU and now dominate on large grids (1.4 s at 1.2M elements).
-  Grids up to 100M elements are allowed on the GPU, 8M on the CPU (~1.2 kB of memory per element).
+  is matrix-free), warm-started. With a hardware GPU (`--solver gpu`, the default) the whole iteration
+  runs there in f32: solve, sensitivities, filter, projection and the OC update. Only a few numbers
+  come back per iteration, plus the fields when the `.vti` is written. Without one, `--solver mg` runs
+  the same on the CPU in f64, multithreaded. Solves are looser while the design still moves a lot and
+  reach full accuracy at the final β. CG needs about 8–13 iterations per solve at any grid size.
+  - The default voxel keeps the bounds at about 40k elements; the bracket runs 50 iterations in 1.4 s.
+  - Per iteration on an RTX 3080: 0.22 s at 1.2M elements, 2.1 s at 9.5M, 5.6 s at 22M.
+  - CPU multigrid: 7.7 s at 1.2M; the old Jacobi-preconditioned CG (`--solver jacobi`): 76 s.
+  - A 10 GB GPU holds about 25–30M elements (~230 B each). Past that, `optimize` says it doesn't
+    fit. The CPU solver allows 8M (~1.2 kB each).
 - **Shortcuts in this version:**
-  - The filter and density update are not on the GPU yet (see `docs/topopt-scaling-plan.md`).
+  - The `.vti` is written at full resolution, which takes seconds at tens of millions of elements;
+    it is throttled to ~10% of the run time.
   - No symmetry or overhang (printability) constraints.
 
 ## Mesh quality notes
@@ -454,5 +457,7 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing |
 | `src/topopt/mod.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
 | `src/topopt/mg.rs` | multigrid preconditioner: Galerkin coarse levels, Chebyshev/Jacobi smoothers, banded Cholesky |
-| `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32): kernels, recorded dispatch programs |
+| `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32) |
+| `src/topopt/gpu_opt.rs`, `opt.wgsl` | the optimizer loop on the GPU: stiffness, sensitivities, filter, projection, OC |
+| `src/topopt/gpu_engine.rs` | GPU kernels as recorded dispatch programs, reductions, scalars, readback |
 | `src/wgsl/sdf.wgsl` | the SDF library |

@@ -121,6 +121,16 @@ impl Gpu {
         }
     }
 
+    /// Like `scoped`, but also catches running out of GPU memory.
+    pub fn alloc_scoped<T>(&self, f: impl FnOnce() -> T) -> Result<T> {
+        let oom = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let out = self.scoped(f);
+        if let Some(e) = pollster::block_on(oom.pop()) {
+            return Err(anyhow!("out of GPU memory ({e})"));
+        }
+        out
+    }
+
     /// Copy `size` bytes of `src` back to the CPU.
     pub fn read_buffer(&self, src: &wgpu::Buffer, size: u64) -> Result<Vec<u8>> {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {

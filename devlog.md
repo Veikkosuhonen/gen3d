@@ -3,6 +3,73 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: The whole optimizer iteration on the GPU (scaling plan step 4)
+
+**What:** with `--solver gpu` (the default on hardware GPUs) every per-element step runs on the GPU
+too: stiffness from densities, sensitivities through the projection, the density filter (forward and
+transposed), Heaviside projection, and the OC update with its λ search. Per iteration only scalars come
+back: compliance, the volume at each λ trial, change, grey share and max displacement. The fields come
+back only when the `.vti` is written (throttled; the densities the solve used are kept on the GPU so
+the final iteration can still be written).
+
+**How:**
+- `gpu_engine.rs`: the shared machinery, split out of the solver. It compiles the kernels of
+  `mg.wgsl` and `opt.wgsl` (each `//// kernel` section is its own module with the shared prelude). It
+  records programs (dispatch lists with fixed bind groups), keeps a scalar buffer, and does reductions
+  (dot, weighted dot, max |a − b|, grey count, max vector norm) and readback. Every submit runs in a
+  validation error scope, so a bad binding fails the run instead of only being logged; that caught a
+  buffer bound for reading and writing in one dispatch.
+- `gpu_opt.rs`: the loop. The λ search is the CPU's (bracket around the previous λ, then bisect), with
+  the volume of each trial read back: ~18 small readbacks per iteration, negligible next to the solve.
+  Convergence, β continuation and the iteration line come from shared helpers (`Control`,
+  `print_iteration`), so the CPU and GPU loops can't drift apart.
+- Memory: level 0's smoother residual shares CG's `q`, and the unfiltered compliance sensitivity
+  shares `xnew`. Allocation runs in an out-of-memory error scope. Buffers are filled with
+  `write_buffer` rather than `create_buffer_init`, which panics when the allocation fails. A grid that
+  doesn't fit now says so: "35.1M elements don't fit on this GPU; use a larger --voxel".
+
+**Measured** (bracket; mean of 2–4 iterations; RTX 3080):
+
+| voxel | domain elements | CG its/solve | setup s | solve s | update s | io s | s/iter |
+|---|---|---|---|---|---|---|---|
+| 1.3 | 34k | 9 | 0.012 | 0.015 | 0.002 | 0.001 | 0.030 |
+| 0.5 | 607k | 9 | 0.037 | 0.063 | 0.007 | 0.008 | 0.115 |
+| 0.4 | 1.19M | 12 | 0.043 | 0.150 | 0.012 | 0.019 | 0.224 |
+| 0.25 | 4.9M | 11 | 0.21 | 0.68 | 0.045 | 0.065 | 0.99 |
+| 0.2 | 9.5M | 12 | 0.39 | 1.49 | 0.091 | 0.11 | 2.08 |
+| 0.15 | 22.5M | 13 | 0.99 | 4.0 | 0.20 | 0.43 | 5.6 |
+
+- The update (filter + OC) went from 5.3 s on the CPU to 0.045 s at 4.9M elements.
+- The default bracket run takes 1.4 s for 50 iterations, from 77 s this morning.
+- 35M elements doesn't fit in 10 GB.
+
+**Verified:**
+- New test: the GPU loop follows the CPU loop on a two-load-case cantilever with a kept-solid strip,
+  with and without projection. Compliance agrees within 2e-3 at every iteration (4 digits in
+  practice), and the written densities agree.
+- Bracket: 8.9645 (CPU 8.9635), 8 of 13k elements flip. `bracket_editor`: 13.291 (reference 13.289),
+  4 flips. `--no-projection`: 10.356, as on the CPU.
+- 32 tests pass; clippy and fmt are clean.
+
+**Open / next:**
+- Memory, ~230 B per element now:
+  - fine vectors: 9 + 2 per load case, 12 B per node each;
+  - 13 per-element arrays;
+  - level-2 matrices: 36 B per element.
+
+  Ideas, roughly by payoff:
+  - f per load case as a sparse list (loads touch few nodes);
+  - flags/emask/free packed into bits;
+  - drop `design` (use the flags);
+  - level 2 as symmetric halves or node stencils;
+  - fp16 storage for some vectors.
+- Speed: per CG iteration about 0.3 s at 22M elements, more than the fine mat-vecs alone should cost
+  (~5 per iteration). Level 1 on the fly (compute-bound, dynamic T indexing) and the smoother's many
+  small `lin` passes are the likely costs. Next is profiling with timestamp queries.
+- Setup is ~1 s at 22M: power iterations (12 per level), assembly, and the coarsest inverse round
+  trip. The λmax estimates could be reused across iterations.
+- Output at this scale: decimated live preview, full fields at the end (plan step 5).
+
 ## 2026-11-13: MGCG on the GPU (scaling plan step 4, first part)
 
 **What:** `--solver gpu` runs the whole multigrid-preconditioned CG on the GPU in f32: mat-vecs,
