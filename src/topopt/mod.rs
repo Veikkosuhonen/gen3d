@@ -1377,6 +1377,9 @@ struct Control {
     stalled: usize,
     stage_its: usize,
     last_compliance: f64,
+    /// the final stage's lowest compliance, and the iterations since it last improved by over 0.1%
+    best: f64,
+    since_best: usize,
 }
 
 impl Control {
@@ -1390,6 +1393,14 @@ impl Control {
         } else {
             0
         };
+        // at the final β (sharp projection), OC tends to oscillate: compliance alternates by ~0.1%,
+        // which keeps resetting `stalled` without the design improving
+        if self.stage_its == 0 || compliance < self.best * (1.0 - 1e-3) {
+            self.best = compliance;
+            self.since_best = 0;
+        } else {
+            self.since_best += 1;
+        }
         self.stage_its += 1;
         let converged = change < s.tol || self.stalled >= 3;
         // continuation: sharpen the projection each time the design settles (or after 25 iterations)
@@ -1406,6 +1417,11 @@ impl Control {
         }
         if self.stalled >= 3 {
             println!("converged (compliance changed < 0.1% for 3 iterations)");
+            return Next::Stop;
+        }
+        let final_stage = beta == 0.0 || beta >= s.beta_max;
+        if final_stage && self.since_best >= 3 {
+            println!("converged (compliance hasn't improved by 0.1% in 3 iterations)");
             return Next::Stop;
         }
         Next::Go
@@ -1452,6 +1468,50 @@ pub(super) mod tests {
         // no coarse domain cell nearby: volfrac
         coarse.domain.fill(false);
         assert_eq!(prolong_design(&coarse, &xc, &fine, 0.3)[0], 0.3);
+    }
+
+    #[test]
+    fn oscillation_at_the_final_beta_stops_the_run() {
+        let s = Settings {
+            voxel: 1.0,
+            volfrac: 0.3,
+            penal: 3.0,
+            rmin: 1.5,
+            iters: 100,
+            tol: 0.01,
+            e0: 1.0,
+            nu: 0.3,
+            force: 1.0,
+            beta_max: 32.0,
+            solver: Solver::Jacobi,
+            emin: 1e-6,
+            cg_tol: 1e-4,
+            adaptive_tol: false,
+            ground: Ground::None,
+            coarse_start: false,
+        };
+        // iterations until `next` says Stop at β, for a compliance sequence
+        let run = |beta: f64, seq: &dyn Fn(usize) -> f64| {
+            let mut c = Control::default();
+            for i in 0..40 {
+                match c.next(&s, beta, seq(i), 0.2) {
+                    Next::Go => {}
+                    Next::Beta(_) => return None,
+                    Next::Stop => return Some(i + 1),
+                }
+            }
+            Some(usize::MAX)
+        };
+        // alternating by ~0.1% around a flat level: no new best after the first iteration
+        let osc = |i: usize| if i.is_multiple_of(2) { 8.28 } else { 8.29 };
+        assert_eq!(run(32.0, &osc), Some(4));
+        // a slow steady decline (0.06% per iteration) keeps going until the old stall rule
+        let slow = |i: usize| 10.0 * 0.9994f64.powi(i as i32);
+        assert_eq!(run(32.0, &slow), Some(4));
+        let slower = |i: usize| 10.0 * (0.998f64).powi(i as i32);
+        assert_eq!(run(32.0, &slower), Some(usize::MAX));
+        // an intermediate stage never stops on it: it waits for the 25-iteration cap
+        assert_eq!(run(4.0, &osc), None);
     }
 
     #[test]

@@ -3,6 +3,39 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Stop the final stage when compliance oscillates
+
+**Why:** at β = 32 the OC updates oscillate: compliance alternates by about ±0.1% (8.28 ↔ 8.29 on the
+1.8M bracket). Each swing resets the "changed < 0.1% for 3 iterations" counter, so the final stage ran
+15–19 iterations, about 20 s of a 51 s run, without improving.
+
+**What:** `Control` also tracks the stage's best compliance. At the final β (or without projection),
+the run stops once compliance hasn't beaten that best by 0.1% in 3 iterations. The old rule still
+stops it too, so no run takes more iterations than before. A steady decline keeps going even when
+it is slow: 0.2% per iteration doesn't stop. Intermediate stages are unchanged; when they advance
+affected compliance by up to 2.5% (see "Tried and not kept" on 2026-11-13).
+
+**Result** (coarse start on; time, iterations, compliance):
+
+| | before | after |
+|---|---|---|
+| bracket_domain 0.35 mm (1.8M) | 51.5 s, 73, 8.2887 | 30.5 s, 58, 8.2883 |
+| table (--ground grip) | 26.4 s, 66, 0.032875 | 24.8 s, 64, 0.032862 |
+| bracket_domain (291k) | 7.2 s, 62, 8.2035 | 6.4 s, 60, 8.2021 |
+| bracket_editor, book_stand1, --no-projection, --no-coarse-start | unchanged | unchanged |
+
+The final-stage iterations are the most expensive ones (16–24 CG iterations against 4–8), so the
+time saved is larger than the share of iterations.
+
+**Not done:** keeping the best iterate rather than the last. At the stop the last one is within the
+oscillation's ~0.1% of the best, and keeping it would need copies of the density, filtered density
+and displacement fields (about 20 B per element on the GPU).
+
+**Possible next:** a smaller OC move limit at high β would probably remove the oscillation itself.
+
+**Verified:** `oscillation_at_the_final_beta_stops_the_run` (oscillation stops after 4 iterations;
+slow declines continue; an intermediate stage never stops the run). topopt tests pass; clippy clean.
+
 ## 2026-11-14: Coarse start: the first projection stage on a 2× coarser grid
 
 **What:** `optimize` runs the β = 1 stage on a grid of twice the element size (1/8 of the elements)
@@ -42,7 +75,7 @@ CLI and shows the coarse design about 6× sooner.
 - Continuing at β = 1 on the fine grid instead was slower, with about the same compliance.
 
 **Still open:**
-- **The final β = 32 stage oscillates:** compliance alternates by about ±0.1% (8.28 ↔ 8.29 at 1.8M), so
+- **The final β = 32 stage oscillates** (fixed in the next entry): compliance alternates by about ±0.1% (8.28 ↔ 8.29 at 1.8M), so
   the "< 0.1% for 3 iterations" stop fires late. It ran 15–19 iterations at 1.8M, about 20–25 s of
   60, without improving. A stop on "no new best in N iterations", or on the change over two
   iterations, would end it sooner. Reporting the best iterate rather than the last would also help.

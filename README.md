@@ -387,8 +387,9 @@ ends it at once).
     to `--beta-max` (32). Starting sharp would lock in a poor layout early.
   - The density update uses optimality criteria (move limit 0.2) under the volume constraint, which is
     measured on the projected densities.
-  - It stops when compliance improves by less than 0.1% for 3 iterations at the final β, or at
-    `--iters` (150).
+  - It stops at the final β when compliance changes by less than 0.1% for 3 iterations, or doesn't
+    improve on its best by 0.1% in 3 iterations (at β = 32 the updates tend to oscillate around a
+    level), or at `--iters` (150).
   - **Coarse start:** the β = 1 stage, where the layout forms, runs on a grid of twice the element
     size first (1/8 of the elements) until it settles. The fine grid then continues from that design
     at β = 2. This is 15–30% faster on most problems, with compliance within about 1% (sometimes
