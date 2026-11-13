@@ -393,14 +393,16 @@ watch the design form; **Stop** ends the run and keeps the last iteration.
   part. `--no-projection` gives the faster, softer-edged grey result.
 - **Speed:** each iteration solves the stiffness system with conjugate gradient preconditioned by
   geometric multigrid (a V-cycle with Chebyshev smoothing and Galerkin coarse levels; the fine level
-  is matrix-free), multithreaded and warm-started. Solves are looser while the design still moves a
-  lot and reach full accuracy at the final β. CG needs about 8–12 iterations per solve at any grid
-  size. The default voxel keeps the bounds at about 40k elements. On 12 cores the bracket (34k domain
-  elements) runs 50 iterations in 8 s. At 0.4 mm (1.2M domain elements) an iteration takes about
-  7.5 s, against 76 s with the old Jacobi-preconditioned CG (`--solver jacobi`, still available).
-  Grids up to 8M elements are allowed (~1.2 kB of memory per element).
+  is matrix-free), warm-started. It runs on the GPU in f32 (`--solver gpu`, the default with a
+  hardware GPU) or on the CPU in f64 (`--solver mg`, multithreaded). Solves are looser while the
+  design still moves a lot and reach full accuracy at the final β. CG needs about 8–12 iterations per
+  solve at any grid size. The default voxel keeps the bounds at about 40k elements, where the bracket
+  runs 50 iterations in about 3 s. At 0.4 mm (1.2M domain elements) the GPU solve takes 0.16 s per
+  iteration (CPU multigrid 5 s, the old Jacobi-preconditioned CG `--solver jacobi` 74 s). Density
+  filter and update still run on the CPU and now dominate on large grids (1.4 s at 1.2M elements).
+  Grids up to 100M elements are allowed on the GPU, 8M on the CPU (~1.2 kB of memory per element).
 - **Shortcuts in this version:**
-  - CPU only; a GPU solver is in progress (see `docs/topopt-scaling-plan.md`).
+  - The filter and density update are not on the GPU yet (see `docs/topopt-scaling-plan.md`).
   - No symmetry or overhang (printability) constraints.
 
 ## Mesh quality notes
@@ -452,4 +454,5 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing |
 | `src/topopt/mod.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
 | `src/topopt/mg.rs` | multigrid preconditioner: Galerkin coarse levels, Chebyshev/Jacobi smoothers, banded Cholesky |
+| `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32): kernels, recorded dispatch programs |
 | `src/wgsl/sdf.wgsl` | the SDF library |

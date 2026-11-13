@@ -19,7 +19,9 @@ Measured on `bracket_domain` at 1.3 mm (62×19×31, 34k domain elements): **~100
 
 **Status (2026-11-13):** steps 1–3 are done (see the devlog). CPU MGCG needs 8–12 CG iterations per
 solve from 34k to 1.2M elements, against ~1000–1300 for Jacobi, and gives the same designs. At 1.2M
-elements an iteration takes 7.7 s instead of 76 s. Next is step 4.
+elements an iteration takes 7.7 s instead of 76 s. Step 4 has started: the whole MGCG solve runs on
+the GPU (0.16 s per iteration at 1.2M elements, 0.73 s at 4.9M), and the filter and OC update are
+next.
 
 ## Why the solver comes before the hardware
 

@@ -78,6 +78,15 @@ pub fn headless() -> Result<Gpu> {
 }
 
 impl Gpu {
+    /// A CPU or software-rasterizer adapter (llvmpipe and the like).
+    pub fn is_software(&self) -> bool {
+        let info = self.adapter.get_info();
+        info.device_type == wgpu::DeviceType::Cpu
+            || ["llvmpipe", "lavapipe", "softpipe", "swiftshader"]
+                .iter()
+                .any(|s| info.name.to_lowercase().contains(s))
+    }
+
     /// Create a shader module, catching any wgpu-side validation error instead of panicking.
     ///
     /// By default wgpu wraps every loop in a hidden iteration counter (`force_loop_bounding`) and

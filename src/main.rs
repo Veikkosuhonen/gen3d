@@ -102,8 +102,10 @@ impl Format {
 
 #[derive(Args)]
 struct SolverArgs {
-    /// linear solver: mg (multigrid-preconditioned CG) or jacobi (Jacobi CG: slow on large grids)
-    #[arg(long, value_enum, default_value = "mg")]
+    /// linear solver: gpu (multigrid-preconditioned CG on the GPU, f32), mg (the same on the CPU),
+    /// jacobi (Jacobi CG on the CPU: slow on large grids), or auto (gpu unless the GPU is a software
+    /// renderer, then mg)
+    #[arg(long, value_enum, default_value = "auto")]
     solver: SolverKind,
     /// multigrid smoother
     #[arg(long, value_enum, default_value = "chebyshev", hide = true)]
@@ -127,7 +129,9 @@ struct SolverArgs {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum SolverKind {
+    Auto,
     Mg,
+    Gpu,
     Jacobi,
 }
 
@@ -138,24 +142,37 @@ enum SmootherKind {
 }
 
 impl SolverArgs {
-    fn solver(&self) -> topopt::Solver {
-        match self.solver {
+    fn solver(&self, gpu: &gpu::Gpu) -> topopt::Solver {
+        let kind = match self.solver {
+            SolverKind::Auto if gpu.is_software() => SolverKind::Mg,
+            SolverKind::Auto => SolverKind::Gpu,
+            k => k,
+        };
+        match kind {
             SolverKind::Jacobi => topopt::Solver::Jacobi,
-            SolverKind::Mg => topopt::Solver::Multigrid(topopt::mg::MgSettings {
-                smoother: match self.smoother {
-                    SmootherKind::Chebyshev => topopt::mg::Smoother::Chebyshev { degree: self.sweeps },
-                    SmootherKind::Jacobi => topopt::mg::Smoother::Jacobi {
-                        sweeps: self.sweeps,
-                        omega: self.omega,
+            _ => {
+                let ms = topopt::mg::MgSettings {
+                    smoother: match self.smoother {
+                        SmootherKind::Chebyshev => topopt::mg::Smoother::Chebyshev { degree: self.sweeps },
+                        SmootherKind::Jacobi => topopt::mg::Smoother::Jacobi {
+                            sweeps: self.sweeps,
+                            omega: self.omega,
+                        },
                     },
-                },
-                ..Default::default()
-            }),
+                    ..Default::default()
+                };
+                if matches!(kind, SolverKind::Gpu) {
+                    topopt::Solver::Gpu(ms)
+                } else {
+                    topopt::Solver::Multigrid(ms)
+                }
+            }
         }
     }
 
-    fn emin(&self) -> f64 {
-        self.emin.unwrap_or_else(|| topopt::Settings::default_emin(&self.solver()))
+    fn emin(&self, gpu: &gpu::Gpu) -> f64 {
+        self.emin
+            .unwrap_or_else(|| topopt::Settings::default_emin(&self.solver(gpu)))
     }
 }
 
@@ -580,6 +597,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             let defines = parse_defines(&s.define)?;
             let shape = load_shape(&s.shape, &defines)?;
+            let gpu = gpu::headless()?;
             let settings = topopt::Settings {
                 voxel: voxel.unwrap_or_else(|| topopt::auto_voxel(&shape, 40_000.0)) as f64,
                 volfrac,
@@ -591,15 +609,14 @@ fn run(cli: Cli) -> Result<()> {
                 nu,
                 force,
                 beta_max: if no_projection { 0.0 } else { beta_max.max(1.0) },
-                solver: solver.solver(),
-                emin: solver.emin(),
+                solver: solver.solver(&gpu),
+                emin: solver.emin(&gpu),
                 cg_tol: solver.cg_tol,
                 adaptive_tol: !solver.fixed_cg_tol,
             };
-            let gpu = gpu::headless()?;
             let problem = topopt::setup(&shape, &settings, &gpu)?;
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
-            topopt::optimize(&problem, &settings, &out)?;
+            topopt::optimize(&problem, &settings, &out, Some(&gpu))?;
             Ok(())
         }
         Cmd::BenchTopopt {
@@ -626,20 +643,30 @@ fn run(cli: Cli) -> Result<()> {
                     nu: 0.35,
                     force: 100.0,
                     beta_max: 32.0,
-                    solver: solver.solver(),
-                    emin: solver.emin(),
+                    solver: solver.solver(&gpu),
+                    emin: solver.emin(&gpu),
                     cg_tol: solver.cg_tol,
                     adaptive_tol: !solver.fixed_cg_tol,
                 };
                 let problem = topopt::setup(&shape, &settings, &gpu)?;
                 let ne = problem.domain.iter().filter(|d| **d).count();
-                let r = topopt::optimize(&problem, &settings, &dir.join("bench.vti"))?;
+                let r = topopt::optimize(&problem, &settings, &dir.join("bench.vti"), Some(&gpu))?;
                 rows.push((voxel, problem.n, ne, r));
             }
             std::fs::remove_dir_all(&dir).ok();
             println!(
                 "\n{:>6} {:>13} {:>9} {:>7} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>11}",
-                "voxel", "grid", "domain", "CG/sol", "OC/it", "setup s", "solve s", "update s", "io s", "iter s", "compliance"
+                "voxel",
+                "grid",
+                "domain",
+                "CG/sol",
+                "OC/it",
+                "setup s",
+                "solve s",
+                "update s",
+                "io s",
+                "iter s",
+                "compliance"
             );
             for (voxel, n, ne, r) in rows {
                 let k = r.stats.len() as f64;

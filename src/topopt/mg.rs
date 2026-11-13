@@ -209,7 +209,11 @@ impl Coarse {
             nz,
             inv_diag: vec![],
         };
-        l.inv_diag = l.diagonal().iter().map(|&d| if d > 0.0 { 1.0 / d } else { 0.0 }).collect();
+        l.inv_diag = l
+            .diagonal()
+            .iter()
+            .map(|&d| if d > 0.0 { 1.0 / d } else { 0.0 })
+            .collect();
         l
     }
 
@@ -375,6 +379,59 @@ impl Banded {
     }
 }
 
+/// Pᵀ (D ke D) P for each clamped-node mask (8 bits: a set bit zeroes that local node's rows and
+/// columns) and child position: 256 × 8 matrices of 576, row-major. The GPU builds level 1 from it.
+pub(super) fn masked_ptkp_table(ke: &[[f64; 24]; 24]) -> Vec<f64> {
+    let ke: Vec<f64> = ke.iter().flatten().copied().collect();
+    let weights: Vec<[[f64; 8]; 8]> = (0..8).map(child_weights).collect();
+    let mut t = vec![0.0; 256 * 8 * 576];
+    t.par_chunks_mut(8 * 576).enumerate().for_each(|(m, out)| {
+        let mut km = [0.0; 576];
+        for r in 0..24 {
+            for s in 0..24 {
+                if m >> (r / 3) & 1 == 0 && m >> (s / 3) & 1 == 0 {
+                    km[r * 24 + s] = ke[r * 24 + s];
+                }
+            }
+        }
+        for c in 0..8 {
+            add_ptkp(&km, &weights[c], 1.0, &mut out[576 * c..576 * c + 576]);
+        }
+    });
+    t
+}
+
+/// Cost of the exact solve on a grid of `n` elements (for choosing the number of levels).
+pub(super) fn direct_cost(n: [usize; 3]) -> f64 {
+    direct_flops(n)
+}
+
+/// Dense inverse (row-major) of a level given as element matrices; inactive DOFs get identity rows.
+pub(super) fn dense_inverse(n: [usize; 3], mats: Vec<f64>) -> Vec<f64> {
+    let nz = mats.chunks(576).map(|m| m.iter().any(|&v| v != 0.0)).collect();
+    let mut l = Coarse {
+        n,
+        mats,
+        nz,
+        inv_diag: vec![],
+    };
+    l.inv_diag = l
+        .diagonal()
+        .iter()
+        .map(|&d| if d > 0.0 { 1.0 / d } else { 0.0 })
+        .collect();
+    let chol = Banded::factor(&l);
+    let nd = 3 * l.nodes();
+    let mut inv = vec![0.0; nd * nd];
+    // A⁻¹ is symmetric, so its columns are its rows
+    inv.par_chunks_mut(nd).enumerate().for_each(|(j, row)| {
+        let mut e = vec![0.0; nd];
+        e[j] = 1.0;
+        chol.solve(&e, row);
+    });
+    inv
+}
+
 /// Coarse correction: rc = Pᵀ r, from a grid of `nf` elements to its coarse grid.
 fn restrict(nf: [usize; 3], r: &[f64], rc: &mut [f64]) {
     let [fx, fy, fz] = nf.map(|v| v + 1);
@@ -415,7 +472,11 @@ fn prolong_add(nf: [usize; 3], xc: &[f64], x: &mut [f64], mask: &[f64]) {
     let [fx, fy, _] = nf.map(|v| v + 1);
     let [cx, cy, _] = coarse_dims(nf).map(|v| v + 1);
     let split = |i: usize| -> [(usize, f64); 2] {
-        if i.is_multiple_of(2) { [(i / 2, 1.0), (i / 2, 0.0)] } else { [(i / 2, 0.5), (i / 2 + 1, 0.5)] }
+        if i.is_multiple_of(2) {
+            [(i / 2, 1.0), (i / 2, 0.0)]
+        } else {
+            [(i / 2, 0.5), (i / 2 + 1, 0.5)]
+        }
     };
     x.par_chunks_mut(3).enumerate().for_each(|(m, out)| {
         let (i, j, k) = (m % fx, (m / fx) % fy, m / (fx * fy));
@@ -515,7 +576,11 @@ impl<'a> Multigrid<'a> {
     }
 
     fn len(&self, l: usize) -> usize {
-        if l == 0 { self.fine_inv.len() } else { 3 * self.coarse[l - 1].nodes() }
+        if l == 0 {
+            self.fine_inv.len()
+        } else {
+            3 * self.coarse[l - 1].nodes()
+        }
     }
 
     fn dims(&self, l: usize) -> [usize; 3] {
@@ -523,7 +588,11 @@ impl<'a> Multigrid<'a> {
     }
 
     fn inv(&self, l: usize) -> &[f64] {
-        if l == 0 { &self.fine_inv } else { &self.coarse[l - 1].inv_diag }
+        if l == 0 {
+            &self.fine_inv
+        } else {
+            &self.coarse[l - 1].inv_diag
+        }
     }
 
     fn apply(&self, l: usize, u: &[f64], y: &mut [f64]) {
@@ -542,7 +611,11 @@ impl<'a> Multigrid<'a> {
         let mut v: Vec<f64> = (0..n)
             .map(|i| {
                 let h = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29);
-                if inv[i] != 0.0 { (h >> 11) as f64 / (1u64 << 53) as f64 - 0.5 } else { 0.0 }
+                if inv[i] != 0.0 {
+                    (h >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+                } else {
+                    0.0
+                }
             })
             .collect();
         let mut kv = vec![0.0; n];
@@ -655,6 +728,45 @@ impl<'a> Multigrid<'a> {
     }
 }
 
+/// CPU reference pieces for the GPU tests.
+#[cfg(test)]
+pub(super) mod tests_api {
+    use super::*;
+
+    pub fn restrict(nf: [usize; 3], r: &[f64], rc: &mut [f64]) {
+        super::restrict(nf, r, rc)
+    }
+
+    pub fn prolong_add(nf: [usize; 3], xc: &[f64], x: &mut [f64], mask: &[f64]) {
+        super::prolong_add(nf, xc, x, mask)
+    }
+
+    type Apply = Box<dyn Fn(&[f64]) -> Vec<f64>>;
+
+    /// Level 1's mat-vec and diagonal.
+    pub fn level1(fem: &Fem) -> (Apply, Vec<f64>) {
+        let c = Coarse::from_fine(fem);
+        let d = c.diagonal();
+        (
+            Box::new(move |v| {
+                let mut y = vec![0.0; v.len()];
+                c.apply(v, &mut y);
+                y
+            }),
+            d,
+        )
+    }
+
+    pub fn level2(fem: &Fem) -> Apply {
+        let c = Coarse::from_coarse(&Coarse::from_fine(fem));
+        Box::new(move |v| {
+            let mut y = vec![0.0; v.len()];
+            c.apply(v, &mut y);
+            y
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,7 +862,9 @@ mod tests {
     }
 
     fn pseudo(n: usize, seed: usize) -> Vec<f64> {
-        (0..n).map(|i| ((i * 7919 + seed * 104729) % 23) as f64 / 11.0 - 1.0).collect()
+        (0..n)
+            .map(|i| ((i * 7919 + seed * 104729) % 23) as f64 / 11.0 - 1.0)
+            .collect()
     }
 
     /// The stored coarse operators equal Pᵀ (D K D) P applied explicitly, on two levels.
@@ -775,7 +889,12 @@ mod tests {
         c1.apply(&v, &mut got);
         let scale = want.iter().fold(0.0f64, |m, x| m.max(x.abs()));
         for i in 0..n1 {
-            assert!((got[i] - want[i]).abs() < 1e-12 * scale, "level 1 dof {i}: {} vs {}", got[i], want[i]);
+            assert!(
+                (got[i] - want[i]).abs() < 1e-12 * scale,
+                "level 1 dof {i}: {} vs {}",
+                got[i],
+                want[i]
+            );
         }
 
         let c2 = Coarse::from_coarse(&c1);
@@ -791,7 +910,12 @@ mod tests {
         c2.apply(&v, &mut got);
         let scale = want.iter().fold(0.0f64, |m, x| m.max(x.abs()));
         for i in 0..n2 {
-            assert!((got[i] - want[i]).abs() < 1e-12 * scale, "level 2 dof {i}: {} vs {}", got[i], want[i]);
+            assert!(
+                (got[i] - want[i]).abs() < 1e-12 * scale,
+                "level 2 dof {i}: {} vs {}",
+                got[i],
+                want[i]
+            );
         }
     }
 
@@ -804,7 +928,11 @@ mod tests {
         let c = Coarse::from_fine(&fem);
         let chol = Banded::factor(&c);
         let n = 3 * c.nodes();
-        let b: Vec<f64> = pseudo(n, 3).iter().zip(&c.inv_diag).map(|(b, d)| if *d != 0.0 { *b } else { 0.0 }).collect();
+        let b: Vec<f64> = pseudo(n, 3)
+            .iter()
+            .zip(&c.inv_diag)
+            .map(|(b, d)| if *d != 0.0 { *b } else { 0.0 })
+            .collect();
         let mut x = vec![0.0; n];
         chol.solve(&b, &mut x);
         let mut kx = vec![0.0; n];
@@ -830,7 +958,10 @@ mod tests {
         let mut uj = vec![0.0; f.len()];
         let nj = fem.solve(&f, &mut uj, 1e-10, 100_000, &mut jacobi);
         let umax = uj.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-        for smoother in [Smoother::Chebyshev { degree: 2 }, Smoother::Jacobi { sweeps: 2, omega: 1.2 }] {
+        for smoother in [
+            Smoother::Chebyshev { degree: 2 },
+            Smoother::Jacobi { sweeps: 2, omega: 1.2 },
+        ] {
             let settings = MgSettings {
                 smoother,
                 max_direct_flops: 1e5,

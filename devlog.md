@@ -3,6 +3,69 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-13: MGCG on the GPU (scaling plan step 4, first part)
+
+**What:** `--solver gpu` runs the whole multigrid-preconditioned CG on the GPU in f32: mat-vecs,
+Chebyshev smoothing, restriction/prolongation, Galerkin coarsening, CG with its scalars, and element
+energies. It is the default (`--solver auto`) unless the adapter is a software renderer. The density
+filter and OC update still run on the CPU; per iteration, `ee` goes up and the energies and
+displacements come back.
+
+**How (`src/topopt/gpu_mg.rs`, `mg.wgsl`):**
+- Level 0: matrix-free.
+- Level 1 is never stored. Its element matrices are Σ_c ee_c T[mask_c][c] on the fly, where T holds
+  Pᵀ (D ke D) P for every clamped-node mask (8 bits) and child position: 2048 matrices, 4.7 MB.
+  Clamped nodes need no special cases this way, and level 1 costs about a fine mat-vec in arithmetic
+  but no memory per element.
+- Levels ≥ 2: f32 element matrices, assembled with one 64-thread workgroup per coarse element (the
+  child matrix, K P and Pᵀ K P staged through workgroup memory).
+- Coarsest level: the CPU reads back its few element matrices, makes a dense inverse with the banded
+  Cholesky, and uploads it; the V-cycle applies it as a GPU mat-vec. One readback per optimizer
+  iteration, none inside a V-cycle.
+- CG's α, β and ρ live in a small GPU buffer. Dot products are two-pass tree reductions. The residual
+  norm is read back every 4 iterations.
+- Each phase (setup with power iterations for λmax, CG start, CG iteration, energies) is recorded once
+  as a list of dispatches with fixed bind groups and replayed.
+- **f32 and rigid-body modes:** at first the bracket came out 0.35% too soft. Converging further
+  didn't change it, so the operator itself was off. Rounded to f32, `ke` no longer annihilates
+  translations exactly, and the error scales with the absolute displacement (large on a cantilever,
+  against small differences across one element). That acts like spurious springs. The fine mat-vec
+  and the energy kernel now apply `ke` to displacements relative to each element's first node.
+  That's the same in exact arithmetic (and still exact next to clamped nodes, whose u is 0), and the
+  GPU then matches the CPU's compliance to 7 digits. The true residual of an f32 `u` stays near 1e-2
+  (rounding in the vector itself); that is noise, not solution error.
+
+**Measured** (bracket, 4 iterations; GPU RTX 3080, CPU 12 cores):
+
+| voxel | domain elements | CG its/solve | GPU setup s | GPU solve s | CPU-MG solve s | update (CPU) s |
+|---|---|---|---|---|---|---|
+| 1.3 | 34k | 9 | 0.012 | 0.015 | 0.10 | 0.04 |
+| 0.5 | 607k | 9 | 0.044 | 0.069 | 1.75 | 0.76 |
+| 0.4 | 1.19M | 12 | 0.058 | 0.16 | 4.9 | 1.4 |
+| 0.3 | 2.8M | 12 | 0.24 | 0.43 | – | 3.2 |
+| 0.25 | 4.9M | 11 | 0.43 | 0.73 | – | 5.3 |
+
+The default bracket run (34k elements, 50 iterations) takes 3.2 s, against 7.9 s on the CPU
+multigrid and 77 s at the start of the day. On large grids the CPU filter + OC is now 80% of each
+iteration.
+
+**Verified:**
+- Kernel tests against the CPU path: fine and level-1 mat-vecs and diagonals, level-2 GPU assembly,
+  restriction and prolongation all agree to ≤ 4e-7 relative. λmax estimates are sane.
+- A realistic-scale cantilever (E·h = 4550, a hollow section with 1e-9 core, light end load) gives the
+  same compliance as the f64 CPU solve to 7 digits; that test fails the old way.
+- Full runs: the bracket ends at 8.9642 against 8.9635 on the CPU (8 of 13k elements flip: tolerance
+  noise). `bracket_editor` ends at 13.289, the accurate reference value, with 4 flips.
+- 31 tests pass; clippy is clean.
+
+**Open / next:**
+- Port the density filter, projection, sensitivities and OC update (with its bisection) to the GPU,
+  leaving only scalars to read back.
+- Memory: f32 level-2 matrices are 36 B per fine element and the binding limit is 2 GB, so about 55M
+  elements fit as is. Storing the symmetric half, or level 2 as node stencils, raises that.
+- Optional: rigid-body-relative application on level 1 and the stored levels as well (they only
+  precondition, so it affects speed, not accuracy).
+
 ## 2026-11-13: Multigrid CG for topology optimization (scaling plan steps 1–3)
 
 **What:** `optimize` now solves K u = f with multigrid-preconditioned CG (MGCG) on the CPU, as the

@@ -10,9 +10,10 @@
 //! Load cases: loads in one case act together; separate cases are separate situations. The
 //! objective is the sum of the cases' compliances (each solved separately).
 //!
-//! Each iteration solves K(ρ) u = f with a conjugate gradient (multithreaded, warm-started,
-//! matrix-free on the fine grid) preconditioned by a geometric multigrid V-cycle (`mg`), or by
-//! Jacobi. It then computes the compliance sensitivities, applies a density filter and updates the
+//! Each iteration solves K(ρ) u = f with a conjugate gradient (warm-started, matrix-free on the fine
+//! grid) preconditioned by a geometric multigrid V-cycle: on the GPU in f32 (`gpu_mg`), or on the
+//! CPU (`mg`, multithreaded; also the reference the GPU path is tested against). Jacobi-
+//! preconditioned CG is kept as a fallback. It then computes the compliance sensitivities, applies a density filter and updates the
 //! densities with the optimality-criteria method under a volume constraint. The current design is
 //! written to a .vti as it runs, so `gen3d view` can watch it live.
 //!
@@ -31,6 +32,7 @@ use crate::gpu::Gpu;
 use crate::mesher::{Grid, sample_field};
 use crate::shape::Shape;
 
+mod gpu_mg;
 pub mod mg;
 
 /// Linear solver for K u = f.
@@ -40,6 +42,8 @@ pub enum Solver {
     Jacobi,
     /// multigrid-preconditioned CG
     Multigrid(mg::MgSettings),
+    /// multigrid-preconditioned CG on the GPU (f32)
+    Gpu(mg::MgSettings),
 }
 
 pub struct Settings {
@@ -77,7 +81,7 @@ impl Settings {
     pub fn default_emin(solver: &Solver) -> f64 {
         match solver {
             Solver::Jacobi => 1e-6,
-            Solver::Multigrid(_) => 1e-9,
+            Solver::Multigrid(_) | Solver::Gpu(_) => 1e-9,
         }
     }
 }
@@ -189,6 +193,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     let max = match s.solver {
         Solver::Jacobi => 3_000_000,
         Solver::Multigrid(_) => 8_000_000,
+        Solver::Gpu(_) => 100_000_000,
     };
     if ne > max {
         bail!("{ne} elements is too many for this solver (at most {max}); use a larger --voxel");
@@ -668,7 +673,7 @@ type Precond<'a> = dyn FnMut(&[f64], &mut [f64]) + 'a;
 /// Run the optimization, writing the design to `out` (cell `density`, cell `energy` in MPa, point
 /// `displacement` in mm). The file is rewritten as often as keeps writing under ~10% of the run
 /// time (every iteration on small grids), and always after the last iteration.
-pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
+pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Result<Outcome> {
     let ke = hex_ke(s.nu);
     let ne = p.domain.len();
     let design: Vec<usize> = (0..ne).filter(|&e| p.domain[e] && !p.passive[e]).collect();
@@ -679,6 +684,23 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
     let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
     let fs: Vec<Vec<f64>> = p.loads.iter().map(|l| l.iter().flatten().copied().collect()).collect();
     let emin = s.e0 * s.emin;
+    let gpu_mg = match (&s.solver, gpu) {
+        (Solver::Gpu(ms), Some(gpu)) => {
+            let g = gpu_mg::GpuMg::new(gpu, p, &ke, &free, ms)?;
+            let c = g.coarsest();
+            println!(
+                "GPU multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
+                g.levels(),
+                c[0],
+                c[1],
+                c[2],
+                ms.smoother
+            );
+            Some(g)
+        }
+        (Solver::Gpu(_), None) => bail!("the GPU solver needs a GPU"),
+        _ => None,
+    };
     let filter = Filter::new(p, s.rmin);
     let mut proj = Projection {
         beta: if s.beta_max > 0.0 { 1.0 } else { 0.0 },
@@ -750,34 +772,6 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
                 .collect(),
             free: free.clone(),
         };
-        // one preconditioner, shared by the load cases
-        let mut precond: Box<Precond> = match &s.solver {
-            Solver::Jacobi => {
-                let inv = fem.inv_diag();
-                Box::new(move |r: &[f64], z: &mut [f64]| {
-                    z.par_iter_mut().zip(r).zip(&inv).for_each(|((z, r), d)| *z = r * d)
-                })
-            }
-            Solver::Multigrid(ms) => {
-                let mut m = mg::Multigrid::new(&fem, ms);
-                if it == 1 {
-                    let c = m.coarsest();
-                    println!(
-                        "multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
-                        m.levels(),
-                        c[0],
-                        c[1],
-                        c[2],
-                        ms.smoother
-                    );
-                }
-                Box::new(move |r: &[f64], z: &mut [f64]| m.precondition(r, z))
-            }
-        };
-        st.setup = t0.elapsed().as_secs_f64();
-        // each load case separately; the objective is their summed compliance
-        let t1 = Instant::now();
-        let mut ce = vec![0.0; ne];
         let final_stage = proj.beta > 0.0 && proj.beta >= s.beta_max;
         let tol = if !s.adaptive_tol || final_stage {
             s.cg_tol
@@ -785,17 +779,63 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
             (0.05 * last_change).clamp(s.cg_tol, 1e-2)
         };
         st.cg_tol = tol;
-        for (f, u) in fs.iter().zip(us.iter_mut()) {
-            let n = fem.solve(f, u, tol, CG_MAXIT, &mut *precond);
-            if n >= CG_MAXIT {
-                println!("warning: CG did not converge in {CG_MAXIT} iterations");
+        let mut ce = vec![0.0; ne];
+        let t1;
+        if let Some(g) = &gpu_mg {
+            // everything on the GPU; the energies and displacements come back
+            g.set_stiffness(&fem.ee)?;
+            st.setup = t0.elapsed().as_secs_f64();
+            t1 = Instant::now();
+            for (c, u) in us.iter_mut().enumerate() {
+                let n = g.solve(c, tol, CG_MAXIT)?;
+                if n >= CG_MAXIT {
+                    println!("warning: CG did not converge in {CG_MAXIT} iterations");
+                }
+                st.cg.push(n);
+                *u = g.displacement(c)?.iter().map(|&v| v as f64).collect();
             }
-            st.cg.push(n);
-            for (a, b) in ce.iter_mut().zip(fem.element_energy(u)) {
-                *a += b;
+            for (a, b) in ce.iter_mut().zip(g.energies()?) {
+                *a = b as f64;
+            }
+        } else {
+            // one preconditioner, shared by the load cases
+            let mut precond: Box<Precond> = match &s.solver {
+                Solver::Multigrid(ms) => {
+                    let mut m = mg::Multigrid::new(&fem, ms);
+                    if it == 1 {
+                        let c = m.coarsest();
+                        println!(
+                            "multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
+                            m.levels(),
+                            c[0],
+                            c[1],
+                            c[2],
+                            ms.smoother
+                        );
+                    }
+                    Box::new(move |r: &[f64], z: &mut [f64]| m.precondition(r, z))
+                }
+                _ => {
+                    let inv = fem.inv_diag();
+                    Box::new(move |r: &[f64], z: &mut [f64]| {
+                        z.par_iter_mut().zip(r).zip(&inv).for_each(|((z, r), d)| *z = r * d)
+                    })
+                }
+            };
+            st.setup = t0.elapsed().as_secs_f64();
+            // each load case separately; the objective is their summed compliance
+            t1 = Instant::now();
+            for (f, u) in fs.iter().zip(us.iter_mut()) {
+                let n = fem.solve(f, u, tol, CG_MAXIT, &mut *precond);
+                if n >= CG_MAXIT {
+                    println!("warning: CG did not converge in {CG_MAXIT} iterations");
+                }
+                st.cg.push(n);
+                for (a, b) in ce.iter_mut().zip(fem.element_energy(u)) {
+                    *a += b;
+                }
             }
         }
-        drop(precond);
         st.solve = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
         let compliance: f64 = (0..ne).map(|e| fem.ee[e] * ce[e]).sum();
@@ -892,7 +932,11 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path) -> Result<Outcome> {
             let bytes = pending.take().unwrap().write(p, out)?;
             last_write = Some((Instant::now(), t3.elapsed().as_secs_f64()));
             if it == 1 {
-                println!("wrote {} ({:.1} MB, updated as it runs)", out.display(), bytes as f64 / 1e6);
+                println!(
+                    "wrote {} ({:.1} MB, updated as it runs)",
+                    out.display(),
+                    bytes as f64 / 1e6
+                );
             }
         }
         st.io = t3.elapsed().as_secs_f64();
