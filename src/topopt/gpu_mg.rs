@@ -95,12 +95,12 @@ pub(super) struct GpuMg<'a> {
 }
 
 impl<'a> GpuMg<'a> {
-    /// Buffers and programs for a problem. `free` per node, as in `Fem`.
+    /// Buffers and programs for a problem. `free` per node (free axes as bits), as in `Fem`.
     pub(super) fn new(
         e: &'a Engine<'a>,
         p: &Problem,
         ke: &[[f64; 24]; 24],
-        free: &[bool],
+        free: &[u8],
         s: &MgSettings,
     ) -> Result<Self> {
         // levels: at least fine, level 1 (virtual) and one stored level
@@ -139,7 +139,7 @@ impl<'a> GpuMg<'a> {
             let (mut idx, mut val, mut sq) = (vec![], vec![], 0.0);
             for (m, v) in l.iter().enumerate() {
                 for (c, &x) in v.iter().enumerate() {
-                    if free[m] && x != 0.0 {
+                    if free[m] >> c & 1 == 1 && x != 0.0 {
                         idx.push((3 * m + c) as u32);
                         val.push(x as f32);
                         sq += x * x;
@@ -275,7 +275,7 @@ impl<'a> GpuMg<'a> {
                         m,
                         ..Default::default()
                     },
-                    &[kpu, y],
+                    &[kpu, &self.diag[0], y],
                     t,
                 );
             }
@@ -453,7 +453,7 @@ impl<'a> GpuMg<'a> {
                 n: dims4(self.dims[l]),
                 ..Default::default()
             },
-            &[r, cb],
+            &[r, &self.diag[l], cb],
             threads(nodes(self.dims[l + 1])),
         );
         self.vcycle(out, l + 1, cb, cx);
@@ -606,7 +606,7 @@ mod tests {
             origin: [0.0; 3],
             domain: (0..ne).map(|e| e % 11 != 4).collect(),
             passive: vec![false; ne],
-            fixed: vec![false; nn],
+            fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]],
             cases: vec![1],
         };
@@ -614,7 +614,7 @@ mod tests {
         for j in 0..ny {
             for i in 0..nx / 2 {
                 let m = p.node(i, j, 0);
-                p.fixed[m] = true;
+                p.fixed[m] = 7;
             }
             let m = p.node(nx - 1, j, n[2]);
             p.loads[0][m] = [0.3, -1.0, 0.5];
@@ -648,8 +648,7 @@ mod tests {
         };
         let p = problem([7, 5, 9]);
         let ke = super::super::hex_ke(0.3);
-        let active = p.active_nodes();
-        let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
+        let free = p.free_mask();
         let fem = Fem {
             p: &p,
             ke: &ke,
@@ -674,7 +673,7 @@ mod tests {
         let masked = |v: Vec<f64>| -> Vec<f64> {
             v.iter()
                 .enumerate()
-                .map(|(i, x)| if free[i / 3] { *x } else { 0.0 })
+                .map(|(i, x)| if free[i / 3] >> (i % 3) & 1 == 1 { *x } else { 0.0 })
                 .collect()
         };
         let n0 = g.len(0);
@@ -731,12 +730,12 @@ mod tests {
                 n: dims4(g.dims[0]),
                 ..Default::default()
             },
-            &[&g.lr[0], g.lb[1].as_ref().unwrap()],
+            &[&g.lr[0], &g.diag[0], g.lb[1].as_ref().unwrap()],
             threads(nodes(g.dims[1])),
         );
         g.e.run(&[&prog]).unwrap();
         let mut want = vec![0.0; n1];
-        mg::tests_api::restrict(p.n, &u, &mut want);
+        mg::tests_api::restrict(p.n, &u, &mut want, &inv);
         close(&g.e.read_f32(g.lb[1].as_ref().unwrap(), n1).unwrap(), &want, "restrict");
         let v = pseudo(n1, 4);
         write(g.lx[1].as_ref().unwrap(), &v);
@@ -777,21 +776,20 @@ mod tests {
         let n = [40, 4, 6];
         let mut p = problem(n);
         // clamp the x = 0 face only, load the far end lightly
-        p.fixed.fill(false);
+        p.fixed.fill(0);
         p.loads[0].iter_mut().for_each(|l| *l = [0.0; 3]);
         let [nx, ny, nz] = n.map(|v| v + 1);
         for k in 0..nz {
             for j in 0..ny {
                 let m = p.node(0, j, k);
-                p.fixed[m] = true;
+                p.fixed[m] = 7;
                 let m = p.node(nx - 1, j, k);
                 p.loads[0][m] = [0.0, 0.0, -0.01];
             }
         }
         p.domain.fill(true);
         let ke = super::super::hex_ke(0.35);
-        let active = p.active_nodes();
-        let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
+        let free = p.free_mask();
         let fem = Fem {
             p: &p,
             ke: &ke,
@@ -821,6 +819,25 @@ mod tests {
         close(&ug, &u, "GPU u");
     }
 
+    /// Rollers on the GPU: the exact solution of `block_on_rollers`.
+    #[test]
+    fn gpu_block_on_rollers() {
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let (p, force, nu, e0) = crate::topopt::tests::block_on_rollers();
+        let ke = super::super::hex_ke(nu);
+        let free = p.free_mask();
+        let eng = Engine::new(&gpu).unwrap();
+        let g = GpuMg::new(&eng, &p, &ke, &free, &MgSettings::default()).unwrap();
+        g.set_stiffness(&vec![e0 * p.h; p.domain.len()]).unwrap();
+        let its = g.solve(0, 1e-6, 1000).unwrap();
+        let u: Vec<f64> = g.displacement(0).unwrap().iter().map(|&v| v as f64).collect();
+        crate::topopt::tests::check_block_on_rollers(&p, &u, force, nu, e0, 1e-3);
+        assert!(its < 200, "{its} GPU CG iterations");
+    }
+
     /// Timings of the solver's pieces on a 9.6M-element box (run with --ignored --nocapture).
     #[test]
     #[ignore]
@@ -830,8 +847,7 @@ mod tests {
         let mut p = problem(n);
         p.domain.fill(true);
         let ke = super::super::hex_ke(0.3);
-        let active = p.active_nodes();
-        let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
+        let free = p.free_mask();
         let ee: Vec<f64> = (0..p.domain.len())
             .map(|e| if e % 3 == 0 { 1e-6 } else { 1.0 })
             .collect();

@@ -50,6 +50,7 @@ pub enum Solver {
     Gpu(mg::MgSettings),
 }
 
+#[derive(Clone)]
 pub struct Settings {
     /// element size (mm)
     pub voxel: f64,
@@ -78,6 +79,32 @@ pub struct Settings {
     /// solve less accurately while the design is still moving a lot: tolerance 0.05 × the last
     /// density change, between `cg_tol` and 1e-2, and `cg_tol` once β reaches its final value
     pub adaptive_tol: bool,
+    /// the part stands on the ground: the bottom of the design domain is supported
+    pub ground: Ground,
+}
+
+/// How the bottom of the design domain is supported (`--ground`). The optimizer decides where the
+/// part touches down: the supported nodes may end up under empty space.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Ground {
+    /// no ground: only the fixed regions hold the part
+    #[default]
+    None,
+    /// stands on a slippery surface: held vertically only, free to slide and spread sideways (the
+    /// least pins against sliding and spinning are added)
+    Slide,
+    /// stands on a grippy surface (or is glued down): held in all directions
+    Grip,
+}
+
+impl Ground {
+    pub fn name(self) -> &'static str {
+        match self {
+            Ground::None => "none",
+            Ground::Slide => "slide",
+            Ground::Grip => "grip",
+        }
+    }
 }
 
 impl Settings {
@@ -100,8 +127,9 @@ pub struct Problem {
     pub domain: Vec<bool>,
     /// forced solid (design domain ∩ keep)
     pub passive: Vec<bool>,
-    /// per node: clamped (only nodes of domain elements)
-    pub fixed: Vec<bool>,
+    /// per node: the clamped axes, bit c for axis c (only nodes of domain elements); 7 = fully
+    /// clamped, a single bit = a roller (held along that axis only)
+    pub fixed: Vec<u8>,
     /// per load case, per node: force (N)
     pub loads: Vec<Vec<[f64; 3]>>,
     /// the load cases' numbers, in the order of `loads`
@@ -135,6 +163,176 @@ impl Problem {
         }
         active
     }
+
+    fn node_pos(&self, i: usize) -> [f64; 3] {
+        let [nx, ny, _] = self.nodes();
+        let ijk = [i % nx, (i / nx) % ny, i / (nx * ny)];
+        std::array::from_fn(|c| self.origin[c] + ijk[c] as f64 * self.h)
+    }
+
+    /// Per node: the free axes (bit c for axis c), 0 for nodes without stiffness.
+    fn free_mask(&self) -> Vec<u8> {
+        let active = self.active_nodes();
+        (0..active.len())
+            .map(|i| if active[i] { 7 & !self.fixed[i] } else { 0 })
+            .collect()
+    }
+}
+
+/// The active nodes of the lowest layer that has any.
+fn ground_nodes(p: &Problem, active: &[bool]) -> Vec<usize> {
+    let [nx, ny, _] = p.nodes();
+    let layer = nx * ny;
+    let Some(first) = active.iter().position(|a| *a) else {
+        return vec![];
+    };
+    let k = first / layer;
+    (k * layer..(k + 1) * layer).filter(|&i| active[i]).collect()
+}
+
+/// The rigid-body motions (3 translations, 3 rotations) at node position `q` (relative to `c`,
+/// scaled by `scale`) along axis `a`.
+fn rigid_row(q: [f64; 3], c: [f64; 3], scale: f64, a: usize) -> [f64; 6] {
+    let r: [f64; 3] = std::array::from_fn(|k| (q[k] - c[k]) / scale);
+    let mut row = [0.0; 6];
+    row[a] = 1.0;
+    // (ω × r)_a for ω = e_x, e_y, e_z
+    for (w, out) in row[3..].iter_mut().enumerate() {
+        let mut e = [0.0; 3];
+        e[w] = 1.0;
+        let cross = [
+            e[1] * r[2] - e[2] * r[1],
+            e[2] * r[0] - e[0] * r[2],
+            e[0] * r[1] - e[1] * r[0],
+        ];
+        *out = cross[a];
+    }
+    row
+}
+
+/// An orthonormal basis of the rigid-body motions the supports block, grown row by row.
+struct RigidBasis(Vec<[f64; 6]>);
+
+impl RigidBasis {
+    /// Adds a row; whether it blocked another motion.
+    fn add(&mut self, row: [f64; 6]) -> bool {
+        if self.0.len() == 6 {
+            return false;
+        }
+        let mut v = row;
+        for b in &self.0 {
+            let d: f64 = (0..6).map(|k| v[k] * b[k]).sum();
+            for k in 0..6 {
+                v[k] -= d * b[k];
+            }
+        }
+        let n = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if n < 1e-6 {
+            return false;
+        }
+        self.0.push(v.map(|x| x / n));
+        true
+    }
+}
+
+/// Centre and size of the supported nodes (the frame the rigid motions are measured in).
+fn support_frame(p: &Problem) -> ([f64; 3], f64) {
+    let held: Vec<[f64; 3]> = (0..p.fixed.len())
+        .filter(|&i| p.fixed[i] != 0)
+        .map(|i| p.node_pos(i))
+        .collect();
+    if held.is_empty() {
+        return ([0.0; 3], 1.0);
+    }
+    let c: [f64; 3] = std::array::from_fn(|k| held.iter().map(|q| q[k]).sum::<f64>() / held.len() as f64);
+    let scale = held
+        .iter()
+        .map(|q| (0..3).map(|k| (q[k] - c[k]).powi(2)).sum::<f64>().sqrt())
+        .fold(p.h, f64::max);
+    (c, scale)
+}
+
+fn rigid_basis(p: &Problem, c: [f64; 3], scale: f64) -> RigidBasis {
+    let mut b = RigidBasis(vec![]);
+    for i in 0..p.fixed.len() {
+        for a in 0..3 {
+            if p.fixed[i] >> a & 1 == 1 {
+                b.add(rigid_row(p.node_pos(i), c, scale, a));
+                if b.0.len() == 6 {
+                    return b;
+                }
+            }
+        }
+    }
+    b
+}
+
+/// How many of the 6 rigid-body motions the supports block.
+fn rigid_rank(p: &Problem) -> usize {
+    let (c, scale) = support_frame(p);
+    rigid_basis(p, c, scale).0.len()
+}
+
+/// The fewest extra pins (node, axes) that stop the part sliding or spinning on its supports (e.g.
+/// on rollers): the supported node nearest their centre, then the one farthest from it, then the
+/// one farthest from the line through both, each held only along the axes still needed.
+fn stabilize(p: &Problem) -> Vec<(usize, u8)> {
+    let (c, scale) = support_frame(p);
+    let mut basis = rigid_basis(p, c, scale);
+    if basis.0.len() == 6 {
+        return vec![];
+    }
+    let held: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i] != 0).collect();
+    if held.is_empty() {
+        return vec![];
+    }
+    let pos = |i: usize| p.node_pos(i);
+    let dist2 = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>();
+    let a = *held
+        .iter()
+        .min_by(|&&x, &&y| dist2(pos(x), c).total_cmp(&dist2(pos(y), c)))
+        .unwrap();
+    let b = *held
+        .iter()
+        .max_by(|&&x, &&y| dist2(pos(x), pos(a)).total_cmp(&dist2(pos(y), pos(a))))
+        .unwrap();
+    let (pa, pb) = (pos(a), pos(b));
+    let ab: [f64; 3] = std::array::from_fn(|k| pb[k] - pa[k]);
+    let ab2 = dist2(pa, pb).max(1e-30);
+    let off_line = |q: [f64; 3]| {
+        let t = (0..3).map(|k| (q[k] - pa[k]) * ab[k]).sum::<f64>() / ab2;
+        dist2(q, std::array::from_fn(|k| pa[k] + t * ab[k]))
+    };
+    let cc = *held
+        .iter()
+        .max_by(|&&x, &&y| off_line(pos(x)).total_cmp(&off_line(pos(y))))
+        .unwrap();
+    let mut out: Vec<(usize, u8)> = vec![];
+    for node in [a, b, cc] {
+        // the axes most across the line to the first pin first: they block spinning best
+        let mut axes = [0, 1, 2];
+        if node != a {
+            axes.sort_by(|&x, &y| ab[x].abs().total_cmp(&ab[y].abs()));
+        }
+        let mut add = 0u8;
+        for ax in axes {
+            if p.fixed[node] >> ax & 1 == 0 && basis.add(rigid_row(pos(node), c, scale, ax)) {
+                add |= 1 << ax;
+            }
+        }
+        if add != 0 {
+            out.push((node, add));
+        }
+        if basis.0.len() == 6 {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether DOF `i` (3 per node) is free in a per-node axis mask.
+fn dof_free(free: &[u8], i: usize) -> bool {
+    free[i / 3] >> (i % 3) & 1 == 1
 }
 
 /// How many elements the automatic element size aims for: the GPU solver runs ~300k elements in a
@@ -183,12 +381,13 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     let shape = &shape;
     let fields = shape.fields()?;
     let field = |name: &str, comps: usize| fields.iter().find(|f| f.name == name && f.comps == comps);
-    let Some(fixed_f) = field("fixed", 1) else {
+    let supports = shape.support_specs();
+    if supports.is_empty() && s.ground == Ground::None {
         bail!(
             "optimize needs supports: `fn field_fixed(p: vec3f) -> f32` (< 0 where the part is clamped), \
-             or a primitive with the fixed role"
+             a primitive with the fixed role, or --ground"
         );
-    };
+    }
     let specs = shape.load_specs();
     if specs.is_empty() {
         bail!(
@@ -227,7 +426,6 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     let sdf = at_cells("map")?;
     let keep = field("keep", 1).map(|f| at_cells(&f.func)).transpose()?;
     let void = field("void", 1).map(|f| at_cells(&f.func)).transpose()?;
-    let fixed = x_fastest(&sample_field(shape, &nodes, &fixed_f.func, 1, gpu)?, pts, 1);
 
     let domain: Vec<bool> = (0..ne)
         .map(|e| sdf[e] < 0.0 && void.as_ref().is_none_or(|v| v[e] >= 0.0))
@@ -246,14 +444,48 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         cases: vec![],
     };
     let active = p.active_nodes();
-    p.fixed = (0..active.len()).map(|i| active[i] && fixed[i] < 0.0).collect();
-    let nfixed = p.fixed.iter().filter(|b| **b).count();
-    if nfixed == 0 {
-        bail!(
-            "no clamped nodes: the fixed region (field_fixed < 0, or a fixed primitive) reaches no node of \
-             the design domain (try a smaller --voxel, a thicker region, or move it onto the part)"
+    p.fixed = vec![0; active.len()];
+    for spec in &supports {
+        let r = x_fastest(&sample_field(shape, &nodes, &spec.func, 1, gpu)?, pts, 1);
+        let mut hit = 0;
+        for i in 0..active.len() {
+            if active[i] && r[i] < 0.0 {
+                p.fixed[i] |= spec.axes;
+                hit += 1;
+            }
+        }
+        if hit == 0 {
+            bail!(
+                "no supported nodes for `{}`: its region reaches no node of the design domain (try a \
+                 smaller --voxel, a thicker region, or move it onto the part)",
+                spec.name
+            );
+        }
+    }
+    if s.ground != Ground::None {
+        let n = ground_nodes(&p, &active);
+        let axes = if s.ground == Ground::Grip { 7 } else { 4 };
+        for &i in &n {
+            p.fixed[i] |= axes;
+        }
+        println!("ground ({}): {} nodes on the bottom layer", s.ground.name(), n.len());
+    }
+    for (i, axes) in stabilize(&p) {
+        p.fixed[i] |= axes;
+        let q = p.node_pos(i);
+        let names: String = (0..3)
+            .filter(|c| axes >> c & 1 == 1)
+            .map(|c| ['X', 'Y', 'Z'][c])
+            .collect();
+        println!(
+            "pinned the node at ({:.1}, {:.1}, {:.1}) in {names}: the supports alone let the part move",
+            q[0], q[1], q[2]
         );
     }
+    if rigid_rank(&p) < 6 {
+        bail!("the supports can't hold the part in place (all on one line?): add or widen a support");
+    }
+    let nfixed = p.fixed.iter().filter(|b| **b != 0).count();
     // each load is spread over its own nodes so its magnitudes sum to its force
     let nn = active.len();
     let mut cases: std::collections::BTreeMap<u32, Vec<[f64; 3]>> = Default::default();
@@ -280,7 +512,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
             .into_iter()
             .enumerate()
             .map(|(i, v)| {
-                if active[i] && !p.fixed[i] && v.iter().all(|x| x.is_finite()) {
+                if active[i] && p.fixed[i] != 7 && v.iter().all(|x| x.is_finite()) {
                     v
                 } else {
                     [0.0; 3]
@@ -299,7 +531,10 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
             );
         }
         let force = spec.force.unwrap_or(s.force);
-        println!("load `{}`: {force} N, case {}", spec.name, spec.case);
+        match &spec.label {
+            Some(l) => println!("load `{}`: {force:.1} N, case {l}", spec.name),
+            None => println!("load `{}`: {force} N, case {}", spec.name, spec.case),
+        }
         let case = cases.entry(spec.case).or_insert_with(|| vec![[0.0; 3]; nn]);
         for (i, v) in raw.iter().enumerate() {
             if v.iter().any(|x| *x != 0.0) {
@@ -316,7 +551,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     let ndomain = p.domain.iter().filter(|b| **b).count();
     let npassive = p.passive.iter().filter(|b| **b).count();
     println!(
-        "grid {}x{}x{} @ {} mm: {ndomain} domain elements ({} design, {npassive} kept solid), {nfixed} clamped nodes, {nload} loaded nodes, {} load case{}",
+        "grid {}x{}x{} @ {} mm: {ndomain} domain elements ({} design, {npassive} kept solid), {nfixed} supported nodes, {nload} loaded nodes, {} load case{}",
         n[0],
         n[1],
         n[2],
@@ -393,8 +628,8 @@ struct Fem<'a> {
     ke: &'a [[f64; 24]; 24],
     /// per element: E_e * h (0 outside the domain)
     ee: Vec<f64>,
-    /// per node: has stiffness and is not clamped
-    free: Vec<bool>,
+    /// per node: the axes that have stiffness and are not clamped (bit c for axis c)
+    free: Vec<u8>,
 }
 
 impl Fem<'_> {
@@ -410,7 +645,8 @@ impl Fem<'_> {
         let [ex, ey, ez] = self.p.n;
         y.par_chunks_mut(3).enumerate().for_each(|(n, yn)| {
             yn.fill(0.0);
-            if !self.free[n] {
+            let free = self.free[n];
+            if free == 0 {
                 return;
             }
             let (i, j, k) = (n % nx, (n / nx) % ny, n / (nx * ny));
@@ -433,6 +669,11 @@ impl Fem<'_> {
                     }
                 }
             }
+            for (c, y) in yn.iter_mut().enumerate() {
+                if free >> c & 1 == 0 {
+                    *y = 0.0;
+                }
+            }
         });
     }
 
@@ -451,7 +692,13 @@ impl Fem<'_> {
         }
         d.iter()
             .enumerate()
-            .map(|(i, &v)| if self.free[i / 3] && v > 0.0 { 1.0 / v } else { 0.0 })
+            .map(|(i, &v)| {
+                if dof_free(&self.free, i) && v > 0.0 {
+                    1.0 / v
+                } else {
+                    0.0
+                }
+            })
             .collect()
     }
 
@@ -467,14 +714,14 @@ impl Fem<'_> {
     ) -> usize {
         let dot = |a: &[f64], b: &[f64]| a.par_iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
         for (i, v) in u.iter_mut().enumerate() {
-            if !self.free[i / 3] {
+            if !dof_free(&self.free, i) {
                 *v = 0.0;
             }
         }
         let fm: Vec<f64> = f
             .iter()
             .enumerate()
-            .map(|(i, &v)| if self.free[i / 3] { v } else { 0.0 })
+            .map(|(i, &v)| if dof_free(&self.free, i) { v } else { 0.0 })
             .collect();
         let fnorm = dot(&fm, &fm).sqrt().max(1e-300);
         let mut q = vec![0.0; u.len()];
@@ -698,8 +945,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
     if design.is_empty() {
         bail!("no design elements: the domain is empty or entirely kept solid");
     }
-    let active = p.active_nodes();
-    let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
+    let free = p.free_mask();
     let fs: Vec<Vec<f64>> = p.loads.iter().map(|l| l.iter().flatten().copied().collect()).collect();
     let emin = s.e0 * s.emin;
     let filter = Filter::new(p, s.rmin);
@@ -1048,7 +1294,7 @@ impl Control {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -1142,6 +1388,7 @@ mod tests {
             emin: 1e-6,
             cg_tol: 1e-4,
             adaptive_tol: false,
+            ground: Ground::None,
         };
         let p = setup(&shape, &s, &gpu).unwrap();
         assert_eq!(p.cases, [1, 2]);
@@ -1162,7 +1409,7 @@ mod tests {
                 .map(|(c, o)| o + c * p.h)
                 .collect::<Vec<_>>()
         };
-        let clamped: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i]).collect();
+        let clamped: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i] != 0).collect();
         assert!(clamped.len() > 20, "{}", clamped.len());
         for &i in &clamped {
             let q = pos(i);
@@ -1172,6 +1419,163 @@ mod tests {
         // the shells around the holes are kept solid
         assert!(p.passive.iter().filter(|b| **b).count() > 50);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A bar standing on slippery ground, carrying a 5 kg weight that also rocks: the bottom layer
+    /// is held in Z, three pins stop it sliding and spinning, and the rocking adds four cases.
+    #[test]
+    fn ground_weight_and_rocking() {
+        use crate::prims::{Kind, Op, Prim, Role, save, sidecar};
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("gen3d-ground-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("stand.wgsl");
+        std::fs::write(&path, "").unwrap();
+        let block = Prim::new(Kind::Box, "block".into(), [0.0, 0.0, 10.0], 20.0);
+        let top = Prim {
+            op: Op::Region,
+            role: Role::Load,
+            force: 5.0,
+            kg: true,
+            rock: 0.2,
+            ..Prim::new(Kind::Sphere, "book".into(), [0.0, 0.0, 20.0], 4.0)
+        };
+        save(&sidecar(&path), &[block, top]).unwrap();
+        let shape = crate::shape::load_shape(&path, &[]).unwrap();
+        let s = Settings {
+            voxel: 2.0,
+            volfrac: 0.3,
+            penal: 3.0,
+            rmin: 1.5,
+            iters: 1,
+            tol: 0.01,
+            e0: 3500.0,
+            nu: 0.3,
+            force: 999.0,
+            beta_max: 0.0,
+            solver: Solver::Jacobi,
+            emin: 1e-6,
+            cg_tol: 1e-4,
+            adaptive_tol: false,
+            ground: Ground::None,
+        };
+        let err = setup(&shape, &s, &gpu).err().unwrap().to_string();
+        assert!(err.contains("needs supports"), "{err}");
+        let p = setup(
+            &shape,
+            &Settings {
+                ground: Ground::Slide,
+                ..s
+            },
+            &gpu,
+        )
+        .unwrap();
+        // 5 kg upright, and tilted 20% both ways along X and Y
+        assert_eq!(p.cases, [1, 1001, 1002, 1003, 1004]);
+        let sum = |l: &Vec<[f64; 3]>| [0, 1, 2].map(|c| l.iter().map(|v| v[c]).sum::<f64>());
+        let w = 5.0 * crate::prims::G;
+        let close = |a: [f64; 3], b: [f64; 3]| (0..3).all(|c| (a[c] - b[c]).abs() < 1e-6 * w);
+        assert!(close(sum(&p.loads[0]), [0.0, 0.0, -w]));
+        assert!(close(sum(&p.loads[1]), [0.2 * w, 0.0, -w]), "{:?}", sum(&p.loads[1]));
+        assert!(close(sum(&p.loads[4]), [0.0, -0.2 * w, -w]), "{:?}", sum(&p.loads[4]));
+        // the bottom layer rests on rollers; a few of its nodes are pinned sideways too
+        let bottom = p.node_pos(p.fixed.iter().position(|f| *f != 0).unwrap())[2];
+        let held: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i] != 0).collect();
+        assert!(held.iter().all(|&i| p.fixed[i] & 4 != 0 && p.node_pos(i)[2] == bottom));
+        let pinned: usize = held.iter().map(|&i| (p.fixed[i] & 3).count_ones() as usize).sum();
+        assert_eq!(pinned, 3, "X/Y pins");
+        assert_eq!(rigid_rank(&p), 6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A block standing on rollers (bottom held in Z only, plus the least X/Y pins against sliding
+    /// and spinning), squeezed by a uniform pressure on top: the exact solution is uniform
+    /// compression with free sideways expansion, which trilinear elements reproduce.
+    pub(super) fn block_on_rollers() -> (Problem, f64, f64, f64) {
+        let (h, force, nu) = (1.5, 80.0, 0.3);
+        let n = [4, 4, 8];
+        let ne: usize = n.iter().product();
+        let nn: usize = n.iter().map(|v| v + 1).product();
+        let mut p = Problem {
+            n,
+            h,
+            origin: [0.0; 3],
+            domain: vec![true; ne],
+            passive: vec![false; ne],
+            fixed: vec![0; nn],
+            loads: vec![vec![[0.0; 3]; nn]],
+            cases: vec![1],
+        };
+        for j in 0..=n[1] {
+            for i in 0..=n[0] {
+                let b = p.node(i, j, 0);
+                p.fixed[b] = 4;
+            }
+        }
+        let b = p.node(0, 0, 0);
+        p.fixed[b] = 7;
+        let b = p.node(n[0], 0, 0);
+        p.fixed[b] = 4 | 2;
+        // consistent nodal loads of a uniform pressure: a quarter of each top face's share per corner
+        let per_face = force / (n[0] * n[1]) as f64;
+        for j in 0..n[1] {
+            for i in 0..n[0] {
+                for (di, dj) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    let t = p.node(i + di, j + dj, n[2]);
+                    p.loads[0][t][2] -= per_face / 4.0;
+                }
+            }
+        }
+        (p, force, nu, 1000.0)
+    }
+
+    /// Checks a displacement field against `block_on_rollers`' exact solution.
+    pub(super) fn check_block_on_rollers(p: &Problem, u: &[f64], force: f64, nu: f64, e0: f64, tol: f64) {
+        let [w, d, l] = p.n.map(|v| v as f64 * p.h);
+        let stress = force / (w * d);
+        let top = p.node(p.n[0], p.n[1], p.n[2]);
+        let want_z = -stress / e0 * l;
+        let want_x = nu * stress / e0 * w;
+        let want_y = nu * stress / e0 * d;
+        let got = &u[3 * top..3 * top + 3];
+        for (c, want) in [want_x, want_y, want_z].into_iter().enumerate() {
+            assert!(
+                (got[c] - want).abs() < tol * want.abs(),
+                "axis {c}: {} vs {want}",
+                got[c]
+            );
+        }
+    }
+
+    #[test]
+    fn block_on_rollers_cpu() {
+        let (p, force, nu, e0) = block_on_rollers();
+        let ke = hex_ke(nu);
+        let fem = Fem {
+            p: &p,
+            ke: &ke,
+            ee: vec![e0 * p.h; p.domain.len()],
+            free: p.free_mask(),
+        };
+        let f: Vec<f64> = p.loads[0].iter().flatten().copied().collect();
+        let inv = fem.inv_diag();
+        let mut u = vec![0.0; f.len()];
+        let mut jacobi = |r: &[f64], z: &mut [f64]| {
+            for i in 0..r.len() {
+                z[i] = r[i] * inv[i];
+            }
+        };
+        fem.solve(&f, &mut u, 1e-12, 5000, &mut jacobi);
+        check_block_on_rollers(&p, &u, force, nu, e0, 1e-6);
+        // multigrid: its coarse levels see the rollers as clamped, still a good preconditioner
+        let mut m = mg::Multigrid::new(&fem, &mg::MgSettings::default());
+        let mut u = vec![0.0; f.len()];
+        let its = fem.solve(&f, &mut u, 1e-12, 500, &mut |r, z| m.precondition(r, z));
+        check_block_on_rollers(&p, &u, force, nu, e0, 1e-6);
+        assert!(its < 100, "{its} MGCG iterations");
     }
 
     /// reproduces uniaxial tension exactly, so the top moves F L / (E A).
@@ -1185,14 +1589,14 @@ mod tests {
             origin: [0.0; 3],
             domain: vec![true; 4],
             passive: vec![false; 4],
-            fixed: vec![false; 2 * 2 * 5],
+            fixed: vec![0; 2 * 2 * 5],
             loads: vec![vec![[0.0; 3]; 2 * 2 * 5]],
             cases: vec![1],
         };
         for j in 0..2 {
             for i in 0..2 {
                 let b = p.node(i, j, 0);
-                p.fixed[b] = true;
+                p.fixed[b] = 7;
                 let t = p.node(i, j, 4);
                 p.loads[0][t] = [0.0, 0.0, force / 4.0];
             }
@@ -1202,7 +1606,7 @@ mod tests {
             p: &p,
             ke: &ke,
             ee: vec![e0 * h; 4],
-            free: p.fixed.iter().map(|f| !f).collect(),
+            free: p.free_mask(),
         };
         let f: Vec<f64> = p.loads[0].iter().flatten().copied().collect();
         let mut u = vec![0.0; f.len()];

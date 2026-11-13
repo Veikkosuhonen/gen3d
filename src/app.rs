@@ -30,6 +30,7 @@ use crate::jobs::{Job, Slot, mesh_report, opt_progress};
 use crate::prims::{self, Kind, Op, Prim, Role};
 use crate::shape::{Field, Param, ParamKind, Shape};
 use crate::slicer;
+use crate::topopt::Ground;
 use crate::viewer::{
     Bindings, Camera, Options, Pipeline, Source, VolGpu, all_fields, build_pipeline, compiled_defines, draw,
     field_color, is_vti, load_source, preview_module, uniform_buffer, uniforms, volume_source,
@@ -159,6 +160,7 @@ struct OptUi {
     rmin: f64,
     /// Heaviside projection (crisp 0/1 designs)
     projection: bool,
+    ground: Ground,
 }
 
 impl Default for OptUi {
@@ -170,6 +172,7 @@ impl Default for OptUi {
             force: 100.0,
             rmin: 1.5,
             projection: true,
+            ground: Ground::None,
         }
     }
 }
@@ -529,6 +532,220 @@ fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(2.0);
 }
 
+/// A rough duration: "40 s", "3 min 20 s", "1 h 05 min".
+fn fmt_duration(secs: f32) -> String {
+    let s = secs.max(0.0).round() as u64;
+    if s < 60 {
+        format!("{s} s")
+    } else if s < 3600 {
+        // seconds are noise beyond a few minutes
+        if s < 600 {
+            format!("{} min {} s", s / 60, s % 60 / 10 * 10)
+        } else {
+            format!("{} min", (s + 30) / 60)
+        }
+    } else {
+        format!("{} h {:02} min", s / 3600, s % 3600 / 60)
+    }
+}
+
+/// Starting setups for common situations (`App::apply_template`).
+#[derive(Clone, Copy)]
+enum Template {
+    Stand,
+    Wall,
+    Hang,
+}
+
+impl Template {
+    const ALL: [Template; 3] = [Template::Stand, Template::Wall, Template::Hang];
+
+    fn label(self) -> &'static str {
+        match self {
+            Template::Stand => "stands on a table",
+            Template::Wall => "sticks out of a wall",
+            Template::Hang => "hangs from above",
+        }
+    }
+
+    fn tip(self) -> &'static str {
+        match self {
+            Template::Stand => {
+                "the ground holds the bottom; a 1 kg item rests on top and the part gets rocked 20% \
+                 sideways"
+            }
+            Template::Wall => "the low-X side is screwed to a wall; 2 kg hangs on the top of the far end",
+            Template::Hang => "the top is held; 2 kg hangs from the bottom",
+        }
+    }
+
+    fn added(self) -> &'static str {
+        match self {
+            Template::Stand => "a load region on top (and set the ground)",
+            Template::Wall => "a fixed wall region and a load region",
+            Template::Hang => "a fixed region on top and a load region at the bottom",
+        }
+    }
+}
+
+/// A colour per load case.
+fn case_color(case: u32) -> egui::Color32 {
+    const COLORS: [egui::Color32; 4] = [
+        egui::Color32::from_rgb(255, 120, 90),
+        egui::Color32::from_rgb(240, 200, 80),
+        egui::Color32::from_rgb(200, 120, 240),
+        egui::Color32::from_rgb(90, 210, 210),
+    ];
+    COLORS[(case.max(1) as usize - 1) % COLORS.len()]
+}
+
+/// The Optimize step's summary of the editor primitives' supports and loads, by load case.
+fn supports_and_loads_ui(ui: &mut egui::Ui, prims: &[Prim], ground: Ground, bounds: ([f32; 3], [f32; 3])) {
+    let fixed: Vec<String> = prims
+        .iter()
+        .filter(|p| !p.hidden && p.role == Role::Fixed)
+        .map(|p| match p.fix_mask() {
+            7 => p.name.clone(),
+            m => {
+                let axes: String = (0..3).filter(|c| m >> c & 1 == 1).map(|c| ['X', 'Y', 'Z'][c]).collect();
+                format!("{} (holds {})", p.name, if axes.is_empty() { "nothing" } else { &axes })
+            }
+        })
+        .collect();
+    let loads = prims::load_specs(prims);
+    if fixed.is_empty() && loads.is_empty() && ground == Ground::None {
+        return;
+    }
+    section(ui, "Supports & loads");
+    egui::Grid::new("bcs").num_columns(2).show(ui, |ui| {
+        if ground != Ground::None {
+            ui.label("ground");
+            ui.label(match ground {
+                Ground::Slide => "the bottom rests on it, free to slide",
+                _ => "the bottom rests on it, gripped",
+            });
+            ui.end_row();
+        }
+        if !fixed.is_empty() {
+            ui.label("fixed");
+            ui.label(fixed.join(", "));
+            ui.end_row();
+        }
+        let mut last = None;
+        for l in &loads {
+            let case = l.label.clone().unwrap_or_else(|| l.case.to_string());
+            ui.label(if last.as_ref() != Some(&case) {
+                format!("case {case}")
+            } else {
+                String::new()
+            });
+            let d = l.dir.unwrap_or_default();
+            let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-12);
+            let f = l.force.unwrap_or(0.0);
+            let along = [0, 1, 2].map(|c| fmt_num((d[c] / len * 100.0).round() as f64 / 100.0));
+            ui.label(format!(
+                "{}: {} N along ({}, {}, {})",
+                l.name,
+                fmt_num((f * 10.0).round() / 10.0),
+                along[0],
+                along[1],
+                along[2]
+            ));
+            ui.end_row();
+            last = Some(case);
+        }
+    });
+    let ncases = {
+        let mut c: Vec<u32> = loads.iter().map(|l| l.case).collect();
+        c.dedup();
+        c.len()
+    };
+    if ncases > 1 {
+        ui.weak(format!(
+            "{ncases} load cases: the part is made stiff for each (one solve per case)."
+        ));
+    }
+    for w in bc_warnings(prims, bounds) {
+        ui.colored_label(ui.visuals().warn_fg_color, w);
+    }
+    ui.weak("Set in Design (select a primitive: Optimize as).");
+}
+
+/// Mistakes in the supports and loads that show before running.
+fn bc_warnings(prims: &[Prim], (lo, hi): ([f32; 3], [f32; 3])) -> Vec<String> {
+    let mut out = vec![];
+    for p in prims.iter().filter(|p| !p.hidden && p.role.is_bc()) {
+        let (a, b) = p.aabb();
+        if (0..3).any(|k| b[k] < lo[k] || a[k] > hi[k]) {
+            out.push(format!(
+                "`{}` is outside the shape, so it holds or carries nothing.",
+                p.name
+            ));
+        }
+        match p.role {
+            Role::Fixed if p.fix_mask() == 0 => out.push(format!(
+                "`{}` holds no direction: tick at least one of X, Y, Z.",
+                p.name
+            )),
+            Role::Load if p.force <= 0.0 => out.push(format!("`{}` has no force.", p.name)),
+            Role::Load if p.load.iter().all(|v| *v == 0.0) => out.push(format!("`{}` has no direction.", p.name)),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Plain-language steps for defining an optimization problem (Optimize step).
+fn optimize_howto(ui: &mut egui::Ui) {
+    let steps = [
+        (
+            "The shape is the space to fill.",
+            "Design the shape as the largest part that could fit. The optimizer keeps only some of \
+             that space as material and carves the rest away.",
+        ),
+        (
+            "Say what holds the part.",
+            "Standing on a table? Pick \"Stands on the ground\" above. Screwed or clamped? In Design, \
+             select a primitive at that spot (e.g. a bolt hole) and set its \"optimize as\" to fixed.",
+        ),
+        (
+            "Say what it carries.",
+            "Select the primitive where the load sits and set \"optimize as\" to load. For something \
+             resting on it, give its weight in kg; otherwise a force in newtons and a direction. A \
+             subtracted primitive set to load puts the load on the face it cuts.",
+        ),
+        (
+            "Optional: rocking and other situations.",
+            "Tick rocking on a load if the part also gets bumped or tipped sideways. Loads with \
+             different case numbers are separate situations; the part is made stiff for each.",
+        ),
+        (
+            "Optional: keep spots solid.",
+            "Set \"optimize as\" to keep solid where material must stay (e.g. a mounting face). To \
+             mark a spot without changing the shape, set the primitive's operation to region.",
+        ),
+        (
+            "Pick the amount of material and run.",
+            "Set material below (e.g. 30% of the shape) and click Optimize. When it finishes, move \
+             the threshold until the part looks right, then go to Print.",
+        ),
+    ];
+    for (i, (title, text)) in steps.iter().enumerate() {
+        ui.horizontal_top(|ui| {
+            ui.strong(format!("{}.", i + 1));
+            ui.vertical(|ui| {
+                ui.strong(*title);
+                ui.label(*text);
+            });
+        });
+        ui.add_space(3.0);
+    }
+    ui.weak(
+        "Script shapes can define `fn field_fixed(p: vec3f) -> f32` (< 0 where held) and \
+         `fn field_load(p: vec3f) -> vec3f` instead; see shapes/bracket_domain.wgsl.",
+    );
+}
+
 /// A primary action button (filled with the selection colour).
 fn primary(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
     let fill = ui.visuals().selection.bg_fill;
@@ -768,7 +985,7 @@ impl App {
     /// Whether the design defines the fields `gen3d optimize` needs.
     fn optimizable(&self) -> bool {
         let has = |n: &str, c: usize| self.design_fields.iter().any(|f| f.name == n && f.comps == c);
-        has("fixed", 1) && has("load", 3)
+        (has("fixed", 1) || self.opt.ground != Ground::None) && has("load", 3)
     }
 
     /// The design's files on disk (the .wgsl and its includes).
@@ -801,6 +1018,9 @@ impl App {
     }
 
     fn set_step(&mut self, step: Step) {
+        if self.step == Step::Optimize && step == Step::Print && self.existing_result().is_some() {
+            self.print_result = true;
+        }
         self.step = step;
         if step == Step::Print {
             self.print.profiles = slicer::profiles();
@@ -1196,6 +1416,72 @@ impl App {
         self.select(Some(i));
     }
 
+    /// Adds a starting setup's supports and loads (regions sized to the design's bounds) and sets
+    /// the ground to match.
+    fn apply_template(&mut self, t: Template) {
+        let Some(shape) = &self.design_shape else { return };
+        let margin = 2.0 * shape.voxel;
+        let (lo, hi) = shape.bounds;
+        let lo = lo.map(|v| v + margin);
+        let hi = hi.map(|v| v - margin);
+        let size: [f32; 3] = std::array::from_fn(|k| (hi[k] - lo[k]).max(1e-3));
+        let mid: [f32; 3] = std::array::from_fn(|k| 0.5 * (lo[k] + hi[k]));
+        // a region slab on a face of the bounds: `axis`, at its low (false) or high (true) end
+        let slab = |name: &str, axis: usize, high: bool, share: f32, role: Role| {
+            let t = (share * size[axis]).max(margin);
+            let mut pos = mid;
+            pos[axis] = if high { hi[axis] - 0.5 * t } else { lo[axis] + 0.5 * t };
+            let mut dims = size;
+            dims[axis] = t;
+            Prim {
+                op: Op::Region,
+                role,
+                dims,
+                ..Prim::new(Kind::Box, name.into(), pos, 1.0)
+            }
+        };
+        let weight = |mut p: Prim, kg: f32, rock: f32| {
+            p.kg = true;
+            p.force = kg;
+            p.load = [0.0, 0.0, -1.0];
+            p.rock = rock;
+            p
+        };
+        let (add, ground) = match t {
+            Template::Stand => (
+                vec![weight(slab("item on top", 2, true, 0.1, Role::Load), 1.0, 0.2)],
+                Ground::Grip,
+            ),
+            Template::Wall => {
+                // the wall at the low X side; the load on top at the far end
+                let mut load = slab("load on the end", 2, true, 0.1, Role::Load);
+                load.dims[0] = 0.25 * size[0];
+                load.pos[0] = hi[0] - 0.125 * size[0];
+                (
+                    vec![slab("wall", 0, false, 0.05, Role::Fixed), weight(load, 2.0, 0.0)],
+                    Ground::None,
+                )
+            }
+            Template::Hang => (
+                vec![
+                    slab("hangs from", 2, true, 0.05, Role::Fixed),
+                    weight(slab("hanging weight", 2, false, 0.1, Role::Load), 2.0, 0.0),
+                ],
+                Ground::None,
+            ),
+        };
+        let mut prims = self.prims();
+        let first = prims.len();
+        prims.extend(add);
+        self.set_prims(prims);
+        self.opt.ground = ground;
+        self.select(Some(first));
+        self.notice = Some(format!(
+            "Added {}: move and resize them in Design to match your part.",
+            t.added()
+        ));
+    }
+
     fn duplicate_prim(&mut self, i: usize) {
         let mut prims = self.prims();
         let Some(p) = prims.get(i).cloned() else { return };
@@ -1236,6 +1522,181 @@ impl App {
                 self.duplicate_prim(i);
             } else if key(ui, egui::Modifiers::NONE, egui::Key::Escape) {
                 self.select(None);
+            }
+        }
+    }
+
+    /// World to screen for the current camera (None behind the camera).
+    fn projector(&self, rect: egui::Rect) -> impl Fn([f32; 3]) -> Option<egui::Pos2> {
+        let eye = self.cam.eye();
+        let (fw, rt, up) = self.cam.basis();
+        let h = rect.height();
+        move |q: [f32; 3]| {
+            let dot = |a: [f32; 3], b: [f32; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+            let v = [0, 1, 2].map(|k| q[k] - eye[k]);
+            let z = dot(v, fw);
+            (z > 1e-3).then(|| rect.center() + egui::vec2(dot(v, rt), -dot(v, up)) * (1.8 * h / z))
+        }
+    }
+
+    /// Supports, loads and the ground drawn over the view (Design and Optimize steps): an arrow per
+    /// load (coloured by load case, with its rocking pushes), a marker per support, the ground plane.
+    fn bc_overlay(&self, ui: &egui::Ui, rect: egui::Rect) {
+        if self.step == Step::Print || self.volume.is_some() && self.step == Step::Design {
+            return;
+        }
+        let Some(shape) = &self.design_shape else { return };
+        if !shape.editor && self.opt.ground == Ground::None {
+            return;
+        }
+        let prims = self.prims();
+        let project = self.projector(rect);
+        let painter = ui.painter_at(rect);
+        let (lo, hi) = shape.bounds;
+        let size = [0, 1, 2].map(|k| hi[k] - lo[k]);
+        let scale = size.iter().fold(0.0f32, |m, v| m.max(*v));
+        let font = egui::FontId::proportional(12.0);
+        let text = egui::Color32::from_white_alpha(220);
+
+        // the ground: the bottom of the bounds, a little wider
+        if self.step == Step::Optimize && self.opt.ground != Ground::None {
+            let z = lo[2];
+            let m = 0.08 * scale;
+            let c = [
+                [lo[0] - m, lo[1] - m],
+                [hi[0] + m, lo[1] - m],
+                [hi[0] + m, hi[1] + m],
+                [lo[0] - m, hi[1] + m],
+            ];
+            let pts: Vec<_> = c.iter().filter_map(|p| project([p[0], p[1], z])).collect();
+            if pts.len() == 4 {
+                let col = egui::Color32::from_rgba_unmultiplied(140, 170, 120, 40);
+                painter.add(egui::Shape::convex_polygon(
+                    pts.clone(),
+                    col,
+                    egui::Stroke::new(1.5, egui::Color32::from_rgb(140, 170, 120)),
+                ));
+                let name = if self.opt.ground == Ground::Slide {
+                    "ground (slides)"
+                } else {
+                    "ground (grips)"
+                };
+                painter.text(pts[0], egui::Align2::LEFT_TOP, name, font.clone(), text);
+            }
+        }
+        if !shape.editor {
+            return;
+        }
+        // where a primitive acts: its box clipped to the shape's bounds
+        let anchor = |p: &Prim| {
+            let (a, b) = p.aabb();
+            [0, 1, 2].map(|k| {
+                let (l, h) = (a[k].max(lo[k]), b[k].min(hi[k]));
+                if l <= h {
+                    0.5 * (l + h)
+                } else {
+                    p.pos[k].clamp(lo[k], hi[k])
+                }
+            })
+        };
+        let arrow = |from: [f32; 3], to: [f32; 3], col: egui::Color32, width: f32| {
+            let (Some(a), Some(b)) = (project(from), project(to)) else {
+                return None;
+            };
+            painter.line_segment([a, b], egui::Stroke::new(width, col));
+            let d = b - a;
+            if d.length() > 1.0 {
+                let u = d.normalized();
+                let n = egui::vec2(-u.y, u.x);
+                let head = 4.0 + 2.0 * width;
+                painter.add(egui::Shape::convex_polygon(
+                    vec![b, b - u * head * 1.6 + n * head, b - u * head * 1.6 - n * head],
+                    col,
+                    egui::Stroke::NONE,
+                ));
+            }
+            Some(a)
+        };
+        let len = 0.18 * scale;
+        for p in prims.iter().filter(|p| !p.hidden) {
+            let at = anchor(p);
+            match p.role {
+                Role::Load => {
+                    let l = p.load;
+                    let n = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
+                    if n == 0.0 {
+                        continue;
+                    }
+                    let d = l.map(|v| v / n);
+                    let col = case_color(p.case);
+                    let tail = [0, 1, 2].map(|k| at[k] - d[k] * len);
+                    if let Some(a) = arrow(tail, at, col, 2.5) {
+                        let amount = if p.kg {
+                            format!("{} kg", fmt_num(p.force as f64))
+                        } else {
+                            format!("{} N", fmt_num(p.force as f64))
+                        };
+                        let case = if p.case > 1 {
+                            format!(" · case {}", p.case)
+                        } else {
+                            String::new()
+                        };
+                        painter.text(
+                            a,
+                            egui::Align2::CENTER_BOTTOM,
+                            format!("{amount}{case}"),
+                            font.clone(),
+                            col,
+                        );
+                    }
+                    if p.rock > 0.0 {
+                        let side = (0..3).max_by(|&a, &b| d[a].abs().total_cmp(&d[b].abs())).unwrap_or(2);
+                        for ax in (0..3).filter(|&a| a != side) {
+                            for sign in [1.0f32, -1.0] {
+                                let mut tip = at;
+                                tip[ax] += sign * len * p.rock.max(0.15);
+                                arrow(at, tip, col.gamma_multiply(0.7), 1.5);
+                            }
+                        }
+                    }
+                }
+                Role::Fixed => {
+                    let Some(c) = project(at) else { continue };
+                    let col = egui::Color32::from_rgb(110, 170, 255);
+                    let m = p.fix_mask();
+                    // a triangle standing on a base line: clamped; with wheels: a roller
+                    let r = 8.0;
+                    painter.add(egui::Shape::convex_polygon(
+                        vec![c, c + egui::vec2(-r, 1.6 * r), c + egui::vec2(r, 1.6 * r)],
+                        col.gamma_multiply(0.5),
+                        egui::Stroke::new(1.5, col),
+                    ));
+                    let base = c.y + 1.6 * r + if m == 7 { 2.0 } else { 7.0 };
+                    if m != 7 {
+                        for x in [-0.6 * r, 0.6 * r] {
+                            painter.circle_stroke(egui::pos2(c.x + x, base - 3.0), 2.5, egui::Stroke::new(1.5, col));
+                        }
+                    }
+                    painter.line_segment(
+                        [egui::pos2(c.x - 1.4 * r, base), egui::pos2(c.x + 1.4 * r, base)],
+                        egui::Stroke::new(2.0, col),
+                    );
+                    let label = match m {
+                        7 => p.name.clone(),
+                        _ => {
+                            let axes: String = (0..3).filter(|c| m >> c & 1 == 1).map(|c| ['X', 'Y', 'Z'][c]).collect();
+                            format!("{} (holds {axes})", p.name)
+                        }
+                    };
+                    painter.text(
+                        egui::pos2(c.x + 1.6 * r, c.y + r),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        font.clone(),
+                        text,
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -1451,7 +1912,9 @@ impl App {
                 ui.end_row();
                 ui.label("optimize as").on_hover_text(
                     "its meaning for Optimize: fixed and load apply to its inside plus a thin shell around \
-                     it (so a fixed subtracted cylinder clamps its hole's wall), and keep those spots solid",
+                     it, and keep those spots solid. A subtracted primitive works too: a fixed subtracted \
+                     cylinder clamps its hole's wall, and a subtracted box set to load loads the face it \
+                     cuts (no extra region primitive needed)",
                 );
                 ui.horizontal_wrapped(|ui| {
                     for r in Role::ALL {
@@ -1462,15 +1925,68 @@ impl App {
                     }
                 });
                 ui.end_row();
-                if p.role == Role::Load {
-                    ui.label("load force");
-                    ui.add(
-                        egui::DragValue::new(&mut p.force)
-                            .speed(1.0)
-                            .range(0.0..=1e6)
-                            .max_decimals(1)
-                            .suffix(" N"),
+                if p.op == Op::Subtract && p.role.is_bc() {
+                    ui.label("");
+                    ui.weak(format!(
+                        "acts on the surface this primitive cuts ({} there)",
+                        p.role.name()
+                    ));
+                    ui.end_row();
+                }
+                if p.role == Role::Fixed {
+                    ui.label("holds").on_hover_text(
+                        "the directions it holds the part in. All three clamp it; only the one across a \
+                         surface makes a roller: the part can't move into or off the surface, but slides \
+                         along it",
                     );
+                    ui.horizontal(|ui| {
+                        for (c, name) in ["X", "Y", "Z"].into_iter().enumerate() {
+                            if ui.checkbox(&mut p.fix[c], name).changed() {
+                                new_step = true;
+                            }
+                        }
+                        let kind = match p.fix_mask() {
+                            7 => "clamped",
+                            0 => "holds nothing",
+                            1 | 2 | 4 => "roller",
+                            _ => "slides along one axis",
+                        };
+                        ui.weak(kind);
+                    });
+                    ui.end_row();
+                }
+                if p.role == Role::Load {
+                    ui.label("load");
+                    ui.horizontal(|ui| {
+                        let suffix = if p.kg { " kg" } else { " N" };
+                        ui.add(
+                            egui::DragValue::new(&mut p.force)
+                                .speed(if p.kg { 0.05 } else { 1.0 })
+                                .range(0.0..=1e6)
+                                .max_decimals(2)
+                                .suffix(suffix),
+                        );
+                        let was = p.kg;
+                        ui.selectable_value(&mut p.kg, false, "N")
+                            .on_hover_text("a force in newtons, along the direction below");
+                        ui.selectable_value(&mut p.kg, true, "kg")
+                            .on_hover_text("the weight of something resting on it (mass × 9.81 N, straight down)");
+                        if p.kg != was {
+                            // keep the force the same when switching units
+                            p.force = if p.kg {
+                                p.force / prims::G as f32
+                            } else {
+                                p.force * prims::G as f32
+                            };
+                            if p.kg {
+                                p.load = [0.0, 0.0, -1.0];
+                            }
+                            new_step = true;
+                        }
+                        if p.kg {
+                            ui.weak(format!("= {} N", fmt_num(p.newtons())));
+                        }
+                    });
                     ui.end_row();
                     ui.label("direction").on_hover_text("normalized when used");
                     ui.vertical(|ui| {
@@ -1496,6 +2012,29 @@ impl App {
                          the part must handle (optimized for all of them)",
                     );
                     ui.add(egui::DragValue::new(&mut p.case).range(1..=16).speed(0.05));
+                    ui.end_row();
+                    ui.label("rocking").on_hover_text(
+                        "the part also gets pushed sideways while carrying this load (bumped, rocked, \
+                         tipped). Adds four load cases: this load tilted by the given share of itself, \
+                         both ways along each sideways axis. Each extra case adds solve time",
+                    );
+                    ui.horizontal(|ui| {
+                        let mut on = p.rock > 0.0;
+                        if ui.checkbox(&mut on, "").changed() {
+                            p.rock = if on { 0.2 } else { 0.0 };
+                            new_step = true;
+                        }
+                        if on {
+                            ui.add(
+                                egui::Slider::new(&mut p.rock, 0.05..=1.0)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                    .custom_parser(|s| {
+                                        s.trim_end_matches('%').trim().parse::<f64>().ok().map(|v| v / 100.0)
+                                    }),
+                            )
+                            .on_hover_text("sideways push as a share of the load");
+                        }
+                    });
                     ui.end_row();
                 }
                 ui.label("kind");
@@ -1857,6 +2396,9 @@ impl App {
         if !o.projection {
             a.push("--no-projection".into());
         }
+        if o.ground != Ground::None {
+            a.extend(["--ground".into(), o.ground.name().into()]);
+        }
         a.extend(["-o".into(), result.display().to_string()]);
         self.opt_job.start("optimize", a, result);
     }
@@ -2159,6 +2701,7 @@ impl App {
         painter.image(tex, rect, uv, egui::Color32::WHITE);
 
         let editing = self.edit_viewport(ui, &resp, rect);
+        self.bc_overlay(ui, rect);
 
         // camera (rates per physical pixel)
         let d = resp.drag_delta();
@@ -2248,13 +2791,6 @@ impl App {
         }
     }
 
-    fn next_button(&mut self, ui: &mut egui::Ui, label: &str, step: Step) {
-        ui.add_space(12.0);
-        if primary(ui, true, label).clicked() {
-            self.set_step(step);
-        }
-    }
-
     // ---------------------------------------------------------------------------- 1. Design
 
     fn design_ui(&mut self, ui: &mut egui::Ui) {
@@ -2266,7 +2802,6 @@ impl App {
             section(ui, "Solid");
             self.volume_ui(ui);
             egui::CollapsingHeader::new("Grid details").show(ui, |ui| self.grid_ui(ui));
-            self.next_button(ui, "Next: Print", Step::Print);
             return;
         }
         if self.is_empty_design() {
@@ -2291,17 +2826,6 @@ impl App {
         }
         ui.add_space(6.0);
         egui::CollapsingHeader::new("Shape details").show(ui, |ui| self.shape_ui(ui));
-        if !self.loaded {
-            return;
-        }
-        if self.optimizable() {
-            self.next_button(ui, "Next: Optimize", Step::Optimize);
-            if ui.small_button("Skip to Print").clicked() {
-                self.set_step(Step::Print);
-            }
-        } else {
-            self.next_button(ui, "Next: Print", Step::Print);
-        }
     }
 
     fn params_ui(&mut self, ui: &mut egui::Ui) {
@@ -2629,16 +3153,50 @@ impl App {
             "Optional. Finds the stiffest part that uses a given share of the design domain (the \
              shape), held at its supports and carrying its loads.",
         );
-        if !self.optimizable() {
-            ui.add_space(6.0);
-            ui.label(
-                "This shape needs supports and loads first. In Design, select a primitive (e.g. a \
-                 subtracted bolt hole) and set Optimize as: fixed; then one as load, with a force and \
-                 direction. Primitives set to region mark a spot without changing the shape. Or, in the \
-                 script: `fn field_fixed(p: vec3f) -> f32` (< 0 where clamped) and \
-                 `fn field_load(p: vec3f) -> vec3f` (load direction); see shapes/bracket_domain.wgsl.",
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Stands on the ground").on_hover_text(
+                "the bottom of the shape rests on a table or floor. The optimizer picks where the part \
+                 touches down. Note: the ground can still pull on the part (a linear model can't let it \
+                 lift off), so check the result for feet that would hang in tension",
             );
-            self.next_button(ui, "Skip to Print", Step::Print);
+            let running = self.opt_job.running();
+            ui.add_enabled_ui(!running, |ui| {
+                let g = &mut self.opt.ground;
+                ui.selectable_value(g, Ground::None, "no");
+                ui.selectable_value(g, Ground::Slide, "slides").on_hover_text(
+                    "held up only: free to slide and spread sideways (a slippery surface), so the part \
+                     can't use the ground to tie its feet together",
+                );
+                ui.selectable_value(g, Ground::Grip, "grips")
+                    .on_hover_text("held in all directions: a grippy surface, or glued down");
+            });
+        });
+        if self.design_shape.as_ref().is_some_and(|s| s.editor) && !self.opt_job.running() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Quick start: the part")
+                    .on_hover_text("adds supports and loads sized to the shape, for you to adjust");
+                for t in Template::ALL {
+                    if ui.small_button(t.label()).on_hover_text(t.tip()).clicked() {
+                        self.apply_template(t);
+                    }
+                }
+            });
+        }
+        let ready = self.optimizable();
+        if !ready {
+            ui.add_space(6.0);
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "Not ready yet: the shape needs something holding it (a fixed spot, or the ground) and \
+                 one load.",
+            );
+        }
+        egui::CollapsingHeader::new("How to set up an optimization")
+            .id_salt("opt_howto")
+            .default_open(!ready)
+            .show(ui, optimize_howto);
+        if !ready {
             return;
         }
         let Some(shape) = self.design_shape.clone() else { return };
@@ -2646,37 +3204,7 @@ impl App {
             ui.weak(format!("for {}", define_list(&self.defines)));
         }
         if shape.editor {
-            let fixed: Vec<_> = shape
-                .prims
-                .iter()
-                .filter(|p| !p.hidden && p.role == Role::Fixed)
-                .map(|p| p.name.as_str())
-                .collect();
-            let loads = prims::load_specs(&shape.prims);
-            if !fixed.is_empty() || !loads.is_empty() {
-                section(ui, "Supports & loads");
-                egui::Grid::new("bcs").num_columns(2).show(ui, |ui| {
-                    if !fixed.is_empty() {
-                        ui.label("fixed");
-                        ui.label(fixed.join(", "));
-                        ui.end_row();
-                    }
-                    for l in &loads {
-                        let d = l.dir.unwrap_or_default();
-                        ui.label(format!("case {}", l.case));
-                        ui.label(format!(
-                            "{}: {} N along ({}, {}, {})",
-                            l.name,
-                            fmt_num(l.force.unwrap_or(0.0)),
-                            fmt_num(d[0] as f64),
-                            fmt_num(d[1] as f64),
-                            fmt_num(d[2] as f64)
-                        ));
-                        ui.end_row();
-                    }
-                });
-                ui.weak("Set in Design (select a primitive: Optimize as).");
-            }
+            supports_and_loads_ui(ui, &shape.prims, self.opt.ground, shape.bounds);
         }
         let result = self.result_path();
         let job = self.opt_job.get();
@@ -2766,6 +3294,25 @@ impl App {
                 egui::ProgressBar::new(p.iteration as f32 / self.opt.iters.max(1) as f32)
                     .text(format!("iteration {} of at most {}", p.iteration, self.opt.iters)),
             );
+            let beta_max = if self.opt.projection { 32.0 } else { 0.0 };
+            match p.eta(self.opt.iters, beta_max) {
+                Some(e) => {
+                    let text = match e.likely {
+                        Some(l) if e.max - l > 1.0 => {
+                            format!("about {} left (at most {})", fmt_duration(l), fmt_duration(e.max))
+                        }
+                        Some(_) => format!("about {} left", fmt_duration(e.max)),
+                        None => format!("at most {} left", fmt_duration(e.max)),
+                    };
+                    ui.label(text).on_hover_text(
+                        "estimated from the recent iterations' times. It may stop sooner when the \
+                         design converges; \"at most\" is if it runs to the iteration limit",
+                    );
+                }
+                None => {
+                    ui.weak("estimating time left…");
+                }
+            }
             let mut parts = vec![];
             if let Some(c) = p.compliance {
                 parts.push(format!("compliance {c}"));
@@ -2816,11 +3363,6 @@ impl App {
         if self.volume.is_some() && self.shown == result {
             ui.weak("Pick the threshold that forms the part; the mesh follows it.");
             self.volume_ui(ui);
-        }
-        ui.add_space(12.0);
-        if primary(ui, true, "Next: Print the result").clicked() {
-            self.print_result = true;
-            self.set_step(Step::Print);
         }
     }
 

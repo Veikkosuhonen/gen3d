@@ -157,6 +157,57 @@ pub struct OptProgress {
     pub beta: Option<String>,
     /// the final "converged ..." / "done in ..." line, once there is one
     pub finished: Option<String>,
+    /// wall time of each iteration, s
+    pub iter_secs: Vec<f32>,
+    /// iterations after which the projection sharpened (`beta -> ...`)
+    pub beta_steps: Vec<usize>,
+}
+
+/// Estimated time left of an optimization run, s.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Eta {
+    /// best guess, if the run's course can be predicted (with projection)
+    pub likely: Option<f32>,
+    /// if it runs to the iteration limit
+    pub max: f32,
+}
+
+impl OptProgress {
+    /// Time left, from the recent iteration times. `beta_max` is the projection's final sharpness
+    /// (0 without projection); each sharpening stage ends on convergence or after 25 iterations.
+    pub fn eta(&self, maxit: usize, beta_max: f64) -> Option<Eta> {
+        // the first iteration includes setup, so leave it out once there are others
+        let times = match self.iter_secs.len() {
+            0 => return None,
+            1 => &self.iter_secs[..],
+            _ => &self.iter_secs[1..],
+        };
+        let recent = &times[times.len().saturating_sub(5)..];
+        let per = recent.iter().sum::<f32>() / recent.len() as f32;
+        let left_max = maxit.saturating_sub(self.iteration);
+        let max = left_max as f32 * per;
+        let beta = self.beta.as_deref().and_then(|b| b.parse::<f64>().ok());
+        let likely = beta.filter(|_| beta_max > 0.0).map(|beta| {
+            let mut bounds = vec![0];
+            bounds.extend(&self.beta_steps);
+            let done: Vec<usize> = bounds.windows(2).map(|w| w[1] - w[0]).collect();
+            let typical = if done.is_empty() {
+                25.0
+            } else {
+                done.iter().sum::<usize>() as f32 / done.len() as f32
+            };
+            let in_stage = self.iteration.saturating_sub(*bounds.last().unwrap()) as f32;
+            let later = (beta_max / beta).log2().round().max(0.0) as f32;
+            let final_stage = later == 0.0;
+            let mut cur = (typical - in_stage).max(1.0);
+            if !final_stage {
+                cur = cur.min((25.0 - in_stage).max(1.0));
+            }
+            let its = (cur + later * typical).min(left_max as f32);
+            its * per
+        });
+        Some(Eta { likely, max })
+    }
 }
 
 pub fn opt_progress(log: &str) -> OptProgress {
@@ -176,8 +227,14 @@ pub fn opt_progress(log: &str) -> OptProgress {
                     p.grey = Some(v.to_string());
                 } else if let Some(v) = part.strip_prefix("beta ") {
                     p.beta = Some(v.to_string());
+                } else if let Some((secs, _)) = part.split_once(" s [")
+                    && let Ok(t) = secs.trim().parse()
+                {
+                    p.iter_secs.push(t);
                 }
             }
+        } else if l.starts_with("beta -> ") {
+            p.beta_steps.push(p.iteration);
         } else if l.starts_with("done in ") {
             p.finished = Some(l.to_string());
         }
@@ -200,17 +257,39 @@ mod tests {
     #[test]
     fn parses_opt_progress() {
         let log = "SIMP: volume fraction 0.3\n\
-                   it   1: compliance 9.6000e1 N·mm, max displacement 1.17 mm, change 0.200, grey 24%, beta 1, 900 CG its, 1.8 s\n\
+                   it   1: compliance 9.6000e1 N·mm, max displacement 1.17 mm, change 0.200, grey 24%, beta 1, 900 CG its, 1.8 s [setup 0.10 solve 1.50 update 0.10 io 0.10]\n\
                    beta -> 2\n\
-                   it  12: compliance 1.0400e1 N·mm, max displacement 0.124 mm, change 0.050, grey 10%, beta 2, 950 CG its, 1.7 s\n";
+                   it  12: compliance 1.0400e1 N·mm, max displacement 0.124 mm, change 0.050, grey 10%, beta 2, 950 CG its, 1.7 s [setup 0.10 solve 1.40 update 0.10 io 0.10]\n";
         let p = opt_progress(log);
         assert_eq!(p.iteration, 12);
         assert_eq!(p.compliance.as_deref(), Some("1.0400e1 N·mm"));
         assert_eq!(p.grey.as_deref(), Some("10%"));
         assert_eq!(p.beta.as_deref(), Some("2"));
         assert!(p.finished.is_none());
+        assert_eq!(p.iter_secs, vec![1.8, 1.7]);
+        assert_eq!(p.beta_steps, vec![1]);
         let p = opt_progress(&format!("{log}done in 52.0 s: 29 iterations\n"));
         assert!(p.finished.unwrap().starts_with("done in"));
+    }
+
+    #[test]
+    fn opt_eta() {
+        let p = OptProgress {
+            iteration: 10,
+            beta: Some("4".into()),
+            iter_secs: vec![5.0, 2.0, 2.0],
+            beta_steps: vec![4, 8],
+            ..Default::default()
+        };
+        // stages of 4 iterations, 2 into the beta 4 one, then 8, 16, 32: 2 + 3 * 4 = 14 its at 2 s
+        let e = p.eta(100, 32.0).unwrap();
+        assert_eq!(e.likely, Some(28.0));
+        assert_eq!(e.max, 180.0);
+        // capped by the iteration limit
+        assert_eq!(p.eta(12, 32.0).unwrap().likely, Some(4.0));
+        // without projection only the upper bound is known
+        assert_eq!(p.eta(100, 0.0).unwrap().likely, None);
+        assert!(OptProgress::default().eta(100, 32.0).is_none());
     }
 
     #[test]

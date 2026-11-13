@@ -210,7 +210,18 @@ pub struct Prim {
     /// Load case (`Role::Load`): loads in one case act together; separate cases are separate
     /// situations the part must survive (the optimizer minimizes their summed compliance).
     pub case: u32,
+    /// `force` is a mass in kg (`Role::Load`): its weight, `force` × 9.81 N.
+    pub kg: bool,
+    /// Rocking (`Role::Load`): its case also comes in variants with a sideways push of this share of
+    /// the load added, both ways along each axis across the load (0 = off).
+    pub rock: f32,
+    /// The axes a fixed primitive holds (`Role::Fixed`): all three clamp; only the one across a
+    /// surface makes a roller that lets the part slide along it.
+    pub fix: [bool; 3],
 }
+
+/// Standard gravity, N per kg.
+pub const G: f64 = 9.81;
 
 impl Default for Prim {
     fn default() -> Prim {
@@ -228,7 +239,26 @@ impl Default for Prim {
             load: [0.0, 0.0, -1.0],
             force: 100.0,
             case: 1,
+            kg: false,
+            rock: 0.0,
+            fix: [true; 3],
         }
+    }
+}
+
+impl Prim {
+    /// The load in N (`force`, or its weight when given in kg).
+    pub fn newtons(&self) -> f64 {
+        if self.kg {
+            self.force as f64 * G
+        } else {
+            self.force as f64
+        }
+    }
+
+    /// The fixed axes as bits (bit c for axis c).
+    pub fn fix_mask(&self) -> u8 {
+        (0..3).filter(|&c| self.fix[c]).fold(0, |m, c| m | 1 << c)
     }
 }
 
@@ -243,6 +273,48 @@ pub struct LoadSpec {
     /// N; None = the optimizer's `--force`
     pub force: Option<f64>,
     pub case: u32,
+    /// for a generated rocking variant: its case's name, e.g. "1 rocked +X"
+    pub label: Option<String>,
+}
+
+/// A support for the optimizer: the script's `field_fixed` (all axes) or a primitive with the fixed
+/// role.
+#[derive(Clone, Debug)]
+pub struct SupportSpec {
+    pub name: String,
+    /// `fn(p) -> f32`, < 0 inside the region
+    pub func: String,
+    /// the held axes, bit c for axis c
+    pub axes: u8,
+}
+
+/// The supports of the visible primitives with the fixed role.
+pub fn support_specs(prims: &[Prim]) -> Vec<SupportSpec> {
+    prims
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.hidden && p.role == Role::Fixed && p.fix_mask() != 0)
+        .map(|(i, p)| SupportSpec {
+            name: p.name.clone(),
+            func: format!("g3d_bc{i}"),
+            axes: p.fix_mask(),
+        })
+        .collect()
+}
+
+/// The two world axes most across direction `d`, as indices.
+fn across(d: [f32; 3]) -> [usize; 2] {
+    let main = (0..3).max_by(|&a, &b| d[a].abs().total_cmp(&d[b].abs())).unwrap_or(2);
+    let mut out = [0; 2];
+    for (k, c) in (0..3).filter(|&c| c != main).enumerate() {
+        out[k] = c;
+    }
+    out
+}
+
+/// Case number of a generated rocking variant: case `c`'s variant `k` (1..=4).
+pub fn rock_case(c: u32, k: u32) -> u32 {
+    1000 * c + k
 }
 
 /// The sidecar file.
@@ -283,6 +355,10 @@ pub fn load(path: &Path) -> Result<Vec<Prim>> {
             p.force = 0.0;
         }
         p.case = p.case.max(1);
+        if !p.rock.is_finite() {
+            p.rock = 0.0;
+        }
+        p.rock = p.rock.clamp(0.0, 1.0);
         for v in [&mut p.round, &mut p.blend] {
             if !v.is_finite() {
                 *v = 0.0;
@@ -760,10 +836,70 @@ pub fn load_specs(prims: &[Prim]) -> Vec<LoadSpec> {
             name: p.name.clone(),
             func: format!("g3d_bc{i}"),
             dir: Some(p.load),
-            force: Some(p.force as f64),
+            force: Some(p.newtons()),
             case: p.case.max(1),
+            label: None,
         })
+        .chain(rock_variants(prims))
         .collect()
+}
+
+/// The rocking variants: for each case with a rocking load, four more cases with every load of the
+/// case, the rocking ones tilted by ± their share sideways along each axis across them.
+fn rock_variants(prims: &[Prim]) -> Vec<LoadSpec> {
+    let loads: Vec<(usize, &Prim)> = prims
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.hidden && p.role == Role::Load)
+        .collect();
+    let mut cases: Vec<u32> = loads
+        .iter()
+        .filter(|(_, p)| p.rock > 0.0)
+        .map(|(_, p)| p.case.max(1))
+        .collect();
+    cases.sort();
+    cases.dedup();
+    let mut out = vec![];
+    for c in cases {
+        // sideways is across the case's first rocking load
+        let lead = loads
+            .iter()
+            .find(|(_, p)| p.case.max(1) == c && p.rock > 0.0)
+            .unwrap()
+            .1;
+        let mut k = 0;
+        for axis in across(lead.load) {
+            for sign in [1.0f32, -1.0] {
+                k += 1;
+                let label = format!(
+                    "{c} rocked {}{}",
+                    if sign > 0.0 { "+" } else { "-" },
+                    ["X", "Y", "Z"][axis]
+                );
+                for &(i, p) in loads.iter().filter(|(_, p)| p.case.max(1) == c) {
+                    let l = p.load;
+                    let len = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
+                    let (dir, force) = if p.rock > 0.0 && len > 0.0 {
+                        let mut d = l.map(|v| v / len);
+                        d[axis] += sign * p.rock;
+                        let dl = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                        (d, p.newtons() * dl as f64)
+                    } else {
+                        (l, p.newtons())
+                    };
+                    out.push(LoadSpec {
+                        name: p.name.clone(),
+                        func: format!("g3d_bc{i}"),
+                        dir: Some(dir),
+                        force: Some(force),
+                        case: rock_case(c, k),
+                        label: Some(label.clone()),
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Byte offset of the name in the script's `fn <name>(` definition (ignoring `//` comments), if any.

@@ -42,6 +42,8 @@ pub struct Shape {
     /// The script's own `field_load`, under the name it has in `source` (it is renamed when
     /// primitives add loads).
     pub script_load: Option<String>,
+    /// The script's own `field_fixed`, under the name it has in `source`.
+    pub script_fixed: Option<String>,
     /// Whether primitives have boundary-condition roles (so `g3d_reach` is declared).
     pub bc: bool,
 }
@@ -91,6 +93,7 @@ impl Shape {
             script_map: true,
             base_bounds: ([-50.0, -50.0, 0.0], [50.0, 50.0, 100.0]),
             script_load: None,
+            script_fixed: None,
             bc: false,
         }
     }
@@ -126,10 +129,28 @@ impl Shape {
                 dir: None,
                 force: None,
                 case: 1,
+                label: None,
             });
         }
         if self.editor {
             out.extend(prims::load_specs(&self.prims));
+        }
+        out
+    }
+
+    /// The supports for `gen3d optimize`: the script's `field_fixed` (all axes) and each primitive
+    /// with the fixed role.
+    pub fn support_specs(&self) -> Vec<prims::SupportSpec> {
+        let mut out = vec![];
+        if let Some(func) = &self.script_fixed {
+            out.push(prims::SupportSpec {
+                name: "field_fixed".into(),
+                func: func.clone(),
+                axes: 7,
+            });
+        }
+        if self.editor {
+            out.extend(prims::support_specs(&self.prims));
         }
         out
     }
@@ -707,6 +728,9 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
     if prims::find_fn(&shape.source, "field_load")?.is_some() {
         shape.script_load = Some("field_load".into());
     }
+    if prims::find_fn(&shape.source, "field_fixed")?.is_some() {
+        shape.script_fixed = Some("field_fixed".into());
+    }
 
     // the editor's primitives: rename the script's map (and the optimization fields the primitives'
     // roles add to) and append the generated code that combines them
@@ -730,6 +754,9 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
         shape.script_map = script.map;
         if script.load {
             shape.script_load = Some("g3d_script_field_load".into());
+        }
+        if script.fixed {
+            shape.script_fixed = Some("g3d_script_field_fixed".into());
         }
         shape.bc = fixed || load || keep;
         // the optimizer sets g3d_reach from its element size; this default is for the preview (with

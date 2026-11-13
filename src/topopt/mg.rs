@@ -146,18 +146,21 @@ impl Coarse {
                 return false;
             }
             let nodes = fem.element_nodes(e.0);
-            if nodes.iter().all(|&m| fem.free[m]) {
+            let free = |m: usize| fem.free[m] == 7;
+            // per-DOF mask: a roller node keeps its free axes
+            let dof = |r: usize| fem.free[nodes[r / 3]] >> (r % 3) & 1 == 1;
+            if nodes.iter().all(|&m| free(m)) {
                 for (o, m) in out.iter_mut().zip(&ptkp[e.1]) {
                     *o += ee * m;
                 }
             } else {
                 let mut km = [0.0; 576];
                 for r in 0..24 {
-                    if !fem.free[nodes[r / 3]] {
+                    if !dof(r) {
                         continue;
                     }
                     for s in 0..24 {
-                        if fem.free[nodes[s / 3]] {
+                        if dof(s) {
                             km[r * 24 + s] = ee * ke[r * 24 + s];
                         }
                     }
@@ -432,8 +435,9 @@ pub(super) fn dense_inverse(n: [usize; 3], mats: Vec<f64>) -> Vec<f64> {
     inv
 }
 
-/// Coarse correction: rc = Pᵀ r, from a grid of `nf` elements to its coarse grid.
-fn restrict(nf: [usize; 3], r: &[f64], rc: &mut [f64]) {
+/// Coarse correction: rc = Pᵀ D r, from a grid of `nf` elements to its coarse grid, with D zeroing the
+/// DOFs where `mask` (an inverse diagonal) is zero.
+fn restrict(nf: [usize; 3], r: &[f64], rc: &mut [f64], mask: &[f64]) {
     let [fx, fy, fz] = nf.map(|v| v + 1);
     let [cx, cy, _] = coarse_dims(nf).map(|v| v + 1);
     rc.par_chunks_mut(3).enumerate().for_each(|(m, out)| {
@@ -459,7 +463,9 @@ fn restrict(nf: [usize; 3], r: &[f64], rc: &mut [f64]) {
                     let w = wj * if di == 0 { 1.0 } else { 0.5 };
                     let f = 3 * ((k as usize * fy + j as usize) * fx + i as usize);
                     for c in 0..3 {
-                        out[c] += w * r[f + c];
+                        if mask[f + c] != 0.0 {
+                            out[c] += w * r[f + c];
+                        }
                     }
                 }
             }
@@ -467,7 +473,7 @@ fn restrict(nf: [usize; 3], r: &[f64], rc: &mut [f64]) {
     });
 }
 
-/// x += P xc, kept to the DOFs where `mask` (an inverse diagonal) is non-zero.
+/// x += D P xc, D keeping the DOFs where `mask` (an inverse diagonal) is non-zero.
 fn prolong_add(nf: [usize; 3], xc: &[f64], x: &mut [f64], mask: &[f64]) {
     let [fx, fy, _] = nf.map(|v| v + 1);
     let [cx, cy, _] = coarse_dims(nf).map(|v| v + 1);
@@ -664,7 +670,7 @@ impl<'a> Multigrid<'a> {
         // coarse correction of the residual
         self.apply(l, x, &mut w.r);
         w.r.par_iter_mut().zip(b).for_each(|(r, b)| *r = b - *r);
-        restrict(self.dims(l), &w.r, &mut w.cb);
+        restrict(self.dims(l), &w.r, &mut w.cb, self.inv(l));
         self.vcycle(l + 1, &w.cb, &mut w.cx, rest);
         prolong_add(self.dims(l), &w.cx, x, self.inv(l));
         self.smooth(l, b, x, w, false);
@@ -733,8 +739,8 @@ impl<'a> Multigrid<'a> {
 pub(super) mod tests_api {
     use super::*;
 
-    pub fn restrict(nf: [usize; 3], r: &[f64], rc: &mut [f64]) {
-        super::restrict(nf, r, rc)
+    pub fn restrict(nf: [usize; 3], r: &[f64], rc: &mut [f64], mask: &[f64]) {
+        super::restrict(nf, r, rc, mask)
     }
 
     pub fn prolong_add(nf: [usize; 3], xc: &[f64], x: &mut [f64], mask: &[f64]) {
@@ -797,7 +803,7 @@ mod tests {
         let mut pc = vec![0.0; nfn];
         prolong_add(nf, &c, &mut pc, &vec![1.0; nfn]);
         let mut rf = vec![0.0; ncn];
-        restrict(nf, &f, &mut rf);
+        restrict(nf, &f, &mut rf, &vec![1.0; nfn]);
         let a: f64 = f.iter().zip(&pc).map(|(x, y)| x * y).sum();
         let b: f64 = c.iter().zip(&rf).map(|(x, y)| x * y).sum();
         assert!((a - b).abs() < 1e-9 * a.abs().max(1.0), "{a} vs {b}");
@@ -819,7 +825,7 @@ mod tests {
                 })
                 .collect(),
             passive: vec![false; ne],
-            fixed: vec![false; nn],
+            fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]],
             cases: vec![1],
         };
@@ -827,7 +833,7 @@ mod tests {
         for j in 0..ny {
             for i in 0..nx {
                 let m = p.node(i, j, 0);
-                p.fixed[m] = true;
+                p.fixed[m] = 7;
             }
         }
         for j in 0..ny {
@@ -838,7 +844,6 @@ mod tests {
     }
 
     fn fem<'a>(p: &'a super::super::Problem, ke: &'a [[f64; 24]; 24]) -> Fem<'a> {
-        let active = p.active_nodes();
         Fem {
             p,
             ke,
@@ -857,7 +862,7 @@ mod tests {
                     }
                 })
                 .collect(),
-            free: (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect(),
+            free: p.free_mask(),
         }
     }
 
@@ -874,7 +879,7 @@ mod tests {
         let ke = super::super::hex_ke(0.3);
         let fem = fem(&p, &ke);
         let mask: Vec<f64> = (0..3 * fem.free.len())
-            .map(|i| if fem.free[i / 3] { 1.0 } else { 0.0 })
+            .map(|i| if fem.free[i / 3] >> (i % 3) & 1 == 1 { 1.0 } else { 0.0 })
             .collect();
         let c1 = Coarse::from_fine(&fem);
         let n1 = 3 * c1.nodes();
@@ -884,7 +889,7 @@ mod tests {
         let mut kpv = vec![0.0; mask.len()];
         fem.matvec(&pv, &mut kpv);
         let mut want = vec![0.0; n1];
-        restrict(p.n, &kpv, &mut want);
+        restrict(p.n, &kpv, &mut want, &mask);
         let mut got = vec![0.0; n1];
         c1.apply(&v, &mut got);
         let scale = want.iter().fold(0.0f64, |m, x| m.max(x.abs()));
@@ -905,7 +910,7 @@ mod tests {
         let mut kpv = vec![0.0; n1];
         c1.apply(&pv, &mut kpv);
         let mut want = vec![0.0; n2];
-        restrict(c1.n, &kpv, &mut want);
+        restrict(c1.n, &kpv, &mut want, &vec![1.0; n1]);
         let mut got = vec![0.0; n2];
         c2.apply(&v, &mut got);
         let scale = want.iter().fold(0.0f64, |m, x| m.max(x.abs()));

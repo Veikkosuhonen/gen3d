@@ -55,7 +55,7 @@ fn wgt(c: u32, a: u32, b: u32) -> f32 {
 
 //// kernel apply_fine
 // y = K u (y -= K u when P.m.x == 1) on the fine grid: per node, the rows of its up to 8 elements
-// (E_e h · ke). Non-free nodes get 0.
+// (E_e h · ke). Clamped DOFs (`free` holds a node's free axes as bits) get 0.
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
 @group(0) @binding(2) var<storage, read> free: array<u32>;
 @group(0) @binding(3) var<storage, read> ke: array<f32>;
@@ -71,7 +71,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let nx = n.x + 1u;
     let ny = n.y + 1u;
     var acc = vec3<f32>(0.0);
-    if free[node] != 0u {
+    let fm = free[node];
+    if fm != 0u {
         let i = node % nx;
         let j = (node / nx) % ny;
         let k = node / (nx * ny);
@@ -100,6 +101,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                 acc.z += s * dot(vec3<f32>(ke[r + 48u], ke[r + 49u], ke[r + 50u]), um);
             }
         }
+        acc *= vec3<f32>(f32(fm & 1u), f32((fm >> 1u) & 1u), f32((fm >> 2u) & 1u));
     }
     // P.m.x == 1: y -= K u
     if P.m.x == 1u {
@@ -128,7 +130,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let nx = n.x + 1u;
     let ny = n.y + 1u;
     var acc = vec3<f32>(0.0);
-    if free[node] != 0u {
+    let fm = free[node];
+    if fm != 0u {
         let i = node % nx;
         let j = (node / nx) % ny;
         let k = node / (nx * ny);
@@ -145,6 +148,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             let r = (3u * a) * 25u;
             acc += s * vec3<f32>(ke[r], ke[r + 25u], ke[r + 50u]);
         }
+        acc *= vec3<f32>(f32(fm & 1u), f32((fm >> 1u) & 1u), f32((fm >> 2u) & 1u));
     }
     d[3u * node] = acc.x;
     d[3u * node + 1u] = acc.y;
@@ -159,11 +163,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(3) var<storage, read> T: array<f32>;
 @group(0) @binding(4) var<storage, read_write> d: array<f32>;
 
-// clamped-node mask of fine element (i, j, k): bit b set when its local node b is not free
+// clamped-node mask of fine element (i, j, k): bit b set when its local node b is not free on all
+// axes (the table has no per-axis masks: a roller counts as clamped, so level 2 only approximates
+// the Galerkin product of level 1 there)
 fn fine_mask(i: u32, j: u32, k: u32, nf: vec3<u32>) -> u32 {
     var m = 0u;
     for (var b = 0u; b < 8u; b++) {
-        if free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)] == 0u { m |= 1u << b; }
+        if free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)] != 7u { m |= 1u << b; }
     }
     return m;
 }
@@ -307,11 +313,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(4) var<storage, read> child: array<f32>;
 @group(0) @binding(5) var<storage, read_write> out: array<f32>;
 
-// clamped-node mask of fine element (i, j, k): bit b set when its local node b is not free
+// clamped-node mask of fine element (i, j, k): bit b set when its local node b is not free on all
+// axes (the table has no per-axis masks: a roller counts as clamped, so level 2 only approximates
+// the Galerkin product of level 1 there)
 fn fine_mask(i: u32, j: u32, k: u32, nf: vec3<u32>) -> u32 {
     var m = 0u;
     for (var b = 0u; b < 8u; b++) {
-        if free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)] == 0u { m |= 1u << b; }
+        if free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)] != 7u { m |= 1u << b; }
     }
     return m;
 }
@@ -406,9 +414,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel restrict
-// rc = Pᵀ r from the grid P.n to its coarse grid.
+// rc = Pᵀ D r from the grid P.n to its coarse grid, D keeping the DOFs with a positive diagonal (as
+// `prolong`).
 @group(0) @binding(1) var<storage, read> r: array<f32>;
-@group(0) @binding(2) var<storage, read_write> rc: array<f32>;
+@group(0) @binding(2) var<storage, read> diag: array<f32>;
+@group(0) @binding(3) var<storage, read_write> rc: array<f32>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -435,7 +445,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                 if i < 0 || i >= f.x { continue; }
                 let w = select(0.5, 1.0, di == 0) * select(0.5, 1.0, dj == 0) * select(0.5, 1.0, dk == 0);
                 let q = 3u * u32((k * f.y + j) * f.x + i);
-                acc += w * vec3<f32>(r[q], r[q + 1u], r[q + 2u]);
+                let keep = vec3<f32>(f32(diag[q] > 0.0), f32(diag[q + 1u] > 0.0), f32(diag[q + 2u] > 0.0));
+                acc += w * keep * vec3<f32>(r[q], r[q + 1u], r[q + 2u]);
             }
         }
     }
@@ -452,7 +463,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel prolong
-// x += P xc on the grid P.n (x = P xc when P.m.x == 1), kept to DOFs with a positive diagonal.
+// x += D P xc on the grid P.n (x = D P xc when P.m.x == 1), D keeping the DOFs with a positive
+// diagonal. (Level 1, applied as Pᵀ D K D P through the fine grid, is then exact for rollers too; its
+// diagonal and level 2 come from the per-node table, which sees a roller node as clamped.)
 @group(0) @binding(1) var<storage, read> xc: array<f32>;
 @group(0) @binding(2) var<storage, read> diag: array<f32>;
 @group(0) @binding(3) var<storage, read_write> x: array<f32>;

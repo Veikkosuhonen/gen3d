@@ -295,6 +295,10 @@ enum Cmd {
         /// total load in N, spread over the field_load region
         #[arg(long, default_value_t = 100.0)]
         force: f64,
+        /// the part stands on the ground: the bottom of the domain is supported, held vertically
+        /// only (slide) or in all directions (grip)
+        #[arg(long, value_enum, default_value_t = topopt::Ground::None)]
+        ground: topopt::Ground,
         /// Young's modulus in MPa (PLA ~3500)
         #[arg(long, default_value_t = 3500.0)]
         modulus: f64,
@@ -619,6 +623,7 @@ fn run(cli: Cli) -> Result<()> {
             rmin,
             penal,
             force,
+            ground,
             modulus,
             nu,
             output,
@@ -649,6 +654,7 @@ fn run(cli: Cli) -> Result<()> {
                 emin: solver.emin(&gpu),
                 cg_tol: solver.cg_tol,
                 adaptive_tol: !solver.fixed_cg_tol,
+                ground,
             };
             let problem = topopt::setup(&shape, &settings, &gpu)?;
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
@@ -683,6 +689,7 @@ fn run(cli: Cli) -> Result<()> {
                     emin: solver.emin(&gpu),
                     cg_tol: solver.cg_tol,
                     adaptive_tol: !solver.fixed_cg_tol,
+                    ground: topopt::Ground::None,
                 };
                 let problem = topopt::setup(&shape, &settings, &gpu)?;
                 let ne = problem.domain.iter().filter(|d| **d).count();

@@ -52,7 +52,7 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         bail!("at most {MAX_CASES} load cases on the GPU");
     }
     let active = p.active_nodes();
-    let free: Vec<bool> = (0..active.len()).map(|i| active[i] && !p.fixed[i]).collect();
+    let free = p.free_mask();
     let e = Engine::new(gpu)?;
     let elements = ne as f64 / 1e6;
     let oom = |err: anyhow::Error| {
@@ -371,7 +371,7 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Settings, Solver, optimize};
+    use super::super::{Ground, Settings, Solver, optimize};
     use super::*;
 
     /// A cantilever: clamped at x = 0, a spread load down at the far top edge, a kept-solid strip.
@@ -385,7 +385,7 @@ mod tests {
             origin: [0.0; 3],
             domain: vec![true; ne],
             passive: (0..ne).map(|e| e % n[0] == n[0] - 1).collect(),
-            fixed: vec![false; nn],
+            fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn], vec![[0.0; 3]; nn]],
             cases: vec![1, 2],
         };
@@ -393,7 +393,7 @@ mod tests {
         for k in 0..nz {
             for j in 0..ny {
                 let m = p.node(0, j, k);
-                p.fixed[m] = true;
+                p.fixed[m] = 7;
             }
         }
         for j in 0..ny {
@@ -435,6 +435,7 @@ mod tests {
                 emin: 1e-9,
                 cg_tol: 1e-6,
                 adaptive_tol: false,
+                ground: Ground::None,
             };
             let ms = MgSettings::default();
             let cpu = optimize(&p, &settings(Solver::Multigrid(ms)), &dir.join("cpu.vti"), None).unwrap();
