@@ -12,7 +12,7 @@ use super::gpu_engine::{Engine, NONE, Params, Reduce, Step, dims4, threads};
 use super::gpu_mg::GpuMg;
 use super::mg::MgSettings;
 use super::output::{self, Output, Snapshot};
-use super::{CG_MAXIT, Control, IterStats, Next, Outcome, Problem, Settings};
+use super::{CG_MAXIT, Control, IterStats, Next, Outcome, Problem, Settings, Stage};
 use crate::gpu::Gpu;
 
 /// Re-estimate the smoothers' λmax at least every this many optimizer iterations.
@@ -47,7 +47,14 @@ struct Fields {
     dv: wgpu::Buffer,
 }
 
-pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Path, gpu: &Gpu) -> Result<Outcome> {
+pub(super) fn optimize_gpu(
+    p: &Problem,
+    s: &Settings,
+    ms: &MgSettings,
+    out: &Path,
+    gpu: &Gpu,
+    stage: &Stage,
+) -> Result<Outcome> {
     let ke = super::hex_ke(s.nu);
     let ne = p.domain.len();
     let ndesign = (0..ne).filter(|&e| p.domain[e] && !p.passive[e]).count();
@@ -84,7 +91,9 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         .collect();
     let x0: Vec<f32> = (0..ne)
         .map(|i| {
-            if p.passive[i] {
+            if let Some((x, _)) = &stage.start {
+                x[i] as f32
+            } else if p.passive[i] {
                 1.0
             } else if p.domain[i] {
                 s.volfrac as f32
@@ -202,7 +211,11 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         &[&f.flags, &f.xtilde, &e.scalars, &f.xphys],
     );
 
-    let mut beta = if s.beta_max > 0.0 { 1.0 } else { 0.0 };
+    let mut beta = match &stage.start {
+        Some((_, b)) => *b,
+        None if s.beta_max > 0.0 => 1.0,
+        None => 0.0,
+    };
     e.set_scalar(BETA, beta as f32);
     e.run(&[&prog_init])?;
 
@@ -233,6 +246,7 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         compliance: 0.0,
         max_disp: 0.0,
         stats: vec![],
+        design: vec![],
     };
     // the last iteration whose fields are not written yet
     let mut pending = false;
@@ -360,13 +374,13 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
         last_change = change;
         st.update += t4.elapsed().as_secs_f64();
 
-        super::print_iteration(it, compliance, max_disp, change, grey, beta, &st, t0);
+        super::print_iteration(stage.it0 + it, compliance, max_disp, change, grey, beta, &st, t0);
         result.iterations = it;
         result.compliance = compliance;
         result.max_disp = max_disp;
         result.stats.push(st);
         if output::stop_requested() {
-            println!("stopped: writing the result of iteration {it}");
+            println!("stopped: writing the result of iteration {}", stage.it0 + it);
             break;
         }
         match control.next(s, beta, compliance, change) {
@@ -386,7 +400,10 @@ pub(super) fn optimize_gpu(p: &Problem, s: &Settings, ms: &MgSettings, out: &Pat
     } else {
         output.wait()?;
     }
-    super::print_done(&result, t_start, out);
+    result.design = e.read_f32(&f.x, ne)?.into_iter().map(f64::from).collect();
+    if !stage.quiet {
+        super::print_done(&result, t_start, out);
+    }
     Ok(result)
 }
 
@@ -457,6 +474,7 @@ mod tests {
                 cg_tol: 1e-6,
                 adaptive_tol: false,
                 ground: Ground::None,
+                coarse_start: false,
             };
             let ms = MgSettings::default();
             let cpu = optimize(&p, &settings(Solver::Multigrid(ms)), &dir.join("cpu.vti"), None).unwrap();

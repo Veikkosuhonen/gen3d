@@ -81,6 +81,8 @@ pub struct Settings {
     pub adaptive_tol: bool,
     /// the part stands on the ground: the bottom of the design domain is supported
     pub ground: Ground,
+    /// `run`: do the β = 1 stage on a grid of twice the element size first
+    pub coarse_start: bool,
 }
 
 /// How the bottom of the design domain is supported (`--ground`). The optimizer decides where the
@@ -921,6 +923,19 @@ pub struct Outcome {
     pub compliance: f64,
     pub max_disp: f64,
     pub stats: Vec<IterStats>,
+    /// the design variables x after the last update, per element
+    pub design: Vec<f64>,
+}
+
+/// Where an optimizer stage starts, and how it reports.
+#[derive(Default)]
+pub(crate) struct Stage {
+    /// design variables per element and the projection's β (None: uniform `volfrac`, β = 1)
+    start: Option<(Vec<f64>, f64)>,
+    /// iterations done by earlier stages (the iteration lines continue their numbering)
+    it0: usize,
+    /// an earlier stage: no "done" line (the app reads it as the end of the run)
+    quiet: bool,
 }
 
 const CG_MAXIT: usize = 20_000;
@@ -932,12 +947,108 @@ type Precond<'a> = dyn FnMut(&[f64], &mut [f64]) + 'a;
 /// what gets meshed), cell `energy` in MPa, point `displacement` in mm). The file is rewritten as often as keeps writing under ~10% of the run
 /// time (every iteration on small grids), and always after the last iteration.
 pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Result<Outcome> {
+    optimize_stage(p, s, out, gpu, &Stage::default())
+}
+
+/// Fewest domain elements of the coarse grid for a coarse start. Below this the coarse grid loses
+/// thin features, and supports and loads (1.5 elements thick) get much thicker than on the fine grid.
+const COARSE_MIN_ELEMENTS: usize = 10_000;
+
+/// Set up and optimize `shape`.
+///
+/// With `coarse_start` and projection continuation, the β = 1 stage (where the layout forms, about
+/// half the iterations) runs on a grid of twice the element size first: 1/8 of the elements, until
+/// its compliance stalls. The fine grid then starts from that design (interpolated) at β = 2. The
+/// filter radius stays `rmin` voxels on both grids, so it is twice as wide on the coarse one.
+pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu) -> Result<Outcome> {
+    let fine = setup(shape, s, gpu)?;
+    let ndomain = fine.domain.iter().filter(|d| **d).count();
+    if !s.coarse_start || s.beta_max <= 1.0 || ndomain / 8 < COARSE_MIN_ELEMENTS {
+        return optimize(&fine, s, out, Some(gpu));
+    }
+    let t_start = Instant::now();
+    let cs = Settings {
+        voxel: 2.0 * s.voxel,
+        beta_max: 1.0,
+        ..s.clone()
+    };
+    println!("coarse start: the beta 1 stage at {:.3} mm", cs.voxel);
+    let coarse = setup(shape, &cs, gpu)?;
+    let rc = optimize_stage(&coarse, &cs, out, Some(gpu), &Stage { quiet: true, ..Default::default() })?;
+    if output::stop_requested() {
+        print_done(&rc, t_start, out);
+        return Ok(rc);
+    }
+    let x = prolong_design(&coarse, &rc.design, &fine, s.volfrac);
+    println!("fine grid: continuing from the coarse design");
+    let stage = Stage {
+        start: Some((x, 2.0)),
+        it0: rc.iterations,
+        quiet: true,
+    };
+    // --iters caps the whole run
+    let fs = Settings {
+        iters: s.iters.saturating_sub(rc.iterations).max(1),
+        ..s.clone()
+    };
+    let mut rf = optimize_stage(&fine, &fs, out, Some(gpu), &stage)?;
+    rf.iterations += rc.iterations;
+    rf.stats.splice(0..0, rc.stats);
+    print_done(&rf, t_start, out);
+    Ok(rf)
+}
+
+/// Design variables on `fine` from those on `coarse` (same origin): trilinear in the coarse cell
+/// centres, over the coarse domain cells only. Kept-solid elements get 1, others outside the domain 0.
+fn prolong_design(coarse: &Problem, xc: &[f64], fine: &Problem, volfrac: f64) -> Vec<f64> {
+    let [cx, cy, cz] = coarse.n;
+    let r = fine.h / coarse.h;
+    let [fx, fy, _] = fine.n;
+    (0..fine.domain.len())
+        .map(|e| {
+            if fine.passive[e] {
+                return 1.0;
+            }
+            if !fine.domain[e] {
+                return 0.0;
+            }
+            let ijk = [e % fx, (e / fx) % fy, e / (fx * fy)];
+            // the fine centre in coarse cell-centre coordinates, split into a base cell and weights
+            let mut base = [0isize; 3];
+            let mut t = [0.0; 3];
+            for c in 0..3 {
+                let pos = fine.origin[c] - coarse.origin[c];
+                let u = (pos / fine.h + ijk[c] as f64 + 0.5) * r - 0.5;
+                base[c] = u.floor() as isize;
+                t[c] = u - u.floor();
+            }
+            let (mut sum, mut wsum) = (0.0, 0.0);
+            for b in 0..8 {
+                let o = [b & 1, b >> 1 & 1, b >> 2 & 1];
+                let q: [isize; 3] = std::array::from_fn(|c| base[c] + o[c] as isize);
+                if q.iter().zip([cx, cy, cz]).any(|(&v, n)| v < 0 || v >= n as isize) {
+                    continue;
+                }
+                let ce = (q[2] as usize * cy + q[1] as usize) * cx + q[0] as usize;
+                if !coarse.domain[ce] {
+                    continue;
+                }
+                let w: f64 = (0..3).map(|c| if o[c] == 1 { t[c] } else { 1.0 - t[c] }).product();
+                sum += w * xc[ce];
+                wsum += w;
+            }
+            if wsum > 1e-9 { sum / wsum } else { volfrac }
+        })
+        .collect()
+}
+
+fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage: &Stage) -> Result<Outcome> {
     output::catch_stop();
     if let Solver::Gpu(ms) = &s.solver {
         let Some(gpu) = gpu else {
             bail!("the GPU solver needs a GPU");
         };
-        return gpu_opt::optimize_gpu(p, s, ms, out, gpu);
+        return gpu_opt::optimize_gpu(p, s, ms, out, gpu, stage);
     }
     let ke = hex_ke(s.nu);
     let ne = p.domain.len();
@@ -965,6 +1076,10 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
             }
         })
         .collect();
+    if let Some((x0, beta)) = &stage.start {
+        x.copy_from_slice(x0);
+        proj.beta = *beta;
+    }
     let mut xtilde = filter.densities(p, &x);
     let mut xphys = proj.densities(p, &xtilde);
     let mut us: Vec<Vec<f64>> = fs.iter().map(|f| vec![0.0; f.len()]).collect();
@@ -975,6 +1090,7 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         compliance: 0.0,
         max_disp: 0.0,
         stats: vec![],
+        design: vec![],
     };
     println!(
         "SIMP: volume fraction {}, penalty {}, filter radius {} voxels, E = {} MPa, nu = {}, {} load case{}, {}",
@@ -1176,13 +1292,13 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         }
         st.io = t3.elapsed().as_secs_f64();
 
-        print_iteration(it, compliance, max_disp, change, grey, proj.beta, &st, t0);
+        print_iteration(stage.it0 + it, compliance, max_disp, change, grey, proj.beta, &st, t0);
         result.iterations = it;
         result.compliance = compliance;
         result.max_disp = max_disp;
         result.stats.push(st);
         if output::stop_requested() {
-            println!("stopped: writing the result of iteration {it}");
+            println!("stopped: writing the result of iteration {}", stage.it0 + it);
             break;
         }
         match control.next(s, proj.beta, compliance, change) {
@@ -1200,7 +1316,10 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
         }
         None => output.wait()?,
     }
-    print_done(&result, t_start, out);
+    result.design = x;
+    if !stage.quiet {
+        print_done(&result, t_start, out);
+    }
     Ok(result)
 }
 
@@ -1298,6 +1417,44 @@ pub(super) mod tests {
     use super::*;
 
     #[test]
+    fn prolonged_design_interpolates_inside_the_domain() {
+        // coarse 4x2x2 at h = 2, fine 8x4x4 at h = 1, same origin; the coarse design is a ramp in x
+        let grid = |n: [usize; 3], h: f64| Problem {
+            n,
+            h,
+            origin: [0.0; 3],
+            domain: vec![true; n.iter().product()],
+            passive: vec![false; n.iter().product()],
+            fixed: vec![0; n.map(|v| v + 1).iter().product()],
+            loads: vec![],
+            cases: vec![],
+        };
+        let mut coarse = grid([4, 2, 2], 2.0);
+        let mut fine = grid([8, 4, 4], 1.0);
+        let xc: Vec<f64> = (0..16).map(|e| 0.1 + 0.2 * (e % 4) as f64).collect();
+        let x = prolong_design(&coarse, &xc, &fine, 0.3);
+        // inside, linear in x: fine centres 1.5 .. 5.5 lie between coarse centres 1 .. 7
+        for i in 0..8 {
+            let want = (0.1 + 0.2 * ((i as f64 + 0.5) / 2.0 - 0.5)).clamp(0.1, 0.7);
+            assert!((x[i] - want).abs() < 1e-12, "i {i}: {} vs {want}", x[i]);
+        }
+        // coarse cells outside the domain don't pull the values down; fine kept-solid stays 1 and
+        // fine non-domain 0
+        coarse.domain[3] = false;
+        fine.passive[1] = true;
+        fine.domain[2] = false;
+        let x = prolong_design(&coarse, &xc, &fine, 0.3);
+        // fine 6 (centre 6.5) sits between coarse 2 and the removed 3: all of coarse 2's value
+        assert!((x[6] - 0.5).abs() < 1e-12, "{}", x[6]);
+        // fine 7 has no coarse domain cell nearby: volfrac
+        assert_eq!(x[7], 0.3);
+        assert_eq!((x[1], x[2]), (1.0, 0.0));
+        // no coarse domain cell nearby: volfrac
+        coarse.domain.fill(false);
+        assert_eq!(prolong_design(&coarse, &xc, &fine, 0.3)[0], 0.3);
+    }
+
+    #[test]
     fn projection_endpoints_and_derivative() {
         for beta in [0.0, 1.0, 8.0, 32.0] {
             let pr = Projection { beta, eta: 0.5 };
@@ -1389,6 +1546,7 @@ pub(super) mod tests {
             cg_tol: 1e-4,
             adaptive_tol: false,
             ground: Ground::None,
+            coarse_start: false,
         };
         let p = setup(&shape, &s, &gpu).unwrap();
         assert_eq!(p.cases, [1, 2]);
@@ -1461,6 +1619,7 @@ pub(super) mod tests {
             cg_tol: 1e-4,
             adaptive_tol: false,
             ground: Ground::None,
+            coarse_start: false,
         };
         let err = setup(&shape, &s, &gpu).err().unwrap().to_string();
         assert!(err.contains("needs supports"), "{err}");

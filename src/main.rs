@@ -286,6 +286,10 @@ enum Cmd {
         /// no Heaviside projection (faster, but leaves grey, partly dense regions)
         #[arg(long)]
         no_projection: bool,
+        /// do the first projection stage on the fine grid too, instead of on a grid of twice the
+        /// element size first (slower; the coarse start applies from 80k domain elements)
+        #[arg(long)]
+        no_coarse_start: bool,
         /// density filter radius in voxels (larger = thicker, simpler members)
         #[arg(long, default_value_t = 1.5)]
         rmin: f64,
@@ -620,6 +624,7 @@ fn run(cli: Cli) -> Result<()> {
             iters,
             beta_max,
             no_projection,
+            no_coarse_start,
             rmin,
             penal,
             force,
@@ -655,10 +660,10 @@ fn run(cli: Cli) -> Result<()> {
                 cg_tol: solver.cg_tol,
                 adaptive_tol: !solver.fixed_cg_tol,
                 ground,
+                coarse_start: !no_coarse_start,
             };
-            let problem = topopt::setup(&shape, &settings, &gpu)?;
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
-            topopt::optimize(&problem, &settings, &out, Some(&gpu))?;
+            topopt::run(&shape, &settings, &out, &gpu)?;
             Ok(())
         }
         Cmd::BenchTopopt {
@@ -690,6 +695,7 @@ fn run(cli: Cli) -> Result<()> {
                     cg_tol: solver.cg_tol,
                     adaptive_tol: !solver.fixed_cg_tol,
                     ground: topopt::Ground::None,
+                    coarse_start: false,
                 };
                 let problem = topopt::setup(&shape, &settings, &gpu)?;
                 let ne = problem.domain.iter().filter(|d| **d).count();

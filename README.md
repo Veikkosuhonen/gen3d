@@ -206,7 +206,7 @@ gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
 gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
-gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--modulus MPA] [--nu V] [-o out.vti]
+gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--modulus MPA] [--nu V] [-o out.vti]
 
 .vti options (render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
@@ -389,6 +389,11 @@ ends it at once).
     measured on the projected densities.
   - It stops when compliance improves by less than 0.1% for 3 iterations at the final β, or at
     `--iters` (150).
+  - **Coarse start:** the β = 1 stage, where the layout forms, runs on a grid of twice the element
+    size first (1/8 of the elements) until it settles. The fine grid then continues from that design
+    at β = 2. This is 15–30% faster on most problems, with compliance within about 1% (sometimes
+    better). It applies from 80k domain elements; `--no-coarse-start` turns it off. The output file
+    shows the coarse design first.
 - **Projection or not:** with projection the result is crisp (0% grey on the bracket against 24%
   without) and stiffer for the same material (compliance 8.96 against 10.36 N·mm). Thresholding at
   0.5 then matches `--volfrac` closely. The cost is about 1.7× the iterations. Because each voxel is now

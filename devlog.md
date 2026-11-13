@@ -3,6 +3,55 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Coarse start: the first projection stage on a 2× coarser grid
+
+**What:** `optimize` runs the β = 1 stage on a grid of twice the element size (1/8 of the elements)
+until its compliance stalls, interpolates the design onto the fine grid, and continues there at β = 2.
+On by default from 80k domain elements; `--no-coarse-start` turns it off. The app gets it through the
+CLI and shows the coarse design about 6× sooner.
+
+**How:**
+- `topopt::run(shape, …)` sets up both grids with `setup`. The CLI calls it instead of
+  `setup` + `optimize`; `bench-topopt` and the tests still call `optimize` directly.
+- `optimize_stage` takes a `Stage`: a starting design and β, an iteration offset (the iteration lines
+  continue their numbering, which `jobs::opt_progress` relies on), and `quiet` (only the last stage
+  prints "done", which the app reads as the end). `Outcome.design` returns the final design variables.
+  Both the CPU and GPU loops support it.
+- `prolong_design`: trilinear in the coarse cell centres, over coarse domain cells only, so the
+  domain's edge isn't pulled towards 0. Kept-solid elements get 1.
+- The filter stays `rmin` voxels on both grids (twice as wide on the coarse one). `rmin / 2` would be
+  0.75 coarse voxels: no filtering at all.
+- `--iters` caps the whole run. A Stop during the coarse stage writes the coarse result.
+
+**Result** (default settings unless noted; time, iterations, compliance):
+
+| | fine only | coarse start |
+|---|---|---|
+| bracket_domain (291k) | 8.3 s, 50, 8.372 | 6.9 s, 62, 8.204 (−2.0%) |
+| bracket_editor | 11.2 s, 50, 16.954 | 9.3 s, 57, 16.951 |
+| book_stand1 | 7.8 s, 73, 0.08965 | 5.4 s, 76, 0.09033 (+0.8%) |
+| table (--ground grip) | 26.3 s, 48, 0.03283 | 26.3 s, 66, 0.03288 |
+| bracket_domain 0.35 mm (1.8M) | 59.9 s, 60, 8.436 | 51.3 s, 73, 8.289 (−1.7%) |
+| bracket_domain 0.9 mm, CPU mg | 22.4 s, 48, 8.863 | 16.7 s, 62, 8.651 (−2.4%) |
+
+**Why not more than 15–30%:**
+- Coarse iterations cost 1/4 to 1/2.5 of fine ones, not 1/8: fixed per-dispatch costs on small
+  grids, and more CG iterations (the table: 80–100 against ~40).
+- After the switch, the β = 2 stage takes 11–17 iterations against 5–6 in a fine-only run: the design
+  keeps refining to the finer resolution, at 0.1–0.3% per iteration.
+- Continuing at β = 1 on the fine grid instead was slower, with about the same compliance.
+
+**Still open:**
+- **The final β = 32 stage oscillates:** compliance alternates by about ±0.1% (8.28 ↔ 8.29 at 1.8M), so
+  the "< 0.1% for 3 iterations" stop fires late. It ran 15–19 iterations at 1.8M, about 20–25 s of
+  60, without improving. A stop on "no new best in N iterations", or on the change over two
+  iterations, would end it sooner. Reporting the best iterate rather than the last would also help.
+- Three levels (4h → 2h → h) for very large grids.
+
+**Verified:** `prolonged_design_interpolates_inside_the_domain`; topopt tests pass; clippy clean.
+SIGTERM during the coarse stage: exit 0, full coarse result written. CPU `--solver mg` path run end
+to end. `prims::tests::shapes_with_primitives_compile` still fails, as before.
+
 ## 2026-11-13: GPU multigrid setup 3–4× faster
 
 **Why:** per optimizer iteration, rebuilding the hierarchy took as long as the solve (4.8M elements:
