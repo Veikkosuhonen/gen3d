@@ -26,10 +26,15 @@ Measured on `bracket_domain` at 1.3 mm (62×19×31, 34k domain elements): **~100
 - From the Output section: live writes go through a background thread; on grids over 4M elements they
   are decimated density-only previews; the full fields are written at the end and on Stop.
 - Still open:
-  - the step 5 items (coarse-to-fine continuation, the Helmholtz filter, block CG for load cases,
-    decimated output for the mesher);
+  - the step 5 items: the Helmholtz filter, block CG for load cases (cases that are linear
+    combinations of others are no longer solved, since 2026-11-14), decimated output for the mesher.
+    Coarse-to-fine continuation is done (the β = 1 stage on a 2× coarser grid);
   - getting memory down to ~100 B per element (f16 vectors, or fewer CG vectors);
   - fewer, fused passes in the smoother.
+  - a smaller OC move limit at high β (now 0.2 throughout). At β = 32 compliance oscillates by about
+    ±0.1% per iteration. Since 2026-11-14 the run stops on that (no new best in 3 iterations), but a
+    smaller move limit would probably remove the oscillation itself, and might give a slightly
+    better final design. Untested.
 
 ## Why the solver comes before the hardware
 

@@ -179,6 +179,112 @@ impl Problem {
             .map(|i| if active[i] { 7 & !self.fixed[i] } else { 0 })
             .collect()
     }
+
+    /// Which load cases need a solve. All cases share K, so a case whose load is a linear
+    /// combination of other cases' loads has the same combination of their displacements: the
+    /// rocked variants of a load (f ± rock·F_axis) span only 3 directions for 5 cases. Cases are
+    /// taken in order; one is solved when its load (on free DOFs) is not within 1e-6 of the span of
+    /// the cases solved before it.
+    fn load_basis(&self) -> LoadBasis {
+        let free = self.free_mask();
+        let g: Vec<Vec<f64>> = self
+            .loads
+            .iter()
+            .map(|l| {
+                l.iter()
+                    .zip(&free)
+                    .flat_map(|(v, &f)| (0..3).map(move |c| if f >> c & 1 == 1 { v[c] } else { 0.0 }))
+                    .collect()
+            })
+            .collect();
+        let dot = |a: &[f64], b: &[f64]| a.par_iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
+        let mut solved: Vec<usize> = vec![];
+        // orthonormal basis of the solved loads (Gram–Schmidt, twice for stability)
+        let mut q: Vec<Vec<f64>> = vec![];
+        let mut cases = vec![];
+        for (c, gc) in g.iter().enumerate() {
+            let norm = dot(gc, gc).sqrt();
+            let mut r = gc.clone();
+            for _ in 0..2 {
+                for qk in &q {
+                    let d = dot(qk, &r);
+                    r.par_iter_mut().zip(qk).for_each(|(a, b)| *a -= d * b);
+                }
+            }
+            let rn = dot(&r, &r).sqrt();
+            if rn > 1e-6 * norm {
+                r.par_iter_mut().for_each(|v| *v /= rn);
+                q.push(r);
+                cases.push(CaseSolve::Solved(solved.len()));
+                solved.push(c);
+            } else {
+                // least squares over the solved cases' loads: (BᵀB) a = Bᵀ g
+                let k = solved.len();
+                let mut m: Vec<Vec<f64>> = (0..k)
+                    .map(|i| {
+                        let mut row: Vec<f64> = (0..k).map(|j| dot(&g[solved[i]], &g[solved[j]])).collect();
+                        row.push(dot(&g[solved[i]], gc));
+                        row
+                    })
+                    .collect();
+                let a = solve_dense(&mut m);
+                cases.push(CaseSolve::Combined(
+                    a.into_iter().enumerate().filter(|(_, v)| *v != 0.0).collect(),
+                ));
+            }
+        }
+        LoadBasis { solved, cases }
+    }
+}
+
+/// How the load cases are solved (`Problem::load_basis`).
+pub(super) struct LoadBasis {
+    /// the solved cases (by index into `loads`), in order
+    pub solved: Vec<usize>,
+    /// per load case
+    pub cases: Vec<CaseSolve>,
+}
+
+pub(super) enum CaseSolve {
+    /// solved, into solution slot i (the position in `LoadBasis::solved`)
+    Solved(usize),
+    /// u = Σ a · u_slot
+    Combined(Vec<(usize, f64)>),
+}
+
+impl LoadBasis {
+    fn describe(&self) -> Option<String> {
+        let n = self.cases.len();
+        (self.solved.len() < n).then(|| {
+            format!(
+                "{} of {n} load cases solved, the others are linear combinations of them",
+                self.solved.len()
+            )
+        })
+    }
+}
+
+/// Solve the small dense system [A | b] in place (Gaussian elimination, partial pivoting).
+fn solve_dense(m: &mut [Vec<f64>]) -> Vec<f64> {
+    let k = m.len();
+    for i in 0..k {
+        let piv = (i..k)
+            .max_by(|&a, &b| m[a][i].abs().total_cmp(&m[b][i].abs()))
+            .unwrap();
+        m.swap(i, piv);
+        for r in i + 1..k {
+            let f = m[r][i] / m[i][i];
+            for c in i..=k {
+                m[r][c] -= f * m[i][c];
+            }
+        }
+    }
+    let mut a = vec![0.0; k];
+    for i in (0..k).rev() {
+        let s: f64 = (i + 1..k).map(|j| m[i][j] * a[j]).sum();
+        a[i] = (m[i][k] - s) / m[i][i];
+    }
+    a
 }
 
 /// The active nodes of the lowest layer that has any.
@@ -1044,11 +1150,15 @@ fn prolong_design(coarse: &Problem, xc: &[f64], fine: &Problem, volfrac: f64) ->
 
 fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage: &Stage) -> Result<Outcome> {
     output::catch_stop();
+    let basis = p.load_basis();
+    if let Some(d) = basis.describe() {
+        println!("{d}");
+    }
     if let Solver::Gpu(ms) = &s.solver {
         let Some(gpu) = gpu else {
             bail!("the GPU solver needs a GPU");
         };
-        return gpu_opt::optimize_gpu(p, s, ms, out, gpu, stage);
+        return gpu_opt::optimize_gpu(p, &basis, s, ms, out, gpu, stage);
     }
     let ke = hex_ke(s.nu);
     let ne = p.domain.len();
@@ -1172,13 +1282,23 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
             st.setup = t0.elapsed().as_secs_f64();
             // each load case separately; the objective is their summed compliance
             t1 = Instant::now();
-            for (f, u) in fs.iter().zip(us.iter_mut()) {
-                let n = fem.solve(f, u, tol, CG_MAXIT, &mut *precond);
+            for &c in &basis.solved {
+                let n = fem.solve(&fs[c], &mut us[c], tol, CG_MAXIT, &mut *precond);
                 if n >= CG_MAXIT {
                     println!("warning: CG did not converge in {CG_MAXIT} iterations");
                 }
                 st.cg.push(n);
-                for (a, b) in ce.iter_mut().zip(fem.element_energy(u)) {
+            }
+            for (c, how) in basis.cases.iter().enumerate() {
+                if let CaseSolve::Combined(a) = how {
+                    let mut u = vec![0.0; us[c].len()];
+                    for &(slot, w) in a {
+                        let us_ = &us[basis.solved[slot]];
+                        u.par_iter_mut().zip(us_).for_each(|(v, s)| *v += w * s);
+                    }
+                    us[c] = u;
+                }
+                for (a, b) in ce.iter_mut().zip(fem.element_energy(&us[c])) {
                     *a += b;
                 }
             }
@@ -1468,6 +1588,52 @@ pub(super) mod tests {
         // no coarse domain cell nearby: volfrac
         coarse.domain.fill(false);
         assert_eq!(prolong_design(&coarse, &xc, &fine, 0.3)[0], 0.3);
+    }
+
+    /// Rocked variants (f ± r·g) are formed from the upright case and the sideways push; loads on
+    /// clamped DOFs don't count.
+    #[test]
+    fn load_basis_solves_only_independent_cases() {
+        let n = [2, 1, 1];
+        let nn = 3 * 2 * 2;
+        let mut f = vec![[0.0; 3]; nn];
+        let mut g = vec![[0.0; 3]; nn];
+        f[1] = [0.0, 0.0, -2.0];
+        f[5] = [0.0, 0.0, -1.0];
+        g[1] = [1.0, 0.0, 0.0];
+        g[5] = [0.5, 0.0, 0.0];
+        let rocked = |s: f64| -> Vec<[f64; 3]> {
+            f.iter().zip(&g).map(|(a, b)| std::array::from_fn(|c| a[c] + s * 0.5 * b[c])).collect()
+        };
+        // a load on a clamped node only: no load at all
+        let mut clamped = vec![[0.0; 3]; nn];
+        clamped[0] = [0.0, 0.0, 5.0];
+        let mut fixed = vec![0; nn];
+        fixed[0] = 7;
+        let p = Problem {
+            n,
+            h: 1.0,
+            origin: [0.0; 3],
+            domain: vec![true; 2],
+            passive: vec![false; 2],
+            fixed,
+            loads: vec![f.clone(), rocked(1.0), rocked(-1.0), g.clone(), clamped],
+            cases: vec![1, 2, 3, 4, 5],
+        };
+        let b = p.load_basis();
+        assert_eq!(b.solved, vec![0, 1]);
+        let combo = |c: usize| match &b.cases[c] {
+            CaseSolve::Combined(a) => a.clone(),
+            CaseSolve::Solved(_) => panic!("case {c} is solved"),
+        };
+        let close = |a: Vec<(usize, f64)>, want: &[(usize, f64)]| {
+            a.len() == want.len() && a.iter().zip(want).all(|(x, y)| x.0 == y.0 && (x.1 - y.1).abs() < 1e-9)
+        };
+        // f - 0.5 g = 2 f - (f + 0.5 g); g = 2 ((f + 0.5 g) - f)
+        assert!(close(combo(2), &[(0, 2.0), (1, -1.0)]), "{:?}", combo(2));
+        assert!(close(combo(3), &[(0, -2.0), (1, 2.0)]), "{:?}", combo(3));
+        assert!(combo(4).is_empty());
+        assert!(matches!(b.cases[1], CaseSolve::Solved(1)));
     }
 
     #[test]

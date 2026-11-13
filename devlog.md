@@ -3,6 +3,42 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Solve only the linearly independent load cases
+
+**Why:** on the table (`item on top` with rocking: 5 cases) the solve was 88% of the run time. A
+rocked variant's load is the case's load plus ±rock times a sideways push (the force is scaled so the
+original component stays the same), so the 5 cases span only 3 load vectors. All cases share the
+supports and so share K, and u is linear in f: 3 solves give all 5 displacements exactly.
+
+**What:**
+- `Problem::load_basis` goes through the cases in order. A case's load (on free DOFs) is solved when
+  it is more than 1e-6 (relative) outside the span of the cases solved before it (Gram–Schmidt,
+  twice). Otherwise its coefficients over the solved cases come from the normal equations. This is
+  generic: any combination of cases is found, not only rocking. A load only on clamped DOFs is an
+  empty combination (u = 0).
+- CPU loop: solves the basis cases, forms the others, then energies and output as before.
+- GPU: `GpuMg` keeps u, the load lists and the CG programs only for solved cases, plus one scratch
+  vector for the combined ones. `compute_energies` forms each combined case in the scratch vector
+  (`lin` steps), then adds its energy and takes its maximum displacement (moved from `gpu_opt`'s
+  sensitivity program, since the scratch vector is reused). `displacement(c)` forms the case first.
+- A line in the log when cases are skipped: "3 of 5 load cases solved, the others are linear
+  combinations of them".
+
+**Result:** table (`--ground grip`) 24.8 → 16.0 s, compliance 0.032862 → 0.032859; the iteration
+lines match before and after (same compliance, same iteration count), with 3/5 of the CG iterations.
+GPU memory 248 → 232 B per element (two fewer u vectors, one scratch vector). bracket_editor (two
+independent cases) and book_stand1: unchanged.
+
+**Verified:** `load_basis_solves_only_independent_cases` (rocked ± variants and the sideways push
+are combinations with the expected coefficients; a load on a clamped node is empty).
+`gpu_loop_matches_cpu_loop` now has a third case = case 1 − 0.5 · case 2: compliance per iteration,
+max displacement and the combined case's written displacement agree between CPU and GPU. topopt
+tests pass; clippy clean.
+
+**Still open:** the remaining solves are still sequential. Solving all cases in one pass (one
+operator read for all right-hand sides) needs a profile of the fine mat-vec first: at 9.6M elements
+it reaches only ~2 GB/s, so it looks latency-bound, and sharing the reads might not help.
+
 ## 2026-11-14: Stop the final stage when compliance oscillates
 
 **Why:** at β = 32 the OC updates oscillate: compliance alternates by about ±0.1% (8.28 ↔ 8.29 on the

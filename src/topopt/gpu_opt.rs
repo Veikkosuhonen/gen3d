@@ -9,10 +9,10 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 
 use super::gpu_engine::{Engine, NONE, Params, Reduce, Step, dims4, threads};
-use super::gpu_mg::GpuMg;
+use super::gpu_mg::{GpuMg, MAXD};
 use super::mg::MgSettings;
 use super::output::{self, Output, Snapshot};
-use super::{CG_MAXIT, Control, IterStats, Next, Outcome, Problem, Settings, Stage};
+use super::{CG_MAXIT, Control, IterStats, LoadBasis, Next, Outcome, Problem, Settings, Stage};
 use crate::gpu::Gpu;
 
 /// Re-estimate the smoothers' λmax at least every this many optimizer iterations.
@@ -29,7 +29,6 @@ const CHANGE: u32 = 99;
 const GREY: u32 = 100;
 const BETA: u32 = 101;
 /// max displacement of load case c at MAXD + c
-const MAXD: u32 = 104;
 const MAX_CASES: usize = 24;
 
 /// Element arrays on the GPU.
@@ -49,6 +48,7 @@ struct Fields {
 
 pub(super) fn optimize_gpu(
     p: &Problem,
+    basis: &LoadBasis,
     s: &Settings,
     ms: &MgSettings,
     out: &Path,
@@ -64,14 +64,13 @@ pub(super) fn optimize_gpu(
     if p.loads.len() > MAX_CASES {
         bail!("at most {MAX_CASES} load cases on the GPU");
     }
-    let active = p.active_nodes();
     let free = p.free_mask();
     let e = Engine::new(gpu)?;
     let elements = ne as f64 / 1e6;
     let oom = |err: anyhow::Error| {
         anyhow::anyhow!("{err}: {elements:.1}M elements don't fit on this GPU; use a larger --voxel")
     };
-    let mg = gpu.alloc_scoped(|| GpuMg::new(&e, p, &ke, &free, ms)).map_err(oom)??;
+    let mg = gpu.alloc_scoped(|| GpuMg::new(&e, p, basis, &ke, &free, ms)).map_err(oom)??;
     let c = mg.coarsest();
     println!(
         "GPU multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
@@ -185,10 +184,6 @@ pub(super) fn optimize_gpu(
     filter(&mut prog_sens, 0, &f.xnew, &f.dc);
     filter(&mut prog_sens, 0, &f.dvs, &f.dv);
     e.reduce_design(&mut prog_sens, Reduce::Grey, &f.xphys, &f.xphys, &f.flags, ne, GREY);
-    let nn = active.len();
-    for (c, u) in mg.us.iter().enumerate() {
-        e.reduce(&mut prog_sens, Reduce::MaxNorm, u, u, u, nn, MAXD + c as u32);
-    }
     let mut prog_oc = vec![];
     elem(
         &mut prog_oc,
@@ -265,7 +260,7 @@ pub(super) fn optimize_gpu(
             // the loop it is one OC update newer than `xused`, a small difference
             filtered: output::filtered_out(p, e.read_f32(&f.xtilde, ne)?.into_iter()),
             energy: ee.iter().zip(&ce).map(|(a, b)| 0.5 * a * b / h3).collect(),
-            disps: (0..mg.us.len()).map(|c| mg.displacement(c)).collect::<Result<_>>()?,
+            disps: (0..p.loads.len()).map(|c| mg.displacement(c)).collect::<Result<_>>()?,
         })
     };
     for it in 1..=s.iters {
@@ -309,7 +304,7 @@ pub(super) fn optimize_gpu(
         let sc = e.read_scalars()?;
         let compliance = sc[COMPL as usize] as f64;
         let grey = sc[GREY as usize] as f64 / ndesign as f64;
-        let max_disp = (0..mg.us.len())
+        let max_disp = (0..p.loads.len())
             .map(|c| sc[MAXD as usize + c] as f64)
             .fold(0.0, f64::max);
         st.compliance = compliance;
@@ -413,6 +408,8 @@ mod tests {
     use super::*;
 
     /// A cantilever: clamped at x = 0, a spread load down at the far top edge, a kept-solid strip.
+    /// The third load case is a combination of the first two (as a rocked load is), so it isn't
+    /// solved but formed from their displacements.
     fn cantilever() -> Problem {
         let n = [24, 6, 10];
         let ne: usize = n.iter().product();
@@ -424,8 +421,8 @@ mod tests {
             domain: vec![true; ne],
             passive: (0..ne).map(|e| e % n[0] == n[0] - 1).collect(),
             fixed: vec![0; nn],
-            loads: vec![vec![[0.0; 3]; nn], vec![[0.0; 3]; nn]],
-            cases: vec![1, 2],
+            loads: vec![vec![[0.0; 3]; nn]; 3],
+            cases: vec![1, 2, 3],
         };
         let [nx, ny, nz] = n.map(|v| v + 1);
         for k in 0..nz {
@@ -440,6 +437,9 @@ mod tests {
             let m = p.node(nx - 1, j, nz / 2);
             p.loads[1][m] = [0.0, 3.0 / ny as f64, 0.0];
         }
+        p.loads[2] = (0..nn)
+            .map(|m| std::array::from_fn(|c| p.loads[0][m][c] - 0.5 * p.loads[1][m][c]))
+            .collect();
         p
     }
 
@@ -480,6 +480,8 @@ mod tests {
             let cpu = optimize(&p, &settings(Solver::Multigrid(ms)), &dir.join("cpu.vti"), None).unwrap();
             let gpu_r = optimize(&p, &settings(Solver::Gpu(ms)), &dir.join("gpu.vti"), Some(&gpu)).unwrap();
             assert_eq!(cpu.iterations, gpu_r.iterations);
+            let rel = (cpu.max_disp - gpu_r.max_disp).abs() / cpu.max_disp;
+            assert!(rel < 2e-3, "max displacement {} (CPU) vs {} (GPU)", cpu.max_disp, gpu_r.max_disp);
             for (it, (a, b)) in cpu.stats.iter().zip(&gpu_r.stats).enumerate() {
                 let rel = (a.compliance - b.compliance).abs() / a.compliance;
                 assert!(
@@ -497,6 +499,14 @@ mod tests {
             let (dc, dg) = (dens(&c), dens(&g));
             let diff = dc.iter().zip(&dg).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
             assert!(diff < 0.05, "beta_max {beta_max}: density differs by {diff}");
+            // and the combined case's displacement
+            let disp = |v: &crate::vti::VtiFile| {
+                v.arrays.iter().find(|a| a.name == "displacement_3").map(|a| a.data.clone())
+            };
+            let (a, b) = (disp(&c).unwrap(), disp(&g).unwrap());
+            let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            assert!(diff < 1e-2 * scale, "beta_max {beta_max}: case 3 displacement differs by {diff}");
         }
         std::fs::remove_dir_all(&dir).ok();
     }

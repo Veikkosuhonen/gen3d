@@ -354,9 +354,11 @@ changing the shape, e.g. a box over the face that rests against a wall.
 
 **Load cases:** loads with the same case number act together. Different cases are separate situations
 (a bracket pulled down *or* pushed sideways), and the part is optimized for all of them: the objective
-is the sum of their compliances, each case solved on its own. Each load primitive's force is spread over
-its own nodes. A script's `field_load` is load case 1 and uses `--force` (the app's "script load").
-The result has `displacement` for the first case and `displacement_<case>` for the others.
+is the sum of their compliances, each case solved on its own. All cases share the supports, so a case
+whose load is a linear combination of other cases' loads isn't solved: its displacement is the same
+combination of theirs. Rocking gives 5 cases (upright, ±X, ±Y) but only 3 solves. Each load
+primitive's force is spread over its own nodes. A script's `field_load` is load case 1 and uses
+`--force` (the app's "script load"). The result has `displacement` for the first case and `displacement_<case>` for the others.
 
 Script and primitives combine: when primitives use a role, the script's own `field_fixed`,
 `field_load` or `field_keep` (if any) is renamed and wrapped, so the field is the script's region plus
