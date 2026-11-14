@@ -3548,8 +3548,9 @@ impl App {
                 if ui
                     .add(egui::Slider::new(&mut n, 0..=50).suffix(" passes"))
                     .on_hover_text(
-                        "Taubin smoothing of the mesh: evens out the voxel steps without shrinking the part; \
-                         faces on the design domain's edge stay in place (0 = off)",
+                        "Taubin smoothing of the mesh, after the optimized density's voxel terraces have been \
+                         faired away: evens out the triangles without shrinking the part; faces on the design \
+                         domain's edge stay in place (0 = off)",
                     )
                     .changed()
                 {

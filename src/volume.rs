@@ -416,16 +416,37 @@ impl Volume {
     }
 }
 
+/// How `Volume::mesh` makes the surface.
+#[derive(Clone, Copy, Debug)]
+pub struct MeshOpts {
+    /// fair the voxels' surface (`fairing::fair`) instead of interpolating the array
+    pub fair: bool,
+    /// Taubin smoothing passes (`Mesh::smooth`)
+    pub smooth: u32,
+}
+
 impl Volume {
-    /// Marching-cubes mesh of the threshold surface (linear interpolation of the array, like the
-    /// smooth view). The grid is padded with an outside layer so the mesh is always closed.
+    /// Whether `mesh` fairs by default: for optimizer densities, whose surface is the voxels'.
+    pub fn fair_by_default(&self) -> bool {
+        self.array_name() == "density"
+    }
+
+    /// Mesh of the solid: marching cubes, smoothing, then scaled to the grid's position and spacing.
+    /// The grid is padded with an outside layer so the mesh is always closed.
+    ///
+    /// The surface is either the array's threshold surface (linear interpolation, like the smooth
+    /// view) or, with `opts.fair`, the faired surface of the samples past the threshold (smooth,
+    /// without the voxel terraces of a near-binary array; `fairing`).
     ///
     /// For cell arrays the samples are cell centres and each is a cell of the design domain or not
     /// (`domain`; the padding is not). Where the solid ends at the domain's edge, the field doesn't
     /// say where between the two samples the surface is (x̃ there depends on the material nearby),
     /// but the domain does: on the cell face. So vertices on such edges go to the edge's midpoint,
-    /// and the part ends in flat faces on the domain boundary and the grid box.
-    pub fn mesh(&self) -> Result<crate::mesh::Mesh> {
+    /// and the part ends in flat faces on the domain boundary and the grid box. Smoothing keeps
+    /// vertices inside the domain (`domain_constraint`). With fairing, the faired field continues
+    /// through the domain's boundary, and the vertices on the outline of each such face are put on
+    /// it (`outline_to_field`), so the outline is a smooth curve rather than a staircase.
+    pub fn mesh(&self, opts: &MeshOpts) -> Result<crate::mesh::Mesh> {
         if self.inside_count == 0 {
             bail!(
                 "nothing inside: no samples of `{}` are past the threshold {}",
@@ -436,18 +457,54 @@ impl Volume {
         let [nx, ny, nz] = self.dims;
         let p = [nx + 2, ny + 2, nz + 2];
         let field = self.field();
-        // f < 0 inside; mc wants z-fastest order
-        let mut vol = vec![1f32; p[0] * p[1] * p[2]];
-        for z in 0..nz {
-            for y in 0..ny {
-                for x in 0..nx {
-                    let v = field[(z * ny + y) * nx + x];
-                    let f = if self.below { v - self.iso } else { self.iso - v };
-                    vol[((x + 1) * p[1] + y + 1) * p[2] + z + 1] = if f.is_finite() { f } else { 1.0 };
+        let cell = self.file.arrays[self.array].cell;
+        // grid index (may be in the padding) -> in the domain
+        let in_domain = |i: [i64; 3]| {
+            (0..3).all(|k| i[k] >= 0 && i[k] < self.dims[k] as i64)
+                && (!cell
+                    || self
+                        .domain
+                        .as_ref()
+                        .is_none_or(|d| d[((i[2] as usize) * ny + i[1] as usize) * nx + i[0] as usize]))
+        };
+        // the field on the padded lattice (x-fastest), < 0 inside
+        let pidx = |x: usize, y: usize, z: usize| (z * p[1] + y) * p[0] + x;
+        let n = p[0] * p[1] * p[2];
+        let mut free = vec![false; n];
+        let mut f = vec![1f32; n];
+        for z in 0..p[2] {
+            for y in 0..p[1] {
+                for x in 0..p[0] {
+                    let c = [x as i64 - 1, y as i64 - 1, z as i64 - 1];
+                    let i = pidx(x, y, z);
+                    if !in_domain(c) {
+                        free[i] = true;
+                        continue;
+                    }
+                    let v = field[((c[2] as usize) * ny + c[1] as usize) * nx + c[0] as usize];
+                    let d = if self.below { v - self.iso } else { self.iso - v };
+                    f[i] = if d.is_finite() { d } else { 1.0 };
                 }
             }
         }
-        // mesh in grid units, then scale each axis (spacing may differ per axis)
+        let faired = opts.fair.then(|| {
+            let inside: Vec<bool> = f.iter().zip(&free).map(|(&v, &fr)| !fr && v < 0.0).collect();
+            crate::fairing::fair(&inside, Some(&free), p)
+        });
+        if let Some(fv) = &faired {
+            for i in 0..n {
+                f[i] = if free[i] { 1.0 } else { fv.v[i] };
+            }
+        }
+        // mc wants z-fastest order; mesh in grid units
+        let mut vol = vec![1f32; n];
+        for z in 0..p[2] {
+            for y in 0..p[1] {
+                for x in 0..p[0] {
+                    vol[(x * p[1] + y) * p[2] + z] = f[pidx(x, y, z)];
+                }
+            }
+        }
         let grid = crate::mesher::Grid {
             vol,
             dims: p,
@@ -455,15 +512,10 @@ impl Volume {
             step: 1.0,
         };
         let mut mesh = crate::mesher::polygonize(grid)?;
-        if self.file.arrays[self.array].cell {
-            let in_domain = |i: [i64; 3]| {
-                (0..3).all(|k| i[k] >= 0 && i[k] < self.dims[k] as i64)
-                    && self
-                        .domain
-                        .as_ref()
-                        .is_none_or(|d| d[((i[2] as usize) * ny + i[1] as usize) * nx + i[0] as usize])
-            };
-            for v in &mut mesh.verts {
+        // per vertex: the axis of the domain face it was put on
+        let mut face = vec![None; mesh.verts.len()];
+        if cell {
+            for (vi, v) in mesh.verts.iter_mut().enumerate() {
                 // a marching-cubes vertex lies on a lattice edge: two whole coordinates
                 let frac: Vec<usize> = (0..3).filter(|&k| (v[k] - v[k].round()).abs() > 1e-4).collect();
                 let &[k] = frac.as_slice() else { continue };
@@ -473,7 +525,25 @@ impl Volume {
                 b[k] += 1;
                 if in_domain(a) != in_domain(b) {
                     v[k] = a[k] as f32 + 0.5;
+                    face[vi] = Some(k);
                 }
+            }
+        }
+        let constraint = cell.then(|| domain_constraint(&free, p));
+        // outlines onto the faired field before smoothing (the whole way: smoothing then evens out
+        // the strip beside them) and after it (only as far as flips no triangle)
+        if let Some(fv) = &faired {
+            outline_to_field(&mut mesh, &face, fv, false);
+        }
+        mesh.smooth(
+            opts.smooth,
+            constraint.as_ref().map(|c| c as &crate::mesh::VertexConstraint),
+        );
+        if let Some(fv) = &faired {
+            outline_to_field(&mut mesh, &face, fv, true);
+            // an outline vertex near a corner of the domain may have slid past the other face
+            if let Some(c) = &constraint {
+                mesh.verts.iter_mut().for_each(c);
             }
         }
         for v in &mut mesh.verts {
@@ -483,56 +553,122 @@ impl Volume {
         }
         Ok(mesh)
     }
+}
 
-    /// For `Mesh::smooth` of a cell array's mesh: moves a vertex that left the region it may occupy
-    /// (the design domain, else the grid box) back onto its boundary. The region is the 0.5 level of
-    /// the trilinear domain indicator (1 in, 0 out, 0 beyond the grid), which runs along the cell
-    /// faces: the same place `mesh` puts the surface where the solid meets the domain's edge. A few
-    /// Newton steps along the indicator's gradient; vertices inside are left alone.
-    pub fn domain_constraint(&self) -> Option<impl Fn(&mut [f32; 3]) + Sync + use<>> {
-        if !self.file.arrays[self.array].cell {
-            return None;
+/// For `Mesh::smooth` of a cell array's mesh, in grid units: moves a vertex that left the region it
+/// may occupy (the design domain, else the grid box; `outside` marks the padded lattice's samples
+/// outside it) back onto its boundary. The region is the 0.5 level of the trilinear domain
+/// indicator, which runs along the cell faces: the same place `Volume::mesh` puts the surface where
+/// the solid meets the domain's edge. A few Newton steps along the indicator's gradient; vertices
+/// inside are left alone.
+fn domain_constraint(outside: &[bool], p: [usize; 3]) -> impl Fn(&mut [f32; 3]) + Sync + use<> {
+    let g: Vec<f32> = outside.iter().map(|&o| if o { 0.0 } else { 1.0 }).collect();
+    move |v: &mut [f32; 3]| {
+        // padded lattice coordinates
+        let mut q: [f64; 3] = std::array::from_fn(|k| v[k] as f64 + 1.0);
+        let mut moved = false;
+        for _ in 0..4 {
+            let (val, grad) = trilinear_grad(&g, p, q);
+            if val >= 0.5 {
+                break;
+            }
+            let gg: f64 = grad.iter().map(|c| c * c).sum();
+            if gg < 1e-12 {
+                break;
+            }
+            // aim slightly inside, so the vertex isn't left a rounding error outside
+            let s = (0.5 + 1e-4 - val) / gg;
+            for k in 0..3 {
+                q[k] += s * grad[k];
+            }
+            moved = true;
         }
-        let [nx, ny, nz] = self.dims;
-        let p = [nx + 2, ny + 2, nz + 2];
-        let mut g = vec![0f32; p[0] * p[1] * p[2]];
-        for z in 0..nz {
-            for y in 0..ny {
-                for x in 0..nx {
-                    let i = (z * ny + y) * nx + x;
-                    if self.domain.as_ref().is_none_or(|d| d[i]) {
-                        g[((z + 1) * p[1] + y + 1) * p[0] + x + 1] = 1.0;
-                    }
-                }
+        if moved {
+            for k in 0..3 {
+                v[k] = (q[k] - 1.0) as f32;
             }
         }
-        let (o, h) = (self.origin, self.spacing);
-        Some(move |v: &mut [f32; 3]| {
-            // padded lattice coordinates
-            let mut q: [f64; 3] = std::array::from_fn(|k| (v[k] as f64 - o[k]) / h[k] + 1.0);
-            let mut moved = false;
-            for _ in 0..4 {
-                let (val, grad) = trilinear_grad(&g, p, q);
-                if val >= 0.5 {
-                    break;
-                }
-                let gg: f64 = grad.iter().map(|c| c * c).sum();
-                if gg < 1e-12 {
-                    break;
-                }
-                // aim slightly inside, so the vertex isn't left a rounding error outside
-                let s = (0.5 + 1e-4 - val) / gg;
-                for k in 0..3 {
-                    q[k] += s * grad[k];
-                }
-                moved = true;
+    }
+}
+
+/// Slides the vertices on the outline of each domain face (face vertices with a neighbour on the
+/// free surface, so not where two faces of the domain meet) within the face's plane onto the zero
+/// level of the faired field `f` (padded lattice: grid coordinates + 1), which continues through
+/// the face. Marching cubes can only put face vertices at lattice points, so without this the
+/// outline is a staircase. Moves are limited to 1.5 voxels; with `safe`, each vertex goes the
+/// largest of 1, ½, ¼ or ⅛ of the way that flips none of its triangles (a vertex that would overrun
+/// its neighbours on the surface goes less far).
+fn outline_to_field(mesh: &mut crate::mesh::Mesh, face: &[Option<usize>], f: &crate::fairing::Field, safe: bool) {
+    let nv = mesh.verts.len();
+    let mut on_outline = vec![false; nv];
+    let mut vtris: Vec<Vec<u32>> = vec![vec![]; nv];
+    for (ti, t) in mesh.tris.iter().enumerate() {
+        for e in 0..3 {
+            let (a, b) = (t[e] as usize, t[(e + 1) % 3] as usize);
+            // next to the free surface; a neighbour on another face is a corner of the domain
+            if face[a].is_some() && face[b].is_none() {
+                on_outline[a] = true;
             }
-            if moved {
-                for k in 0..3 {
-                    v[k] = (o[k] + (q[k] - 1.0) * h[k]) as f32;
-                }
+            if face[b].is_some() && face[a].is_none() {
+                on_outline[b] = true;
             }
-        })
+            vtris[a].push(ti as u32);
+        }
+    }
+    let normal = |v: &[[f32; 3]], t: [u32; 3]| {
+        let [a, b, c] = t.map(|i| v[i as usize]);
+        let u: [f32; 3] = std::array::from_fn(|k| b[k] - a[k]);
+        let w: [f32; 3] = std::array::from_fn(|k| c[k] - a[k]);
+        [
+            u[1] * w[2] - u[2] * w[1],
+            u[2] * w[0] - u[0] * w[2],
+            u[0] * w[1] - u[1] * w[0],
+        ]
+    };
+    for i in 0..nv {
+        let (true, Some(k)) = (on_outline[i], face[i]) else {
+            continue;
+        };
+        let start = mesh.verts[i];
+        let mut q = start.map(|c| c + 1.0);
+        for _ in 0..4 {
+            let (val, mut g) = f.sample(q);
+            g[k] = 0.0;
+            let gg = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+            if gg < 1e-8 || val.abs() < 1e-4 {
+                break;
+            }
+            for j in 0..3 {
+                q[j] -= val * g[j] / gg;
+            }
+        }
+        if f.sample(q).0.abs() > 0.05 {
+            continue; // no zero level nearby in the plane
+        }
+        let mut d: [f32; 3] = std::array::from_fn(|j| q[j] - 1.0 - start[j]);
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if len > 1.5 {
+            d = d.map(|c| c * 1.5 / len);
+        }
+        if !safe {
+            mesh.verts[i] = std::array::from_fn(|j| start[j] + d[j]);
+            continue;
+        }
+        let before: Vec<[f32; 3]> = vtris[i]
+            .iter()
+            .map(|&t| normal(&mesh.verts, mesh.tris[t as usize]))
+            .collect();
+        for s in [1.0, 0.5, 0.25, 0.125] {
+            mesh.verts[i] = std::array::from_fn(|j| start[j] + s * d[j]);
+            let ok = vtris[i].iter().zip(&before).all(|(&t, n0)| {
+                let n = normal(&mesh.verts, mesh.tris[t as usize]);
+                n[0] * n0[0] + n[1] * n0[1] + n[2] * n0[2] > 0.0
+            });
+            if ok {
+                break;
+            }
+            mesh.verts[i] = start;
+        }
     }
 }
 
@@ -845,7 +981,8 @@ mod tests {
         slope_vti(&path);
         let vol = Volume::load(&path, &VolumeOpts::default()).unwrap();
         assert!(vol.label().contains(FILTERED), "{}", vol.label());
-        let mut m = vol.mesh().unwrap();
+        let raw = MeshOpts { fair: false, smooth: 0 };
+        let m = vol.mesh(&raw).unwrap();
         assert!(m.is_watertight());
 
         // the slope away from the edges: on the plane (binary density would leave 0.5-voxel steps)
@@ -868,13 +1005,24 @@ mod tests {
         );
 
         let v0 = m.volume();
-        let c = vol.domain_constraint().unwrap();
-        m.smooth(10, Some(&c));
-        assert!(m.is_watertight());
-        let x_max = m.verts.iter().map(|v| v[0]).fold(f32::MIN, f32::max);
-        assert!(x_max < 20.0 + 1e-3, "smoothing left the domain: x = {x_max}");
-        assert!(off_plane(&m) < 0.05, "{}", off_plane(&m));
-        assert!((m.volume() / v0 - 1.0).abs() < 0.01, "volume {v0} -> {}", m.volume());
+        for fair in [false, true] {
+            let m = vol.mesh(&MeshOpts { fair, smooth: 10 }).unwrap();
+            assert!(m.is_watertight());
+            let x_max = m.verts.iter().map(|v| v[0]).fold(f32::MIN, f32::max);
+            assert!(
+                x_max < 20.0 + 1e-3,
+                "fair {fair}: smoothing left the domain: x = {x_max}"
+            );
+            // this x̃ is exactly linear, so its surface is the plane; fairing uses only the binary
+            // density (0.5-voxel steps) and gets within a quarter voxel of it on this small slab
+            let tol = if fair { 0.25 } else { 0.05 };
+            assert!(off_plane(&m) < tol, "fair {fair}: {}", off_plane(&m));
+            assert!(
+                (m.volume() / v0 - 1.0).abs() < 0.01,
+                "fair {fair}: volume {v0} -> {}",
+                m.volume()
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }

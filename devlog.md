@@ -3,6 +3,61 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Fair the voxel surface of optimized parts
+
+**Why:** exported optimization results still showed voxel terraces, even with `density_filtered` and
+10 Taubin passes. On a shallow slope the steps are 1/slope voxels apart: a long wavelength that
+Taubin (passband ~0.1) barely touches. What tells them apart from features is their amplitude, at
+most half a voxel. Where the part meets a flat face of the design domain, the outline on that face
+was also a staircase, because marching cubes only puts the snapped face vertices at lattice points.
+
+**What:**
+- `fairing.rs`: the smoothest field (thin-plate energy Σ(Δφ)²) whose value at each sample stays
+  within 0.45 of its signed distance to the voxel surface (EDT − ½). Projected gradient descent with
+  Nesterov momentum, 100 iterations on a 4-voxel band. Samples outside the domain are free (the
+  field continues through the faces) and start from the mask extended by nearest neighbour.
+- `Volume::mesh(&MeshOpts { fair, smooth })` does the whole sequence: field (faired or interpolated),
+  marching cubes, snapping to domain faces, Taubin with the domain constraint (now in grid units), then
+  scaling. With fairing, vertices on each domain face's outline slide within the face onto the
+  faired surface, both before Taubin and again after it (that time only as far as flips no triangle).
+  Vertices where two domain faces meet are left alone.
+- On by default for `density` arrays; `export --no-fair` gives the old surface, and `--fair` fairs other
+  arrays.
+
+Tried and dropped (48³ test shapes, see below): longer Taubin (100 passes rounds everything and still
+leaves terraces); Gaussian blur of x̃ (σ 1: thin rod −51% volume); membrane energy Σ|∇φ|² (shrinks
+by mean curvature, −8 to −44%); sign constraints only (rod −24%: the field goes flat inside thin
+members); asymmetric margins (fix the rod, inflate the rest 2–5%); a 2× finer field (10× the time,
+small gains); thin-plate fairing of the mesh vertices (unstable near the domain, rod −20 to −35%);
+bands wider than ½ voxel (rod −22 to −73%). Mirrored Laplacian vs. linear extrapolation at grid edges:
+mirrored is better.
+
+**Result** (mean vertex distance from the true surface in voxels / mean normal error / volume error;
+x̃ marching cubes + Taubin 10 against faired + Taubin 10):
+
+| shape | before | faired |
+|---|---|---|
+| sphere r11.3 | 0.077 / 5.3° / −0.7% | 0.025 / 1.9° / −0.4% |
+| box tilted 9°/5°, faces | 0.158 / 9.0° / −0.9% | 0.166 / 4.4° / +2.8% |
+| cylinder r7 tilted 6° | 0.107 / 6.7° / −0.7% | 0.046 / 2.1° / +1.1% |
+| rod r1.9 tilted | 0.125 / 10.2° / −12.4% | 0.096 / 7.7° / −10.0% |
+
+Volume against the voxels' own: bracket 26.31 → 26.92 cm³ (voxels 26.71: −1.5% → +0.8%), table
+2009.8 → 2126.8 cm³ (voxels 2075.7: −3.2% → +2.5%). Visually, the bracket's ramp is now smooth, and
+its outlines on the side and top faces are smooth curves. The table's pocket ridges stay: its
+1.7 mm shells are 2–3 voxels thick and widen by a voxel at each step, a feature of the design
+itself. Time: the 3.7M-cell table exports in 1.3 s instead of 0.5 s (+145 MB).
+
+**Verified:** `fairing_beats_the_filtered_density` (the table above), `fairing_flattens_terraces`
+(a tilted half-space comes back flat to 0.1 voxel, ±0.05 in the middle), and the slope `.vti` test for
+both paths (faired: within 0.25 voxel of the plane on that small slab, watertight, inside the domain,
+volume ±1%). Bracket and table meshes are watertight with the same body count.
+
+**Still open:** sharp convex edges inside the domain are rounded and bulge out by up to 0.45 voxel
+(the box's +2.8%); the preview still draws the interpolated x̃ surface, not the faired one; the
+crease strip beside a domain face stays half a voxel wide and slightly faceted; one-voxel features
+of the design (thin-shell ridges) need a finer or smoother optimization.
+
 ## 2026-11-14: Solve one side of mirror-symmetric problems
 
 **Why:** with mirror planes declared (previous entry), a symmetric part needs only one side solved:

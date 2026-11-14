@@ -209,6 +209,7 @@ Keys are matched by physical position (US layout), so `[` `]` work without AltGr
 gen3d                                   the app
 gen3d view   [FILE] [-D NAME=VAL]...    the app with a .wgsl shape or .vti grid open
 gen3d export SHAPE [-o out.stl] [--format stl|3mf|obj|ply|vti] [--voxel MM] [--bounds X0 Y0 Z0 X1 Y1 Z1] [--decimate F]
+            [.vti: --smooth N] [--fair | --no-fair]
 gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh opts] [-- extra slicer args]
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
@@ -296,8 +297,17 @@ gen3d slice  result.vti --array density                   # straight to G-code
 - **Threshold:** by default, an SDF-like array (named `*sdf*`, or with values on both sides of 0) is
   solid where it is `< 0`. Anything else (densities, masks) is solid above the middle of its value range.
   `--iso`, `--below` and `--above` override this.
-- **Smooth or blocky:** smooth draws the interpolated threshold surface, the same one `export` meshes.
-  `--blocky` (or `M`) draws every inside sample as a cube; for cell data those are exactly the elements.
+- **Smooth or blocky:** smooth draws the interpolated threshold surface. `--blocky` (or `M`) draws every
+  inside sample as a cube; for cell data those are exactly the elements.
+- **Meshing (`export`, Print):** marching cubes, then `--smooth N` Taubin passes (default 10). For an
+  optimizer's `density` the surface is first *faired*: the smoothest surface that stays within 0.45
+  voxel of the voxels' own (a thin-plate fit, `src/fairing.rs`). That removes the voxel terraces on
+  shallow slopes, which Taubin smoothing hardly touches, and keeps thin members as thick as the
+  voxels; where the part meets the design domain's boundary, the outline on the flat face follows the
+  same smooth surface instead of the voxel staircase. `--no-fair` meshes the interpolated
+  `density_filtered` instead (the view's surface); `--fair` fairs any other array (e.g. a binary mask).
+  Fairing can't remove features of a whole voxel, such as the ridges of a coarse design's thin shells:
+  a finer `--voxel` or larger `--rmin` in `optimize` can.
 - **Colour:** `--color NAME` (or `F`) colours the surface and the section face by another array, using a
   viridis colour map. The range is the 1st to 99th percentile of that array over the inside samples (so
   a few hotspots don't flatten it); the sidebar shows a colour bar and can fix the range.
@@ -425,8 +435,8 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
 - **Projection or not:** with projection the result is crisp (0% grey on the bracket against 24%
   without) and stiffer for the same material (compliance 8.96 against 10.36 N·mm). Thresholding at
   0.5 then matches `--volfrac` closely. The cost is about 1.7× the iterations. Because each voxel is now
-  fully in or out, the threshold surface follows the voxel staircase; a finer `--voxel` gives a smoother
-  part. `--no-projection` gives the faster, softer-edged grey result.
+  fully in or out, the threshold surface follows the voxel staircase; `export` fairs it (see Meshing
+  above), and a finer `--voxel` gives a smoother part. `--no-projection` gives the faster, softer-edged grey result.
 - **Speed:** each iteration solves the stiffness system with conjugate gradient preconditioned by
   geometric multigrid (a V-cycle with Chebyshev smoothing and Galerkin coarse levels; the fine level
   is matrix-free), warm-started. With a hardware GPU (`--solver gpu`, the default) the whole iteration
@@ -491,7 +501,8 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/viewer.rs` | raymarching preview harness and pipelines, headless PNG render |
 | `src/slicer.rs` | PrusaSlicer / OrcaSlicer discovery and CLI driving, G-code summary, profiles, opening files |
 | `src/vti.rs` | VTK ImageData reader and writers |
-| `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing |
+| `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing (domain faces, outlines) |
+| `src/fairing.rs` | smooth surfaces from binary voxels: constrained thin-plate fairing of the field |
 | `src/topopt/mod.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
 | `src/topopt/mg.rs` | multigrid preconditioner: Galerkin coarse levels, Chebyshev/Jacobi smoothers, banded Cholesky |
 | `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32) |

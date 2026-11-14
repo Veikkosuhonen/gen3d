@@ -2,6 +2,7 @@
 
 mod app;
 mod browser;
+mod fairing;
 mod gpu;
 mod jobs;
 mod mc;
@@ -190,6 +191,12 @@ struct MeshArgs {
     /// .vti: Taubin smoothing passes on the mesh (0 = off; default 10)
     #[arg(long)]
     smooth: Option<u32>,
+    /// .vti: fair the voxels' surface (no voxel terraces; default for optimizer densities)
+    #[arg(long, conflicts_with = "no_fair")]
+    fair: bool,
+    /// .vti: mesh the array's interpolated threshold surface instead of fairing it
+    #[arg(long)]
+    no_fair: bool,
     #[arg(long, value_enum, default_value = "stl")]
     format: Format,
 }
@@ -452,8 +459,8 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
     if ext.is_some() && m.format == Format::Vti {
         bail!("--format vti only applies to `export`");
     }
-    if m.smooth.is_some() {
-        bail!("--smooth applies to .vti grids (shapes are meshed from their exact distance field)");
+    if m.smooth.is_some() || m.fair || m.no_fair {
+        bail!("--smooth and --fair apply to .vti grids (shapes are meshed from their exact distance field)");
     }
     let decimate = m.decimate.or(shape.decimate());
     let mesh = mesher::build_mesh(&shape, m.voxel, decimate)?;
@@ -492,19 +499,24 @@ fn export_volume(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option
         vol.inside_count,
         vol.count()
     );
-    let mut mesh = vol.mesh()?;
+    let opts = volume::MeshOpts {
+        fair: if m.fair {
+            true
+        } else if m.no_fair {
+            false
+        } else {
+            vol.fair_by_default()
+        },
+        smooth: m.smooth.unwrap_or(mesher::DEFAULT_SMOOTH),
+    };
+    let mesh = vol.mesh(&opts)?;
     println!(
-        "marching cubes in {:.2}s: {} triangles",
+        "{}marching cubes and {} smoothing passes in {:.2}s: {} triangles",
+        if opts.fair { "faired, " } else { "" },
+        opts.smooth,
         t0.elapsed().as_secs_f64(),
         mesh.tris.len()
     );
-    let passes = m.smooth.unwrap_or(mesher::DEFAULT_SMOOTH);
-    if passes > 0 {
-        let t1 = std::time::Instant::now();
-        let constraint = vol.domain_constraint();
-        mesh.smooth(passes, constraint.as_ref().map(|c| c as &mesh::VertexConstraint));
-        println!("smoothed ({passes} passes) in {:.2}s", t1.elapsed().as_secs_f64());
-    }
     let mesh = mesher::decimate_checked(mesh, m.decimate);
     mesher::report(&mesh);
     let shape = vol.shape(&s.shape);
