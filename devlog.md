@@ -3,6 +3,27 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Throttle the preview animation, and pause it while optimizing
+
+**Why:** after on-demand drawing, the moving load-direction bands were the one thing still redrawing
+the viewport at the refresh rate. A raymarch of the 2200×1670 px viewport takes ~32 ms on
+bracket_editor and ~21 ms on bracket_domain (M1 Pro), so the animation alone kept the GPU busy,
+also while an optimization (which needs the GPU) ran.
+
+**What:** the animation redraws at `ANIMATION_FPS` = 30 (the bands move 1.5 bands per second, so it
+looks the same). It holds still while an optimization job runs: `animating()` is false, so time
+stops advancing and the viewport redraws only on changes.
+
+**Result** (GPU utilization, idle window): bracket_domain 100% → 63%, bracket_editor 100% → 95%
+(its raymarch takes about as long as a 30 fps frame); 0–4% (the baseline) during an optimization.
+
+**Verified:** measured as above, with the render rate logged (30 fps). The pause during an
+optimization follows from `animating()`; not measured with a job running from the app.
+
+**Still open:** animating at all costs most of the GPU on heavier shapes. Options: static bands,
+a lower rate, animating only for a few seconds after the overlay appears, or a lower-resolution
+viewport while animating.
+
 ## 2026-11-14: Draw the viewport on demand
 
 **Why:** the window redrew every frame: `RedrawRequested` drew a frame and requested the next one, so

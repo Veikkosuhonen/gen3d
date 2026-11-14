@@ -419,6 +419,10 @@ struct App {
     fps_t: Instant,
 }
 
+/// Frame rate of the preview's animation (the load bands move 1.5 bands per second, so this looks as
+/// smooth as the display's refresh rate at a fraction of the GPU time).
+const ANIMATION_FPS: f32 = 30.0;
+
 fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
@@ -3825,8 +3829,12 @@ impl App {
     }
 
     /// Whether the preview animates: the moving bands of a shown vector field overlay (the load
-    /// directions). Only then does its time uniform advance and the viewport redraw continuously.
+    /// directions). Only then does its time uniform advance and the viewport redraw (at
+    /// `ANIMATION_FPS`). The bands hold still while an optimization runs, which needs the GPU.
     fn animating(&self) -> bool {
+        if self.opt_job.running() {
+            return false;
+        }
         let mesh_shown = self
             .win
             .as_ref()
@@ -3848,7 +3856,7 @@ impl App {
         let mut next = (egui_delay < Duration::from_secs(3600)).then(|| now + egui_delay);
         let mut at = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
         if self.animating() {
-            at(now);
+            at(now + Duration::from_secs_f32(1.0 / ANIMATION_FPS));
         }
         if self.rebuild.is_some() {
             at(now + Duration::from_millis(30));
