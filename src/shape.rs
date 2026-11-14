@@ -33,6 +33,9 @@ pub struct Shape {
     pub defines: Vec<(String, f64)>,
     /// Primitives from the editor's sidecar file (see `prims.rs`), unioned with the script's map.
     pub prims: Vec<Prim>,
+    /// The editor's mirror planes (from the sidecar): the primitives are mirrored across them, the
+    /// bounds are symmetric about them, and the optimizer solves only one side.
+    pub mirror: prims::Mirror,
     /// Whether the editor's code is part of `source` (the sidecar file exists).
     pub editor: bool,
     /// Whether the script itself defines `fn map` (without one, the primitives are the shape).
@@ -89,6 +92,7 @@ impl Shape {
             directives: BTreeMap::new(),
             defines: vec![],
             prims: vec![],
+            mirror: [None; 3],
             editor: false,
             script_map: true,
             base_bounds: ([-50.0, -50.0, 0.0], [50.0, 50.0, 100.0]),
@@ -116,6 +120,9 @@ impl Shape {
         let margin = 2.0 * self.voxel;
         let prims = if self.editor { &self.prims[..] } else { &[] };
         self.bounds = prims::grow_bounds(base, prims, margin).unwrap_or(self.base_bounds);
+        if self.editor {
+            self.bounds = prims::mirror_bounds(&self.mirror, self.bounds);
+        }
     }
 
     /// The loads for `gen3d optimize`: the script's `field_load` (case 1, scaled to `--force`) and
@@ -738,7 +745,7 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
     let sidecar = prims::sidecar(&path);
     if sidecar.exists() || !has_code(&read_file(&path)?) {
         if sidecar.exists() {
-            shape.prims = prims::load(&sidecar)?;
+            (shape.prims, shape.mirror) = prims::load_file(&sidecar)?;
         }
         shape.editor = true;
         shape.update_bounds();
@@ -765,7 +772,10 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
         shape.files.push(sidecar);
         let idx = shape.files.len();
         shape.files.push(library_path("editor.wgsl"));
-        for (i, line) in prims::wgsl(&shape.prims, script, reach).lines().enumerate() {
+        for (i, line) in prims::wgsl(&shape.prims, &shape.mirror, script, reach)
+            .lines()
+            .enumerate()
+        {
             shape.source.push_str(line);
             shape.source.push('\n');
             shape.origins.push(Origin { file: idx, line: i + 1 });

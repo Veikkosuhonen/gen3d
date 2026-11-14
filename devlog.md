@@ -3,6 +3,29 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Mirror planes in the editor
+
+**Why:** symmetric parts are common (brackets, stands, tables), and the optimizer can solve only one
+side of a symmetric problem. First step: a way to declare the symmetry.
+
+**What:**
+- `.prims.json` has an optional `"mirror": [x, y, z]` (a plane position per axis, or null), read with
+  `prims::load_file` into `Shape::mirror`.
+- Generated WGSL: each primitive's own SDF is `g3d_p<i>`, and `g3d_e<i>` is the min over its mirror
+  images (2^planes points), so everything built on `g3d_e<i>` (the map, the selection highlight, the
+  fixed / load / keep regions) is mirrored. Mirroring per primitive rather than folding the whole shape
+  keeps subtracted holes on both sides and lets primitives sit on either side of the plane.
+- Loads keep their direction on the mirrored region: a sideways push on a load region that spans the
+  plane stays one push.
+- Bounds are made symmetric about the planes; picking traces the mirror images too.
+- Design step: a *Mirror* row (X / Y / Z toggles and plane positions; a position edit applies when the
+  drag or typing ends, since it recompiles).
+
+**Verified:** `mirrored_primitives` (sidecar round trip, symmetric bounds, the twins in the generated
+code, compiles for meshing and preview, picking the twin); an offscreen snapshot of a mirrored beam.
+
+**Still open:** the optimizer doesn't use the symmetry yet (next). The script's own map isn't mirrored.
+
 ## 2026-11-14: Animate the load bands for 3 s, then freeze
 
 **Why:** even at 30 fps the moving load-direction bands kept the GPU 60–95% busy with the window

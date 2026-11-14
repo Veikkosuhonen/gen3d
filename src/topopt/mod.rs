@@ -1854,7 +1854,7 @@ pub(super) mod tests {
             case: 2,
             ..Prim::new(Kind::Sphere, "side".into(), [15.0, 0.0, 10.0], 8.0)
         };
-        save(&sidecar(&path), &[bolt, pin, side]).unwrap();
+        save(&sidecar(&path), &[bolt, pin, side], &[None; 3]).unwrap();
         let shape = crate::shape::load_shape(&path, &[]).unwrap();
         assert!(shape.bc && shape.script_load.is_none());
         let names: Vec<_> = shape.fields().unwrap().into_iter().map(|f| f.name).collect();
@@ -1930,7 +1930,7 @@ pub(super) mod tests {
             rock: 0.2,
             ..Prim::new(Kind::Sphere, "book".into(), [0.0, 0.0, 20.0], 4.0)
         };
-        save(&sidecar(&path), &[block, top]).unwrap();
+        save(&sidecar(&path), &[block, top], &[None; 3]).unwrap();
         let shape = crate::shape::load_shape(&path, &[]).unwrap();
         let s = Settings {
             voxel: 2.0,

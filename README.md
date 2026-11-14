@@ -109,6 +109,13 @@ buffer, so moving or resizing a primitive, switching its operation, or selecting
 with no shader compile; in `render`, `export`, `optimize` etc. it's a `const`, baked in. Adding,
 removing, hiding or changing a kind regenerates the source.
 
+**Mirror planes** (the *Mirror* row under the primitives; `"mirror": [0, null, null]` in the
+`.prims.json` for a plane at x = 0): every primitive is mirrored across each plane, becoming the union of
+itself and its mirror images (`g3d_e<i>` is the min over them), so a subtracted hole is cut on both
+sides and a support or loaded region gets its twin. A load keeps its direction on the mirrored region
+(the same push over both; its force is spread over both). The bounds become symmetric about the planes.
+The script's own `map` is not mirrored. A new plane goes through the middle of the bounds.
+
 ### Library (`src/wgsl/sdf.wgsl`)
 
 - **Primitives:** `sdSphere sdBox sdRoundBox sdTorus sdCylinder sdRoundCylinder sdCapsule sdCappedCone sdHexPrism sdOctahedron sdPlane`

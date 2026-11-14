@@ -89,6 +89,8 @@ struct EditUi {
     /// Edits within a short time of each other (a slider or gizmo drag) are one undo step.
     last_edit: Option<Instant>,
     drag: Option<GizmoDrag>,
+    /// a mirror plane's position while it is being dragged or typed (applied when that ends)
+    mirror_draft: [Option<f32>; 3],
 }
 
 /// A gizmo handle being dragged.
@@ -1409,7 +1411,7 @@ impl App {
                 .iter()
                 .zip(&old)
                 .any(|(a, b)| a.kind != b.kind || a.hidden != b.hidden || a.role != b.role);
-        if let Err(e) = prims::save(&path, &new) {
+        if let Err(e) = prims::save(&path, &new, &shape.mirror) {
             self.notice = Some(format!("{e:#}"));
             return;
         }
@@ -1426,6 +1428,63 @@ impl App {
                 s.set_prims(new);
             }
             self.upload_prims();
+        }
+    }
+
+    /// Save new mirror planes to the sidecar and show them (the generated code changes: a reload).
+    fn set_mirror(&mut self, mirror: prims::Mirror) {
+        let Some(shape) = &self.design_shape else { return };
+        let path = shape.prims_path();
+        let prims = if shape.editor { shape.prims.clone() } else { vec![] };
+        if let Err(e) = prims::save(&path, &prims, &mirror) {
+            self.notice = Some(format!("{e:#}"));
+            return;
+        }
+        self.mtimes.insert(path.clone(), mtime(&path));
+        self.reload(false);
+    }
+
+    /// The mirror planes: a toggle per axis, and the plane's position when on.
+    fn mirror_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(shape) = &self.design_shape else { return };
+        let before = shape.mirror;
+        let (lo, hi) = shape.bounds;
+        let mut m = before;
+        ui.horizontal(|ui| {
+            ui.label("Mirror").on_hover_text(
+                "mirror every primitive across a plane: each becomes itself plus its mirror image (holes \
+                 too), and the optimizer then solves only one side of the part",
+            );
+            for (a, name) in ["X", "Y", "Z"].iter().enumerate() {
+                let mut on = m[a].is_some();
+                if ui
+                    .checkbox(&mut on, *name)
+                    .on_hover_text(format!("mirror across a plane {name} = const"))
+                    .changed()
+                {
+                    // a new plane goes through the middle of the bounds, rounded to 0.1 mm
+                    m[a] = on.then(|| (5.0 * (lo[a] + hi[a])).round() / 10.0);
+                }
+                if let Some(c) = m[a] {
+                    // edited as a draft, applied when the drag or typing ends (each change compiles)
+                    let mut v = self.edit.mirror_draft[a].unwrap_or(c);
+                    let r = ui
+                        .add(egui::DragValue::new(&mut v).speed(0.1).suffix(" mm"))
+                        .on_hover_text(format!("position of the {name} mirror plane"));
+                    if r.changed() {
+                        self.edit.mirror_draft[a] = Some(v);
+                    }
+                    if !r.dragged()
+                        && !r.has_focus()
+                        && let Some(d) = self.edit.mirror_draft[a].take()
+                    {
+                        m[a] = Some(d);
+                    }
+                }
+            }
+        });
+        if m != before {
+            self.set_mirror(m);
         }
     }
 
@@ -1840,7 +1899,13 @@ impl App {
                 let rd = [0, 1, 2].map(|k| fw[k] * 1.8 + uv.x * rt[k] - uv.y * up[k]);
                 let l = (rd[0] * rd[0] + rd[1] * rd[1] + rd[2] * rd[2]).sqrt();
                 let far = self.cam.dist * 4.0 + self.shape.size().iter().sum::<f32>();
-                let hit = prims::pick(&self.prims(), self.cam.eye(), rd.map(|c| c / l), far);
+                let hit = prims::pick(
+                    &self.prims(),
+                    &self.shape.mirror,
+                    self.cam.eye(),
+                    rd.map(|c| c / l),
+                    far,
+                );
                 self.select(hit);
             }
         }
@@ -2869,6 +2934,9 @@ impl App {
         }
         section(ui, "Primitives");
         self.prims_ui(ui);
+        if self.loaded && self.design_shape.is_some() {
+            self.mirror_ui(ui);
+        }
         if !self.fields.is_empty() {
             section(ui, "Field overlays");
             self.fields_ui(ui);

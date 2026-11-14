@@ -317,13 +317,52 @@ pub fn rock_case(c: u32, k: u32) -> u32 {
     1000 * c + k
 }
 
+/// Mirror planes, per axis: `Some(c)` mirrors every primitive across the plane at that coordinate
+/// (x = c for axis 0). Each primitive becomes the union of itself and its mirror images, so
+/// subtracted ones cut on both sides; a load keeps its direction on the mirrored region (the same
+/// push, applied over both). The script's own map is not mirrored.
+pub type Mirror = [Option<f32>; 3];
+
 /// The sidecar file.
 #[derive(Default, Serialize, Deserialize)]
 struct PrimFile {
     #[serde(default)]
     note: String,
+    #[serde(default, skip_serializing_if = "no_mirror")]
+    mirror: Mirror,
     #[serde(default)]
     prims: Vec<Prim>,
+}
+
+fn no_mirror(m: &Mirror) -> bool {
+    m.iter().all(Option::is_none)
+}
+
+/// The images of point `p` under the mirror planes (`p` itself first): 2^planes points.
+pub fn mirror_images(mirror: &Mirror, p: V3) -> Vec<V3> {
+    let mut out = vec![p];
+    for (a, c) in mirror.iter().enumerate() {
+        if let Some(c) = c {
+            for k in 0..out.len() {
+                let mut q = out[k];
+                q[a] = 2.0 * c - q[a];
+                out.push(q);
+            }
+        }
+    }
+    out
+}
+
+/// `bounds` grown to be symmetric about the mirror planes.
+pub fn mirror_bounds(mirror: &Mirror, (mut lo, mut hi): (V3, V3)) -> (V3, V3) {
+    for (a, c) in mirror.iter().enumerate() {
+        if let Some(c) = c {
+            let r = (c - lo[a]).max(hi[a] - c);
+            lo[a] = c - r;
+            hi[a] = c + r;
+        }
+    }
+    (lo, hi)
 }
 
 const NOTE: &str = "gen3d primitives, edited in the Design step; unioned with the shape's map()";
@@ -335,10 +374,17 @@ pub fn sidecar(shape: &Path) -> PathBuf {
 }
 
 /// Read a sidecar. Non-finite numbers are zeroed so they can't break the generated WGSL.
+#[cfg(test)]
 pub fn load(path: &Path) -> Result<Vec<Prim>> {
+    Ok(load_file(path)?.0)
+}
+
+/// Read a sidecar: the primitives and the mirror planes.
+pub fn load_file(path: &Path) -> Result<(Vec<Prim>, Mirror)> {
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let file: PrimFile =
         serde_json::from_str(&text).with_context(|| format!("{}: not a primitives file", path.display()))?;
+    let mirror = file.mirror.map(|c| c.filter(|v| v.is_finite()));
     let mut prims = file.prims;
     for p in &mut prims {
         for v in p.pos.iter_mut().chain(&mut p.rot).chain(&mut p.dims) {
@@ -365,12 +411,13 @@ pub fn load(path: &Path) -> Result<Vec<Prim>> {
             }
         }
     }
-    Ok(prims)
+    Ok((prims, mirror))
 }
 
-pub fn save(path: &Path, prims: &[Prim]) -> Result<()> {
+pub fn save(path: &Path, prims: &[Prim], mirror: &Mirror) -> Result<()> {
     let file = PrimFile {
         note: NOTE.into(),
+        mirror: *mirror,
         prims: prims.to_vec(),
     };
     let mut text = serde_json::to_string_pretty(&file)?;
@@ -524,14 +571,16 @@ pub fn grow_bounds(bounds: Option<(V3, V3)>, prims: &[Prim], margin: f32) -> Opt
     out
 }
 
-/// The visible primitive a ray hits first (sphere tracing their plain union), if any.
-pub fn pick(prims: &[Prim], ro: V3, rd: V3, far: f32) -> Option<usize> {
+/// The visible primitive a ray hits first (sphere tracing their plain union, mirror images
+/// included), if any.
+pub fn pick(prims: &[Prim], mirror: &Mirror, ro: V3, rd: V3, far: f32) -> Option<usize> {
     let scene = |p: V3| {
+        let images = mirror_images(mirror, p);
         prims
             .iter()
             .enumerate()
             .filter(|(_, q)| !q.hidden)
-            .map(|(i, q)| (q.sdf(p), i))
+            .map(|(i, q)| (images.iter().map(|&m| q.sdf(m)).fold(f32::INFINITY, f32::min), i))
             .min_by(|a, b| a.0.total_cmp(&b.0))
     };
     let eps = far * 1e-5;
@@ -726,16 +775,28 @@ pub fn role_fields(prims: &[Prim]) -> (bool, bool, bool) {
 /// highlight), and for primitives with optimization roles `field_fixed` / `field_load` /
 /// `field_keep` (the script's own, if any, plus the primitives' regions; `reach` = default shell
 /// thickness around boundary-condition primitives, `g3d_reach`).
-pub fn wgsl(prims: &[Prim], script: Script, reach: f32) -> String {
+pub fn wgsl(prims: &[Prim], mirror: &Mirror, script: Script, reach: f32) -> String {
     let script_map = script.map;
     let mut s = String::from(LIBRARY);
     let visible: Vec<_> = prims.iter().enumerate().filter(|(_, p)| !p.hidden).collect();
+    // the mirror images of p, as WGSL expressions (p itself first)
+    let mut images = vec![["p.x".to_string(), "p.y".into(), "p.z".into()]];
+    for (a, c) in mirror.iter().enumerate() {
+        if let Some(c) = c {
+            for k in 0..images.len() {
+                let mut q = images[k].clone();
+                // each image mirrors an axis at most once, so q[a] is still the plain component
+                q[a] = format!("{:?} - {}", 2.0 * c, q[a]);
+                images.push(q);
+            }
+        }
+    }
     for &(i, p) in &visible {
         let b = base(i);
         let _ = writeln!(s, "// {} ({})", p.name.replace(['\n', '\r'], " "), p.kind.name());
         let _ = writeln!(
             s,
-            "fn g3d_e{i}(p: vec3f) -> f32 {{\n    \
+            "fn g3d_p{i}(p: vec3f) -> f32 {{\n    \
              let q = g3d_ed_local(p, g3d_ed[{b}].xyz, g3d_ed[{}].xyz);\n    \
              return g3d_ed_{kind}(q, g3d_ed[{}].xyz, g3d_ed[{}].w);\n}}",
             b + 1,
@@ -743,6 +804,12 @@ pub fn wgsl(prims: &[Prim], script: Script, reach: f32) -> String {
             b + 1,
             kind = p.kind.name()
         );
+        // with mirror planes, the union of the primitive and its mirror images
+        let _ = writeln!(s, "fn g3d_e{i}(p: vec3f) -> f32 {{\n    var d = g3d_p{i}(p);");
+        for q in &images[1..] {
+            let _ = writeln!(s, "    d = min(d, g3d_p{i}(vec3f({}, {}, {})));", q[0], q[1], q[2]);
+        }
+        s += "    return d;\n}\n";
     }
     s += "fn map(p: vec3f) -> f32 {\n";
     s += if script_map {
@@ -972,7 +1039,7 @@ mod tests {
             case: 2,
             ..Prim::new(Kind::Sphere, "push".into(), [0.0, 0.0, 9.0], 4.0)
         };
-        save(&sidecar(&p), std::slice::from_ref(&push)).unwrap();
+        save(&sidecar(&p), std::slice::from_ref(&push), &[None; 3]).unwrap();
         let s = load_shape(&p, &[]).unwrap();
         assert!(
             s.source
@@ -992,7 +1059,7 @@ mod tests {
         // hidden: back to the script's fields only
         let mut hidden = push;
         hidden.hidden = true;
-        save(&sidecar(&p), &[hidden]).unwrap();
+        save(&sidecar(&p), &[hidden], &[None; 3]).unwrap();
         let s = load_shape(&p, &[]).unwrap();
         assert!(!s.bc && s.source.contains("fn field_load(") && s.load_specs().len() == 1);
         // old sidecars (no role fields) load with sensible defaults
@@ -1015,6 +1082,56 @@ mod tests {
         assert!(s.contains("fn mapper()"));
         let mut none = "fn mapper() {}\n".to_string();
         assert!(!rename_script_fn(&mut none, "map").unwrap());
+    }
+
+    /// Mirror planes: saved in the sidecar, applied to every primitive (a box off to one side gets a
+    /// twin, picking finds it, the bounds become symmetric) and the generated code compiles.
+    #[test]
+    fn mirrored_primitives() {
+        use crate::shape::load_shape;
+        let dir = std::env::temp_dir().join(format!("gen3d-mirror-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("m.wgsl");
+        std::fs::write(&p, "").unwrap();
+        let mut b = Prim::new(Kind::Box, "box".into(), [10.0, 0.0, 5.0], 4.0);
+        b.role = Role::Load;
+        let mut hole = Prim::new(Kind::Cylinder, "hole".into(), [12.0, 0.0, 5.0], 1.0);
+        hole.op = Op::Subtract;
+        let mirror: Mirror = [Some(1.0), None, None];
+        save(&sidecar(&p), &[b.clone(), hole], &mirror).unwrap();
+        let (prims, m) = load_file(&sidecar(&p)).unwrap();
+        assert_eq!((prims.len(), m), (2, mirror));
+
+        let s = load_shape(&p, &[]).unwrap();
+        assert_eq!(s.mirror, mirror);
+        // symmetric about x = 1: the box reaches x = 12 (+ margin), so its twin reaches -10
+        let (lo, hi) = s.bounds;
+        assert!((lo[0] + hi[0] - 2.0).abs() < 1e-4 && lo[0] < -9.9, "{:?}", s.bounds);
+        assert!(
+            s.source.contains("g3d_p0(vec3f(2.0 - p.x, p.y, p.z))"),
+            "the box's twin"
+        );
+        assert!(
+            s.source.contains("g3d_p1(vec3f(2.0 - p.x, p.y, p.z))"),
+            "the hole's twin"
+        );
+        s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
+        let preview = crate::viewer::preview_harness(&s.fields().unwrap(), true);
+        s.compile_preview(&preview).unwrap();
+        // the load keeps its direction on the mirrored region: one load, as before
+        assert_eq!(s.load_specs().len(), 1);
+
+        // a ray down x = -8 hits only the twin
+        let ro = [-8.0, -50.0, 5.0];
+        assert_eq!(pick(&[b.clone()], &mirror, ro, [0.0, 1.0, 0.0], 200.0), Some(0));
+        assert_eq!(pick(&[b], &[None; 3], ro, [0.0, 1.0, 0.0], 200.0), None);
+        // images: two planes give four points
+        let im = mirror_images(&[Some(0.0), Some(2.0), None], [1.0, 1.0, 1.0]);
+        assert_eq!(
+            im,
+            vec![[1.0, 1.0, 1.0], [-1.0, 1.0, 1.0], [1.0, 3.0, 1.0], [-1.0, 3.0, 1.0]]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1043,7 +1160,7 @@ mod tests {
         prims[2].blend = 2.0;
         prims[3].hidden = true;
         prims[5].pos = [40.0, 0.0, 5.0]; // outside the declared bounds
-        save(&sidecar(&p), &prims).unwrap();
+        save(&sidecar(&p), &prims, &[None; 3]).unwrap();
         assert_eq!(load(&sidecar(&p)).unwrap(), prims);
 
         let s = load_shape(&p, &[("R".into(), 6.0)]).unwrap();
@@ -1086,7 +1203,7 @@ mod tests {
         assert!(!s.script_map);
         assert!(s.bounds.0[0] < -1.9 && s.bounds.1[0] > 42.0, "{:?}", s.bounds);
         s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
-        save(&sidecar(&p), &[]).unwrap();
+        save(&sidecar(&p), &[], &[None; 3]).unwrap();
         load_shape(&p, &[])
             .unwrap()
             .compile_preview(&crate::viewer::preview_harness(&[], true))
@@ -1111,7 +1228,7 @@ mod tests {
             let mut prim = Prim::new(kind, "x".into(), [1.0, -2.0, 0.5], 9.0);
             prim.rot = [25.0 + k as f32, -40.0, 70.0];
             prim.round = 1.0;
-            save(&sidecar(&p), std::slice::from_ref(&prim)).unwrap();
+            save(&sidecar(&p), std::slice::from_ref(&prim), &[None; 3]).unwrap();
             let shape = crate::shape::load_shape(&p, &[]).unwrap();
             let grid = Grid {
                 vol: vec![],
@@ -1162,7 +1279,7 @@ mod tests {
         prims[2].op = Op::Intersect;
         prims[2].rot = [30.0, 0.0, 0.0];
         prims[3].blend = 1.0;
-        save(&sidecar(&p), &prims).unwrap();
+        save(&sidecar(&p), &prims, &[None; 3]).unwrap();
         let shape = crate::shape::load_shape(&p, &[]).unwrap();
         let grid = Grid {
             vol: vec![],
@@ -1230,9 +1347,15 @@ mod tests {
         }
         let s = Prim::new(Kind::Sphere, "s".into(), [0.0, 0.0, 0.0], 10.0);
         assert_eq!(
-            pick(std::slice::from_ref(&s), [0.0, -50.0, 0.0], [0.0, 1.0, 0.0], 200.0),
+            pick(
+                std::slice::from_ref(&s),
+                &[None; 3],
+                [0.0, -50.0, 0.0],
+                [0.0, 1.0, 0.0],
+                200.0
+            ),
             Some(0)
         );
-        assert_eq!(pick(&[s], [0.0, -50.0, 20.0], [0.0, 1.0, 0.0], 200.0), None);
+        assert_eq!(pick(&[s], &[None; 3], [0.0, -50.0, 20.0], [0.0, 1.0, 0.0], 200.0), None);
     }
 }
