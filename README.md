@@ -54,6 +54,7 @@ Directives (`//! key value`, anywhere in the main file):
 | `decimate 0.5` | keep this fraction of triangles after meshing |
 | `slicer ../printers/x.ini` | slicer config(s) for this shape |
 | `range NAME min max` | slider range for parameter `NAME` in the viewer (one line per parameter) |
+| `up -x` | the side printed up (`+z` `-z` `+x` `-x` `+y` `-y`): Optimize's overhang control and Print's mesh orientation default to it (an editor shape keeps it in its sidecar's `"up"` instead) |
 
 `#include "file.wgsl"` resolves relative to the shape first, then the built-in library (compiled into the
 binary). Each file is included once. Shapes are validated with [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga)
@@ -452,9 +453,13 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
     over the hole, a tabletop marked keep solid) still needs supports or bridging, and is counted
     separately. Material can stand on them.
   - **Print orientation** (`--up`, *printed … up* in the app): any of the six axis directions, so the
-    layers stay voxel layers. Pass the same `--up` to `export`, `slice` and `open`, which turn the
-    mesh so that side faces up and set it on z = 0 (the app does this for you). Other angles: rotate
-    the shape. The orientation matters: the bracket printed on its wall plate (`--up=+x`) reaches
+    layers stay voxel layers. It is saved with the shape: the app writes the choice to an editor
+    shape's `.prims.json` (`"up": "-x"`); a script shape takes `//! up -x` (the app says so when you
+    change it). `optimize` without `--up` uses the shape's, and records it in the result (FieldData
+    `print_up`, the up vector). `export`, `slice` and `open` without `--up` turn the mesh so the
+    saved side (the shape's, or the one a result was made for) faces up and set it on z = 0; `--up=+z`
+    keeps it as modelled. In the app Optimize and Print share the setting, and Print warns when a
+    result was optimized for another side up. Other angles: rotate the shape. The orientation matters: the bracket printed on its wall plate (`--up=+x`) reaches
     compliance 7.83 in 58 iterations (8.5 s), against 7.88 in 115 (16.5 s) standing as modelled.
   - 45° is along the layer's two axes; diagonally the limit is a little steeper (about 55°). Bridges
     are not allowed either.

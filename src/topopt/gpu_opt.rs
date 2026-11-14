@@ -354,7 +354,7 @@ pub(super) fn optimize_gpu(
     );
     let t_start = Instant::now();
     let mut control = stage.state.control.clone();
-    let mut output = Output::new(m, out);
+    let mut output = Output::new(m, out, s.up);
     let mut result = Outcome {
         iterations: 0,
         compliance: 0.0,

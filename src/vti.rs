@@ -142,12 +142,15 @@ pub struct GridArray<'a> {
 /// (cells = points - 1), `origin` the first point. Cell arrays are written first, so a viewer that
 /// defaults to the first array shows them. The file is written to a temporary name and renamed into
 /// place, so a viewer reloading it never sees a half-written file. Returns the file size.
+/// `field`: whole-dataset values (VTK FieldData, one tuple each, written as ascii), e.g. an
+/// optimizer result's `print_up`.
 pub fn write_grid(
     path: &Path,
     origin: [f64; 3],
     spacing: f64,
     points: [usize; 3],
     arrays: &[GridArray],
+    field: &[(&str, &[f32])],
 ) -> Result<u64> {
     let [px, py, pz] = points;
     let extent = format!("0 {} 0 {} 0 {}", px - 1, py - 1, pz - 1);
@@ -171,6 +174,20 @@ pub fn write_grid(
             order.push(a);
         }
     }
+    let mut field_xml = String::new();
+    if !field.is_empty() {
+        field_xml.push_str("    <FieldData>\n");
+        for (name, v) in field {
+            let vals: Vec<String> = v.iter().map(|x| x.to_string()).collect();
+            let _ = writeln!(
+                field_xml,
+                r#"      <DataArray type="Float32" Name="{name}" NumberOfTuples="1" NumberOfComponents="{}" format="ascii">{}</DataArray>"#,
+                v.len(),
+                vals.join(" ")
+            );
+        }
+        field_xml.push_str("    </FieldData>\n");
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -183,7 +200,7 @@ pub fn write_grid(
             r#"<?xml version="1.0"?>
 <VTKFile type="ImageData" version="1.0" byte_order="LittleEndian" header_type="UInt64">
   <ImageData WholeExtent="{extent}" Origin="{} {} {}" Spacing="{spacing} {spacing} {spacing}" Direction="1 0 0 0 1 0 0 0 1">
-    <Piece Extent="{extent}">
+{field_xml}    <Piece Extent="{extent}">
       <CellData>
 {}      </CellData>
       <PointData>
@@ -217,6 +234,8 @@ pub struct VtiFile {
     /// WholeExtent: index range of the grid points, `[x0, x1, y0, y1, z0, z1]`
     pub extent: [i64; 6],
     pub arrays: Vec<VtiArray>,
+    /// whole-dataset values (FieldData): name, values
+    pub field: Vec<(String, Vec<f32>)>,
 }
 
 pub struct VtiArray {
@@ -510,6 +529,7 @@ fn read_bytes(bytes: &[u8]) -> Result<VtiFile> {
         spacing,
         extent,
         arrays: vec![],
+        field: vec![],
     };
     let count = |cell| {
         let (_, d) = file.lattice(cell);
@@ -518,10 +538,28 @@ fn read_bytes(bytes: &[u8]) -> Result<VtiFile> {
     let (npoints, ncells) = (count(false), count(true));
 
     let mut section = None;
+    let mut in_field = false;
     for t in &tags {
         match (t.name, t.close) {
             ("PointData" | "CellData", false) if !t.self_closing => section = Some(t.name == "CellData"),
             ("PointData" | "CellData", true) => section = None,
+            ("FieldData", false) if !t.self_closing => in_field = true,
+            ("FieldData", true) => in_field = false,
+            // whole-dataset values: only small ascii ones (the rest is skipped)
+            ("DataArray", false) if in_field => {
+                if t.attr("format") != Some("ascii") {
+                    continue;
+                }
+                let rest = &head[t.end..];
+                let text = &rest[..rest.find('<').unwrap_or(0)];
+                if let Ok(v) = text
+                    .split_whitespace()
+                    .map(|x| x.parse::<f32>())
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    file.field.push((t.attr("Name").unwrap_or("unnamed").to_string(), v));
+                }
+            }
             ("DataArray", false) => {
                 let Some(cell) = section else { continue };
                 let name = t.attr("Name").unwrap_or("unnamed").to_string();
@@ -628,12 +666,21 @@ mod tests {
                 data: &cells,
             },
         ];
-        write_grid(&p, [1.0, 2.0, 3.0], 0.5, [3, 2, 2], &arrays).unwrap();
+        write_grid(
+            &p,
+            [1.0, 2.0, 3.0],
+            0.5,
+            [3, 2, 2],
+            &arrays,
+            &[("print_up", &[-1.0, 0.0, 0.0])],
+        )
+        .unwrap();
         let f = read(&p).unwrap();
         assert_eq!(f.arrays[0].name, "rho"); // cell data first
         assert_eq!(f.arrays[0].data, cells);
         assert_eq!(f.arrays[1].data, pts);
         assert_eq!(f.lattice(true).0, [1.25, 2.25, 3.25]);
+        assert_eq!(f.field, vec![("print_up".to_string(), vec![-1.0, 0.0, 0.0])]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

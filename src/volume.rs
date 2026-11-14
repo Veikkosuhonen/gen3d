@@ -80,6 +80,10 @@ pub struct Volume {
 /// keeps mesh smoothing inside the domain (`Volume::domain_constraint`).
 pub const FILTERED: &str = "density_filtered";
 
+/// An optimizer result's print orientation (FieldData): the up direction it was made printable for,
+/// a unit vector along an axis (`mesh::Up::vector`).
+pub const PRINT_UP: &str = "print_up";
+
 /// Histogram bins for the Volume panel.
 pub const HIST_BINS: usize = 64;
 
@@ -394,7 +398,14 @@ impl Volume {
         let mut shape = Shape::generated(path, VOLUME_WGSL, (lo, hi), voxel);
         // the smooth field is only approximately a distance away from the surface
         shape.directives.insert("step".into(), "0.8".into());
+        shape.up = self.up();
         shape
+    }
+
+    /// The side printed up that an optimizer result was made for (its `print_up`), if recorded.
+    pub fn up(&self) -> Option<crate::mesh::Up> {
+        let (_, v) = self.file.field.iter().find(|(n, _)| n == PRINT_UP)?;
+        crate::mesh::Up::from_vector(v.get(..3)?.try_into().ok()?)
     }
 
     /// Threshold step for the +/- keys: 1/50 of the value range.
@@ -944,7 +955,8 @@ mod tests {
     }
 
     /// An optimizer-style result: a solid under the slope z = 0.3 x + 3, binary `density` and a
-    /// linear `density_filtered`, with cells x >= 20 outside the domain (NaN).
+    /// linear `density_filtered`, with cells x >= 20 outside the domain (NaN). One empty cell's
+    /// density is a hair below 0 (as the AM filter's rounding gave), and it was made for -x up.
     fn slope_vti(path: &Path) {
         let n = [24usize, 16, 16];
         let plane = |x: f32| 0.3 * x + 3.0;
@@ -960,6 +972,7 @@ mod tests {
                 }
             }
         }
+        *dens.last_mut().unwrap() = -3e-8;
         let arr = |name, data| crate::vti::GridArray {
             name,
             cell: true,
@@ -972,8 +985,29 @@ mod tests {
             1.0,
             n.map(|v| v + 1),
             &[arr("density", &dens), arr(FILTERED, &filt)],
+            &[(PRINT_UP, &crate::mesh::Up::MinusX.vector())],
         )
         .unwrap();
+    }
+
+    /// A density a hair below 0 is still a density (inside above the middle of its range), and the
+    /// result's print orientation comes back as its shape's.
+    #[test]
+    fn optimizer_result_threshold_and_orientation() {
+        let dir = std::env::temp_dir().join(format!("gen3d-resup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("slope.vti");
+        slope_vti(&path);
+        let vol = Volume::load(&path, &VolumeOpts::default()).unwrap();
+        assert!(
+            !vol.below && (vol.iso - 0.5).abs() < 0.01,
+            "iso {} below {}",
+            vol.iso,
+            vol.below
+        );
+        assert_eq!(vol.up(), Some(crate::mesh::Up::MinusX));
+        assert_eq!(vol.shape(&path).up, Some(crate::mesh::Up::MinusX));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -200,9 +200,10 @@ struct MeshArgs {
     #[arg(long, value_enum, default_value = "stl")]
     format: Format,
     /// the side of the part that faces up on the printer: the mesh is turned so it does and set on
-    /// z = 0 (+z leaves it as it is)
-    #[arg(long, value_enum, default_value = "+z", allow_hyphen_values = true)]
-    up: mesh::Up,
+    /// z = 0 (+z leaves it as it is). Default: the shape's (sidecar "up" or `//! up`), or the one an
+    /// optimizer result was made for, else +z
+    #[arg(long, value_enum, allow_hyphen_values = true)]
+    up: Option<mesh::Up>,
 }
 
 #[derive(Subcommand)]
@@ -310,9 +311,10 @@ enum Cmd {
         #[arg(long)]
         no_overhang: bool,
         /// the side of the part that faces up on the printer (the build direction for overhang
-        /// control); pass the same --up to export / slice / open
-        #[arg(long, value_enum, default_value = "+z", allow_hyphen_values = true)]
-        up: mesh::Up,
+        /// control). Default: the shape's (sidecar "up" or `//! up`), else +z. The result records
+        /// it, and export / slice / open use it from there
+        #[arg(long, value_enum, allow_hyphen_values = true)]
+        up: Option<mesh::Up>,
         /// density filter radius in voxels (larger = thicker, simpler members)
         #[arg(long, default_value_t = 1.5)]
         rmin: f64,
@@ -382,9 +384,9 @@ enum Cmd {
         /// with --mesh: draw the triangle edges
         #[arg(long)]
         edges: bool,
-        /// the side printed up (Optimize and Print)
-        #[arg(long, value_enum, default_value = "+z", allow_hyphen_values = true)]
-        up: mesh::Up,
+        /// the side printed up (Optimize and Print; default: the shape's)
+        #[arg(long, value_enum, allow_hyphen_values = true)]
+        up: Option<mesh::Up>,
         #[arg(long, num_args = 2, value_names = ["W", "H"], default_values_t = [1440u32, 900])]
         size: Vec<u32>,
         #[arg(short, long, default_value = "out/snapshot.png")]
@@ -450,7 +452,7 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
         && (m.format == Format::Vti
             || output.is_some_and(|o| o.extension().is_some_and(|e| e.eq_ignore_ascii_case("vti"))));
     if vti {
-        if m.up != mesh::Up::PlusZ {
+        if m.up.is_some_and(|u| u != mesh::Up::PlusZ) {
             bail!("--up applies to meshes, not to a .vti export");
         }
         let out = output.map_or_else(|| default_out(&shape.path, ".vti", &defines), Path::to_path_buf);
@@ -482,7 +484,7 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
     }
     let decimate = m.decimate.or(shape.decimate());
     let mut mesh = mesher::build_mesh(&shape, m.voxel, decimate)?;
-    mesh.orient(m.up);
+    mesh.orient(oriented(m.up, shape.up));
     mesher::report(&mesh);
     let out = match (ext, output) {
         (None, Some(o)) => o.to_path_buf(),
@@ -491,6 +493,18 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
     };
     mesher::save(&mesh, &out)?;
     Ok((shape, out))
+}
+
+/// The side to turn up: `--up`, else the file's own (saying so when it isn't +z).
+fn oriented(arg: Option<mesh::Up>, file: Option<mesh::Up>) -> mesh::Up {
+    let up = arg.or(file).unwrap_or_default();
+    if arg.is_none() && up != mesh::Up::PlusZ {
+        println!(
+            "printed {} up (as saved with the file; --up=+z keeps the mesh as modelled)",
+            up.name()
+        );
+    }
+    up
 }
 
 /// Mesh the threshold surface of a .vti array (e.g. a topology-optimization density).
@@ -537,7 +551,7 @@ fn export_volume(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option
         mesh.tris.len()
     );
     let mut mesh = mesher::decimate_checked(mesh, m.decimate);
-    mesh.orient(m.up);
+    mesh.orient(oriented(m.up, vol.up()));
     mesher::report(&mesh);
     let shape = vol.shape(&s.shape);
     let out = match (ext, output) {
@@ -709,7 +723,7 @@ fn run(cli: Cli) -> Result<()> {
                 coarse_start: !no_coarse_start,
                 symmetry: !no_symmetry,
                 overhang: !no_overhang,
-                up,
+                up: up.or(shape.up).unwrap_or_default(),
             };
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
             topopt::run(&shape, &settings, &out, &gpu, resume)?;

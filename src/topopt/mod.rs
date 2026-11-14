@@ -1505,7 +1505,7 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
     // the last iteration's output, until it is written
     // the last iteration's full fields, until written
     let mut pending: Option<Snapshot> = None;
-    let mut output = output::Output::new(m, out);
+    let mut output = output::Output::new(m, out, s.up);
     // OC's Lagrange multiplier, for the next iteration's bracket
     let mut lambda = stage.state.lambda;
     let mut last_change = stage.state.last_change;
@@ -2239,7 +2239,7 @@ pub(super) mod tests {
             case: 2,
             ..Prim::new(Kind::Sphere, "side".into(), [15.0, 0.0, 10.0], 8.0)
         };
-        save(&sidecar(&path), &[bolt, pin, side], &[None; 3]).unwrap();
+        save(&sidecar(&path), &[bolt, pin, side], &[None; 3], None).unwrap();
         let shape = crate::shape::load_shape(&path, &[]).unwrap();
         assert!(shape.bc && shape.script_load.is_none());
         let names: Vec<_> = shape.fields().unwrap().into_iter().map(|f| f.name).collect();
@@ -2371,7 +2371,7 @@ pub(super) mod tests {
             rock: 0.2,
             ..Prim::new(Kind::Sphere, "book".into(), [0.0, 0.0, 20.0], 4.0)
         };
-        save(&sidecar(&path), &[block, top], &[None; 3]).unwrap();
+        save(&sidecar(&path), &[block, top], &[None; 3], None).unwrap();
         let shape = crate::shape::load_shape(&path, &[]).unwrap();
         let s = Settings {
             voxel: 2.0,

@@ -36,6 +36,11 @@ pub struct Shape {
     /// The editor's mirror planes (from the sidecar): the primitives are mirrored across them, the
     /// bounds are symmetric about them, and the optimizer solves only one side.
     pub mirror: prims::Mirror,
+    /// The side printed up, when the shape says (the sidecar's `"up"`, else `//! up`; for an
+    /// optimizer result, the one it was made for). Optimize and Print default to it.
+    pub up: Option<crate::mesh::Up>,
+    /// The sidecar's own `"up"` (what saving the sidecar keeps).
+    pub sidecar_up: Option<crate::mesh::Up>,
     /// Whether the editor's code is part of `source` (the sidecar file exists).
     pub editor: bool,
     /// Whether the script itself defines `fn map` (without one, the primitives are the shape).
@@ -93,6 +98,8 @@ impl Shape {
             defines: vec![],
             prims: vec![],
             mirror: [None; 3],
+            up: None,
+            sidecar_up: None,
             editor: false,
             script_map: true,
             base_bounds: ([-50.0, -50.0, 0.0], [50.0, 50.0, 100.0]),
@@ -719,6 +726,9 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
                 }
                 shape.bounds = ([v[0], v[1], v[2]], [v[3], v[4], v[5]]);
             }
+            "up" => {
+                shape.up = Some(crate::mesh::Up::parse(val).ok_or_else(|| bad("expected +z, -z, +x, -x, +y or -y"))?);
+            }
             "voxel" => {
                 shape.voxel = val
                     .split_whitespace()
@@ -745,7 +755,11 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
     let sidecar = prims::sidecar(&path);
     if sidecar.exists() || !has_code(&read_file(&path)?) {
         if sidecar.exists() {
-            (shape.prims, shape.mirror) = prims::load_file(&sidecar)?;
+            let file = prims::load_file(&sidecar)?;
+            (shape.prims, shape.mirror, shape.sidecar_up) = (file.prims, file.mirror, file.up);
+            if file.up.is_some() {
+                shape.up = file.up;
+            }
         }
         shape.editor = true;
         let (fixed, load, keep) = prims::role_fields(&shape.prims);

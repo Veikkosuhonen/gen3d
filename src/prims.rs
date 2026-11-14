@@ -342,8 +342,18 @@ struct PrimFile {
     note: String,
     #[serde(default, skip_serializing_if = "no_mirror")]
     mirror: Mirror,
+    /// the side printed up (`mesh::Up`); absent = not chosen (+z)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    up: Option<crate::mesh::Up>,
     #[serde(default)]
     prims: Vec<Prim>,
+}
+
+/// What a sidecar holds.
+pub struct Sidecar {
+    pub prims: Vec<Prim>,
+    pub mirror: Mirror,
+    pub up: Option<crate::mesh::Up>,
 }
 
 fn no_mirror(m: &Mirror) -> bool {
@@ -388,11 +398,11 @@ pub fn sidecar(shape: &Path) -> PathBuf {
 /// Read a sidecar. Non-finite numbers are zeroed so they can't break the generated WGSL.
 #[cfg(test)]
 pub fn load(path: &Path) -> Result<Vec<Prim>> {
-    Ok(load_file(path)?.0)
+    Ok(load_file(path)?.prims)
 }
 
-/// Read a sidecar: the primitives and the mirror planes.
-pub fn load_file(path: &Path) -> Result<(Vec<Prim>, Mirror)> {
+/// Read a sidecar: the primitives, the mirror planes and the print orientation.
+pub fn load_file(path: &Path) -> Result<Sidecar> {
     let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
     let file: PrimFile =
         serde_json::from_str(&text).with_context(|| format!("{}: not a primitives file", path.display()))?;
@@ -423,13 +433,18 @@ pub fn load_file(path: &Path) -> Result<(Vec<Prim>, Mirror)> {
             }
         }
     }
-    Ok((prims, mirror))
+    Ok(Sidecar {
+        prims,
+        mirror,
+        up: file.up,
+    })
 }
 
-pub fn save(path: &Path, prims: &[Prim], mirror: &Mirror) -> Result<()> {
+pub fn save(path: &Path, prims: &[Prim], mirror: &Mirror, up: Option<crate::mesh::Up>) -> Result<()> {
     let file = PrimFile {
         note: NOTE.into(),
         mirror: *mirror,
+        up,
         prims: prims.to_vec(),
     };
     let mut text = serde_json::to_string_pretty(&file)?;
@@ -1051,7 +1066,7 @@ mod tests {
             case: 2,
             ..Prim::new(Kind::Sphere, "push".into(), [0.0, 0.0, 9.0], 4.0)
         };
-        save(&sidecar(&p), std::slice::from_ref(&push), &[None; 3]).unwrap();
+        save(&sidecar(&p), std::slice::from_ref(&push), &[None; 3], None).unwrap();
         let s = load_shape(&p, &[]).unwrap();
         assert!(
             s.source
@@ -1071,7 +1086,7 @@ mod tests {
         // hidden: back to the script's fields only
         let mut hidden = push;
         hidden.hidden = true;
-        save(&sidecar(&p), &[hidden], &[None; 3]).unwrap();
+        save(&sidecar(&p), &[hidden], &[None; 3], None).unwrap();
         let s = load_shape(&p, &[]).unwrap();
         assert!(!s.bc && s.source.contains("fn field_load(") && s.load_specs().len() == 1);
         // old sidecars (no role fields) load with sensible defaults
@@ -1110,11 +1125,13 @@ mod tests {
         let mut hole = Prim::new(Kind::Cylinder, "hole".into(), [12.0, 0.0, 5.0], 1.0);
         hole.op = Op::Subtract;
         let mirror: Mirror = [Some(1.0), None, None];
-        save(&sidecar(&p), &[b.clone(), hole], &mirror).unwrap();
-        let (prims, m) = load_file(&sidecar(&p)).unwrap();
-        assert_eq!((prims.len(), m), (2, mirror));
+        save(&sidecar(&p), &[b.clone(), hole], &mirror, Some(crate::mesh::Up::MinusX)).unwrap();
+        let file = load_file(&sidecar(&p)).unwrap();
+        assert_eq!((file.prims.len(), file.mirror), (2, mirror));
+        assert_eq!(file.up, Some(crate::mesh::Up::MinusX), "the print orientation is saved");
 
         let s = load_shape(&p, &[]).unwrap();
+        assert_eq!(s.up, Some(crate::mesh::Up::MinusX));
         assert_eq!(s.mirror, mirror);
         // symmetric about x = 1: the box reaches x = 12 (+ margin), so its twin reaches -10
         let (lo, hi) = s.bounds;
@@ -1172,7 +1189,7 @@ mod tests {
         prims[2].blend = 2.0;
         prims[3].hidden = true;
         prims[5].pos = [40.0, 0.0, 5.0]; // outside the declared bounds
-        save(&sidecar(&p), &prims, &[None; 3]).unwrap();
+        save(&sidecar(&p), &prims, &[None; 3], None).unwrap();
         assert_eq!(load(&sidecar(&p)).unwrap(), prims);
 
         let s = load_shape(&p, &[("R".into(), 6.0)]).unwrap();
@@ -1217,7 +1234,7 @@ mod tests {
         // only them, not the default bounds of a shape without any
         assert_eq!(Some(s.bounds), grow_bounds(None, &s.prims, 2.0 * s.voxel));
         s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
-        save(&sidecar(&p), &[], &[None; 3]).unwrap();
+        save(&sidecar(&p), &[], &[None; 3], None).unwrap();
         load_shape(&p, &[])
             .unwrap()
             .compile_preview(&crate::viewer::preview_harness(&[], true))
@@ -1242,7 +1259,7 @@ mod tests {
             let mut prim = Prim::new(kind, "x".into(), [1.0, -2.0, 0.5], 9.0);
             prim.rot = [25.0 + k as f32, -40.0, 70.0];
             prim.round = 1.0;
-            save(&sidecar(&p), std::slice::from_ref(&prim), &[None; 3]).unwrap();
+            save(&sidecar(&p), std::slice::from_ref(&prim), &[None; 3], None).unwrap();
             let shape = crate::shape::load_shape(&p, &[]).unwrap();
             let grid = Grid {
                 vol: vec![],
@@ -1293,7 +1310,7 @@ mod tests {
         prims[2].op = Op::Intersect;
         prims[2].rot = [30.0, 0.0, 0.0];
         prims[3].blend = 1.0;
-        save(&sidecar(&p), &prims, &[None; 3]).unwrap();
+        save(&sidecar(&p), &prims, &[None; 3], None).unwrap();
         let shape = crate::shape::load_shape(&p, &[]).unwrap();
         let grid = Grid {
             vol: vec![],

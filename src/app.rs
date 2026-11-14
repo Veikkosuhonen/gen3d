@@ -1001,6 +1001,7 @@ impl App {
         self.shown = path;
         self.step = Step::Design;
         self.print_result = false;
+        self.up = Up::PlusZ;
         self.defines = defines;
         self.vopts = VolumeOpts::default();
         self.volume = None;
@@ -1220,6 +1221,10 @@ impl App {
             first || (self.loaded && self.shape.path == shape.path && self.shape.base_bounds != shape.base_bounds);
         if !grid {
             self.params = params;
+            // the shape's saved print orientation (a script's without one keeps the session's)
+            if let Some(u) = shape.up {
+                self.up = u;
+            }
             self.design_shape = Some(shape.clone());
             self.design_fields = fields.clone();
         }
@@ -1436,7 +1441,7 @@ impl App {
                 .iter()
                 .zip(&old)
                 .any(|(a, b)| a.kind != b.kind || a.hidden != b.hidden || a.role != b.role);
-        if let Err(e) = prims::save(&path, &new, &shape.mirror) {
+        if let Err(e) = prims::save(&path, &new, &shape.mirror, shape.sidecar_up) {
             self.notice = Some(format!("{e:#}"));
             return;
         }
@@ -1456,12 +1461,38 @@ impl App {
         }
     }
 
+    /// Keep the chosen print orientation with the shape: in its sidecar (an editor shape), else a
+    /// note on the `//! up` directive that would keep it.
+    fn save_up(&mut self) {
+        let Some(shape) = &self.design_shape else { return };
+        if !shape.editor {
+            if shape.up != Some(self.up) {
+                self.notice = Some(format!(
+                    "To keep this orientation, add `//! up {}` to {}.",
+                    self.up.name(),
+                    shape.path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+            }
+            return;
+        }
+        let path = shape.prims_path();
+        if let Err(e) = prims::save(&path, &shape.prims, &shape.mirror, Some(self.up)) {
+            self.notice = Some(format!("{e:#}"));
+            return;
+        }
+        self.mtimes.insert(path.clone(), mtime(&path));
+        if let Some(s) = &mut self.design_shape {
+            s.up = Some(self.up);
+            s.sidecar_up = Some(self.up);
+        }
+    }
+
     /// Save new mirror planes to the sidecar and show them (the generated code changes: a reload).
     fn set_mirror(&mut self, mirror: prims::Mirror) {
         let Some(shape) = &self.design_shape else { return };
         let path = shape.prims_path();
         let prims = if shape.editor { shape.prims.clone() } else { vec![] };
-        if let Err(e) = prims::save(&path, &prims, &mirror) {
+        if let Err(e) = prims::save(&path, &prims, &mirror, shape.sidecar_up) {
             self.notice = Some(format!("{e:#}"));
             return;
         }
@@ -2472,9 +2503,8 @@ impl App {
         if let Some(d) = self.print.decimate {
             a.extend(["--decimate".into(), fmt_num(d as f64)]);
         }
-        if self.up != Up::PlusZ {
-            a.push(format!("--up={}", self.up.name()));
-        }
+        // always: without it the file's own orientation would apply
+        a.push(format!("--up={}", self.up.name()));
         a
     }
 
@@ -2574,9 +2604,8 @@ impl App {
         if !o.overhang {
             a.push("--no-overhang".into());
         }
-        if self.up != Up::PlusZ {
-            a.push(format!("--up={}", self.up.name()));
-        }
+        // always: without it the file's own orientation would apply
+        a.push(format!("--up={}", self.up.name()));
         if o.ground != Ground::None {
             a.extend(["--ground".into(), o.ground.name().into()]);
         }
@@ -3372,7 +3401,11 @@ impl App {
                          can carry it, so the part may be a little less stiff. Kept-solid regions are \
                          printed as they are: one that overhangs still needs supports.",
                     );
+                let before = self.up;
                 up_ui(ui, &mut self.up, "opt_up");
+                if self.up != before {
+                    self.save_up();
+                }
             });
         });
         if self.design_shape.as_ref().is_some_and(|s| s.editor) && !self.opt_job.running() {
@@ -3614,8 +3647,29 @@ impl App {
         ui.add_enabled_ui(!busy, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Printed");
+                let before = self.up;
                 up_ui(ui, &mut self.up, "print_up");
+                if self.up != before {
+                    self.save_up();
+                }
             });
+            // a result is printable the way up it was optimized for
+            let made_for = self
+                .print_result
+                .then(|| self.volume.as_ref().and_then(|v| v.up()))
+                .flatten();
+            if let Some(u) = made_for.filter(|u| *u != self.up) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!("The result was optimized to print {} up.", u.name()),
+                    );
+                    if ui.small_button(format!("Print it {} up", u.name())).clicked() {
+                        self.up = u;
+                        self.save_up();
+                    }
+                });
+            }
         });
         if grid {
             match &self.volume {
@@ -4303,7 +4357,7 @@ pub struct SnapshotSetup {
     /// Print step: show the exported mesh (with its edges)
     pub mesh: bool,
     pub edges: bool,
-    pub up: Up,
+    pub up: Option<Up>,
 }
 
 /// Draw the app's window offscreen, without opening one, and save it as a PNG: for checking the
@@ -4333,7 +4387,9 @@ pub fn snapshot(
     app.opts.section = setup.section;
     app.print.show_mesh = setup.mesh;
     app.print.edges = setup.edges;
-    app.up = setup.up;
+    if let Some(u) = setup.up {
+        app.up = u;
+    }
     match setup.step.as_str() {
         "design" => {}
         "optimize" => app.set_step(Step::Optimize),

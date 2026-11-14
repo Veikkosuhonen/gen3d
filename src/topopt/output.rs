@@ -65,6 +65,8 @@ struct Grid {
     /// displacement is combined from its parts in the groups (`Snapshot::disps` is per group, per
     /// case)
     sym: Option<Sym>,
+    /// the print orientation, recorded in the file
+    up: crate::mesh::Up,
 }
 
 /// One iteration's output fields (`filtered`, `energy` and `disps` empty for a density-only
@@ -92,6 +94,7 @@ impl Grid {
             origin,
             h: p.h,
             sym: m.sym.clone(),
+            up: crate::mesh::Up::PlusZ,
             names: p
                 .cases
                 .iter()
@@ -159,7 +162,14 @@ impl Grid {
                 data,
             });
         }
-        crate::vti::write_grid(out, self.origin, self.h, self.n.map(|v| v + 1), &arrays)
+        crate::vti::write_grid(
+            out,
+            self.origin,
+            self.h,
+            self.n.map(|v| v + 1),
+            &arrays,
+            &[(crate::volume::PRINT_UP, &self.up.vector())],
+        )
     }
 
     /// The density averaged over k³ blocks of cells, on a grid k× coarser.
@@ -188,6 +198,7 @@ impl Grid {
             h: self.h * k as f64,
             names: vec![],
             sym: None,
+            up: self.up,
         };
         (g, out)
     }
@@ -205,7 +216,8 @@ pub(super) struct Output {
 }
 
 impl Output {
-    pub(super) fn new(m: &Model, path: &Path) -> Output {
+    /// `up`: the print orientation, recorded in the file (`volume::PRINT_UP`).
+    pub(super) fn new(m: &Model, path: &Path, up: crate::mesh::Up) -> Output {
         let grid = Grid::of(m);
         let ne: usize = grid.n.iter().product();
         let k = if ne > PREVIEW_CELLS {
@@ -218,6 +230,7 @@ impl Output {
                 "live preview: density averaged over {k}x{k}x{k} blocks; the full fields are written at the end (or on Stop)"
             );
         }
+        let grid = Grid { up, ..grid };
         Output {
             grid,
             path: path.to_path_buf(),
@@ -314,6 +327,7 @@ mod tests {
             h: 0.5,
             names: vec![],
             sym: None,
+            up: crate::mesh::Up::PlusZ,
         };
         let d: Vec<f32> = (0..30).map(|i| i as f32).collect();
         let (c, v) = g.decimate(&d, 2);

@@ -8,20 +8,28 @@ use anyhow::{Context, Result, bail};
 
 /// The side of the part that faces up on the printer (`--up`): the build direction. Axis-aligned, so
 /// the optimizer's layers are voxel layers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+/// Saved with the shape (`"up"` in the sidecar, `//! up` in a script) and in an optimizer result
+/// (`print_up`, see `Up::vector`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum Up {
     #[default]
     #[value(name = "+z")]
+    #[serde(rename = "+z")]
     PlusZ,
     #[value(name = "-z")]
+    #[serde(rename = "-z")]
     MinusZ,
     #[value(name = "+x")]
+    #[serde(rename = "+x")]
     PlusX,
     #[value(name = "-x")]
+    #[serde(rename = "-x")]
     MinusX,
     #[value(name = "+y")]
+    #[serde(rename = "+y")]
     PlusY,
     #[value(name = "-y")]
+    #[serde(rename = "-y")]
     MinusY,
 }
 
@@ -37,6 +45,34 @@ impl Up {
             Up::PlusY => "+y",
             Up::MinusY => "-y",
         }
+    }
+
+    /// From its name (`+z`, `-x`, ...; the sign may be left off for +).
+    pub fn parse(s: &str) -> Option<Up> {
+        let s = s.trim().to_lowercase();
+        let s = if s.len() == 1 { format!("+{s}") } else { s };
+        Up::ALL.into_iter().find(|u| u.name() == s)
+    }
+
+    /// The up direction as a unit vector (how a result records it).
+    pub fn vector(self) -> [f32; 3] {
+        let mut v = [0.0; 3];
+        v[self.axis()] = if self.negative() { -1.0 } else { 1.0 };
+        v
+    }
+
+    /// The direction closest to `v` (None for a zero or non-finite vector).
+    pub fn from_vector(v: [f32; 3]) -> Option<Up> {
+        if !v.iter().all(|c| c.is_finite()) {
+            return None;
+        }
+        let a = (0..3).max_by(|&i, &j| v[i].abs().total_cmp(&v[j].abs()))?;
+        if v[a] == 0.0 {
+            return None;
+        }
+        Up::ALL
+            .into_iter()
+            .find(|u| u.axis() == a && u.negative() == (v[a] < 0.0))
     }
 
     /// The build axis (0 x, 1 y, 2 z).

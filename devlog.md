@@ -3,6 +3,40 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Save the print orientation with the shape and the result
+
+**Why:** the print orientation was a session setting: reopening the app reset it to +z, the CLI
+needed `--up` on every command, and Print could mesh a result another way up than it was optimized
+for.
+
+**What:**
+- Shape: `Shape::up` from the sidecar's `"up"` (editor shapes; the app saves the selector there at
+  once) or a `//! up -x` directive (script shapes; the app shows the line to add, rather than turning
+  the script into an editor shape). `sidecar_up` keeps a directive from being copied into the sidecar
+  when primitives are saved.
+- Result: the optimizer records it in the `.vti` as FieldData `print_up` (the up vector, ascii; VTK
+  and ParaView read it). `vti::write_grid` takes field arrays, the reader returns them, and
+  `Volume::up` / the volume's `Shape::up` give it back.
+- CLI: `--up` is optional. `optimize` defaults to the shape's, `export` / `slice` / `open` to the
+  shape's or the result's (saying so), else +z.
+- App: the selector loads from the shape on open and reload. Optimize and Print always pass `--up`,
+  and Print warns, with a one-click fix, when the result was optimized for another side up.
+- Fix: the AM filter's smooth minimum could round to -4e-8 in f32, and a `density` with any value below
+  0 was taken for a signed distance (threshold 0, nothing inside). That broke exporting an
+  early-stopped result. The smooth minimum is now clamped at 0 (CPU and GPU), and arrays named
+  *density* are never taken for distances.
+
+**Result:** a script with `//! up +x`: `optimize` prints along +x, the result records `1 0 0`, and
+`export result.vti` gives the upright part (40.3 × 24.3 × 79.5 mm) with no flags. `--up=+z` keeps the
+modelled orientation.
+
+**Verified:** `mirrored_primitives` (the sidecar round-trips `"up"`, the shape loads it),
+`optimizer_result_threshold_and_orientation` (a density a hair below 0 keeps threshold 0.5, the
+result's `print_up` comes back), `write_grid_round_trips` (FieldData). Optimize opening at the
+script's +x, and Print's warning, checked with `snapshot`. All tests pass; clippy clean.
+
+**Still open:** —
+
 ## 2026-11-14: Choose the print orientation
 
 **Why:** overhang control printed along +z only, as the shape is modelled. A part is often better
