@@ -3,6 +3,45 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Draw the viewport on demand
+
+**Why:** the window redrew every frame: `RedrawRequested` drew a frame and requested the next one, so
+the app raymarched the preview at the display's refresh rate even when nothing changed. Idle, it
+kept the GPU at 100% utilization, competing with optimizer jobs for the same GPU.
+
+**What:**
+- Frames on demand: a frame is drawn after input that egui wants repainted, when egui asks for one
+  (its animations, the job spinner, tooltips), when the 250 ms poll sees a change (a reloaded file,
+  the shown file switching, a job starting or ending, the mesh to show changing on disk), while a
+  pipeline compiles (to pick it up), and continuously while the preview animates.
+  `App::schedule` sets the next frame after each one; `about_to_wait` waits until it or the next
+  poll.
+- egui-winit answers `repaint: true` to every event, the redraw itself included, so that response
+  is ignored for `RedrawRequested` (otherwise each frame requests the next).
+- The viewport (drawn into its own texture, which egui shows) is re-rendered only when its view
+  uniforms (camera, options, size, field mask) differ from those of the image it holds, or when
+  `Win::touch` marked it out of date: the pipeline, live parameters, editor primitives, volume
+  buffers, the shown mesh or the target size changed. UI-only frames reuse the image.
+- The preview's time uniform advances only while it animates (a shown vector field overlay: the
+  moving load-direction bands), so a still view keeps identical uniforms.
+- The fps readout counts viewport renders and shows only while the viewport redraws.
+
+**Result** (GPU utilization from `ioreg`, idle window, 6 samples; baseline without the app 0–4%):
+
+| | before | after |
+|---|---|---|
+| gyroid_cube (no overlays) | 100% | 0–4% |
+| vase | 100% | 0–4% |
+| bracket_editor (load bands animate) | 100% | 100% |
+
+**Verified:** idle measurements above; the offscreen snapshot still draws the preview; tests pass
+(except the known `shapes_with_primitives_compile`); clippy clean. Interaction (orbit, zoom,
+parameter sliders, editing primitives, the optimizer's live result) needs a check by hand: each
+goes through egui input or `touch`.
+
+**Still open:** the animated load bands keep the viewport redrawing at the refresh rate in the
+Design step of any shape with loads.
+
 ## 2026-11-14: Stop and resume an optimization
 
 **Why:** Stop kept the current design but threw away the run: optimizing again started from scratch.

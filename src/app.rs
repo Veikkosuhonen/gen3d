@@ -291,6 +291,12 @@ struct Win {
     /// mesh drawing, made when a mesh is first shown
     meshr: Option<crate::meshview::MeshRenderer>,
     mesh: Option<ShownMesh>,
+    /// The viewport image is out of date: something it shows changed on the GPU (pipeline,
+    /// parameters, primitives, volume, mesh, target size). Changes to the view uniforms (camera,
+    /// options) are found by comparing them with `drawn`.
+    dirty: std::cell::Cell<bool>,
+    /// the view uniforms of the image in the viewport target
+    drawn: Vec<u8>,
 }
 
 impl Win {
@@ -325,7 +331,14 @@ impl Win {
             title: String::new(),
             meshr: None,
             mesh: None,
+            dirty: std::cell::Cell::new(true),
+            drawn: vec![],
         }
+    }
+
+    /// The viewport image must be redrawn (see `dirty`).
+    fn touch(&self) {
+        self.dirty.set(true);
     }
 }
 
@@ -398,7 +411,10 @@ struct App {
     gpu_solver: bool,
     win: Option<Win>,
     last_poll: Instant,
-    frames: u32,
+    /// when the next frame is due (None: only on input or a change)
+    next_frame: Option<Instant>,
+    /// viewport renders since `fps_t`, and their rate (shown while the viewport redraws)
+    preview_frames: u32,
     fps: f32,
     fps_t: Instant,
 }
@@ -919,7 +935,8 @@ impl App {
             gpu_solver: true,
             win: None,
             last_poll: Instant::now(),
-            frames: 0,
+            next_frame: None,
+            preview_frames: 0,
             fps: 0.0,
             fps_t: Instant::now(),
         }
@@ -964,6 +981,7 @@ impl App {
         if let Some(win) = &mut self.win {
             win.pipeline = None;
             win.module = None;
+            win.touch();
             self.reload(true);
         }
     }
@@ -1140,6 +1158,7 @@ impl App {
             Ok((m, p, b, live, constants)) => {
                 win.module = Some(m);
                 win.pipeline = Some(p);
+                win.touch();
                 win.vol = b.vol;
                 win.ed = b.ed;
                 win.par = b.par;
@@ -1197,6 +1216,7 @@ impl App {
             && let Some(g) = &win.vol
         {
             g.upload(&win.gpu, &v);
+            win.touch();
         }
         self.volume = Some(v);
     }
@@ -1209,6 +1229,7 @@ impl App {
             && let Some(g) = &win.vol
         {
             g.upload_uniforms(&win.gpu, v);
+            win.touch();
         }
     }
 
@@ -1260,6 +1281,7 @@ impl App {
         if let Some(buf) = &win.par {
             let data = crate::shape::param_data(&win.live, &self.params, &self.defines);
             win.gpu.queue.write_buffer(buf, 0, bytemuck::cast_slice(&data));
+            win.touch();
         }
         if compiled_defines(&self.defines, &win.live) != self.built_defines {
             self.request_rebuild();
@@ -1283,6 +1305,7 @@ impl App {
                 Ok(p) => {
                     if let Some(win) = &mut self.win {
                         win.pipeline = Some(p);
+                        win.touch();
                     }
                     self.param_error = None;
                 }
@@ -1337,6 +1360,7 @@ impl App {
             && buf.size() == (data.len() * 16) as u64
         {
             win.gpu.queue.write_buffer(buf, 0, bytemuck::cast_slice(&data));
+            win.touch();
         }
     }
 
@@ -2207,7 +2231,9 @@ impl App {
         let job = self.out_job.get();
         let Some(win) = &mut self.win else { return };
         let Some(path) = want else {
-            win.mesh = None;
+            if win.mesh.take().is_some() {
+                win.touch();
+            }
             return;
         };
         if job.running && job.target == path {
@@ -2217,6 +2243,7 @@ impl App {
         if win.mesh.as_ref().is_some_and(|s| s.path == path && s.mtime == m) {
             return;
         }
+        win.touch();
         if win.meshr.is_none() {
             match crate::meshview::MeshRenderer::new(&win.gpu, VIEW_FORMAT, &win.ubuf) {
                 Ok(r) => win.meshr = Some(r),
@@ -2764,9 +2791,13 @@ impl App {
             egui::FontId::proportional(13.0),
             egui::Color32::from_white_alpha(170),
         );
-        let mut info = vec![format!("{:.0} fps", self.fps)];
+        // the viewport's own redraw rate: shown while it redraws (it is drawn only on changes)
+        let mut info = vec![];
         if self.rebuild.is_some() {
-            info.insert(0, "compiling…".into());
+            info.push("compiling…".to_string());
+        }
+        if self.fps > 0.0 {
+            info.push(format!("{:.0} fps", self.fps));
         }
         painter.text(
             rect.right_top() + egui::vec2(-10.0, 8.0),
@@ -3698,7 +3729,10 @@ impl App {
             self.sync_params();
         }
         self.poll_rebuild();
-        self.opts.time = self.start.elapsed().as_secs_f32();
+        // time only moves while something animates, so a still view keeps identical uniforms
+        if self.animating() {
+            self.opts.time = self.start.elapsed().as_secs_f32();
+        }
         Some(out)
     }
 
@@ -3720,6 +3754,7 @@ impl App {
             return;
         };
         if win.viewport.size != self.view_px {
+            win.touch();
             win.viewport.size = self.view_px;
             win.viewport.view = Viewport::target(&win.gpu, self.view_px);
             win.renderer.update_egui_texture_from_wgpu_texture(
@@ -3729,25 +3764,33 @@ impl App {
                 win.viewport.id,
             );
         }
+        // the viewport is drawn into its own texture, which egui shows: redrawn only when what it
+        // shows changed, so UI-only frames (hover, the job spinner) don't raymarch the preview
         let mesh = win.mesh.as_ref().and_then(|m| m.gpu.as_ref().ok());
-        let preview = match (mesh, &mut win.meshr) {
-            (Some(m), Some(r)) => {
-                let u = crate::viewer::ViewUniforms::for_mesh(
-                    self.shape.bounds,
-                    &self.cam,
-                    win.viewport.size,
-                    true,
-                    self.print.edges,
-                );
-                win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
-                r.draw(&win.gpu, m, &win.viewport.view, win.viewport.size)
-            }
-            _ => {
-                let u = uniforms(&self.shape, &self.cam, &self.opts, win.viewport.size, true);
-                win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
-                draw(&win.gpu, win.pipeline.as_ref(), &win.viewport.view)
-            }
+        let shown_mesh = mesh.is_some() && win.meshr.is_some();
+        let u = if shown_mesh {
+            crate::viewer::ViewUniforms::for_mesh(
+                self.shape.bounds,
+                &self.cam,
+                win.viewport.size,
+                true,
+                self.print.edges,
+            )
+        } else {
+            uniforms(&self.shape, &self.cam, &self.opts, win.viewport.size, true)
         };
+        let mut key = bytemuck::bytes_of(&u).to_vec();
+        key.push(shown_mesh as u8);
+        let preview = (win.dirty.get() || key != win.drawn).then(|| {
+            win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
+            win.dirty.set(false);
+            win.drawn = key;
+            self.preview_frames += 1;
+            match (mesh, &mut win.meshr) {
+                (Some(m), Some(r)) => r.draw(&win.gpu, m, &win.viewport.view, win.viewport.size),
+                _ => draw(&win.gpu, win.pipeline.as_ref(), &win.viewport.view),
+            }
+        });
 
         let (device, queue) = (&win.gpu.device, &win.gpu.queue);
         let jobs = win
@@ -3777,8 +3820,56 @@ impl App {
                 .forget_lifetime();
             win.renderer.render(&mut pass, &jobs, &screen);
         }
-        queue.submit(std::iter::once(preview).chain(extra).chain([enc.finish()]));
+        queue.submit(preview.into_iter().chain(extra).chain([enc.finish()]));
         free.iter().for_each(|id| win.renderer.free_texture(id));
+    }
+
+    /// Whether the preview animates: the moving bands of a shown vector field overlay (the load
+    /// directions). Only then does its time uniform advance and the viewport redraw continuously.
+    fn animating(&self) -> bool {
+        let mesh_shown = self
+            .win
+            .as_ref()
+            .is_some_and(|w| w.meshr.is_some() && w.mesh.as_ref().is_some_and(|m| m.gpu.is_ok()));
+        !mesh_shown
+            && self
+                .fields
+                .iter()
+                .enumerate()
+                .any(|(i, f)| f.comps == 3 && i < 32 && self.opts.fields >> i & 1 == 1)
+    }
+
+    /// Decide when the next frame is due after one was drawn: egui's request, continuously while
+    /// the preview animates, soon while a pipeline compiles (to pick it up), and once more after
+    /// the viewport stops redrawing (so the fps readout clears). Otherwise frames come only from
+    /// input and from the file/job polling in `about_to_wait`.
+    fn schedule(&mut self, egui_delay: Duration) {
+        let now = Instant::now();
+        let mut next = (egui_delay < Duration::from_secs(3600)).then(|| now + egui_delay);
+        let mut at = |t: Instant| next = Some(next.map_or(t, |n| n.min(t)));
+        if self.animating() {
+            at(now);
+        }
+        if self.rebuild.is_some() {
+            at(now + Duration::from_millis(30));
+        }
+        if self.fps > 0.0 {
+            at(self.fps_t + Duration::from_millis(500));
+        }
+        self.next_frame = next;
+    }
+
+    /// What the 250 ms poll watches besides the shown files: jobs starting or ending, and the
+    /// mesh to show (an export finishing, or the file changing on disk).
+    fn watch_state(&self) -> (bool, bool, Option<(PathBuf, Option<SystemTime>)>) {
+        (
+            self.out_job.running(),
+            self.opt_job.running(),
+            self.wanted_mesh().map(|p| {
+                let m = mtime(&p);
+                (p, m)
+            }),
+        )
     }
 
     fn request_redraw(&self) {
@@ -3793,6 +3884,12 @@ impl App {
         };
         let raw = os.egui_state.take_egui_input(&os.window);
         let Some(mut out) = self.run_ui(raw) else { return };
+        // egui's next repaint: now for animations and the job spinner, later for tooltips, never
+        // when idle
+        let repaint_delay = out
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |v| v.repaint_delay);
         let title = match &self.design {
             Some(d) => format!("gen3d — {}", file_name(d)),
             None => "gen3d".into(),
@@ -3820,13 +3917,13 @@ impl App {
         window.pre_present_notify();
         gpu.queue.present(frame);
 
-        self.frames += 1;
         let dt = self.fps_t.elapsed().as_secs_f32();
         if dt >= 0.5 {
-            self.fps = self.frames as f32 / dt;
-            self.frames = 0;
+            self.fps = self.preview_frames as f32 / dt;
+            self.preview_frames = 0;
             self.fps_t = Instant::now();
         }
+        self.schedule(repaint_delay);
     }
 
     fn open_window(&mut self, el: &ActiveEventLoop) -> Result<Win> {
@@ -3941,13 +4038,18 @@ impl ApplicationHandler for App {
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(win) = &mut self.win else { return };
         let Some(os) = &mut win.os else { return };
-        let _ = os.egui_state.on_window_event(&os.window, &event);
+        let response = os.egui_state.on_window_event(&os.window, &event);
+        // (egui asks to repaint after any event, the redraw itself included: that would loop)
+        if response.repaint && !matches!(event, WindowEvent::RedrawRequested) {
+            os.window.request_redraw();
+        }
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(size) => {
                 os.config.width = size.width.max(1);
                 os.config.height = size.height.max(1);
                 os.surface.configure(&win.gpu.device, &os.config);
+                os.window.request_redraw();
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
@@ -3960,28 +4062,40 @@ impl ApplicationHandler for App {
                     && !ctrl
                 {
                     self.on_key(code);
+                    self.request_redraw();
                 }
             }
-            WindowEvent::RedrawRequested => {
-                self.frame();
-                self.request_redraw();
-            }
+            // drawn on demand: `frame` schedules the next one (see `schedule`)
+            WindowEvent::RedrawRequested => self.frame(),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let now = Instant::now();
-        if now - self.last_poll > Duration::from_millis(250) {
+        let poll = Duration::from_millis(250);
+        if now - self.last_poll > poll {
             self.last_poll = now;
+            let before = (self.shown.clone(), self.watch_state());
             // a result appearing (first iteration of an optimization) or vanishing switches the view
             self.sync_shown();
+            let mut changed = false;
             if self.mtimes.iter().any(|(f, m)| mtime(f) != *m) {
                 std::thread::sleep(Duration::from_millis(50)); // let editors finish writing
                 self.reload(false);
+                changed = true;
+            }
+            if changed || before != (self.shown.clone(), self.watch_state()) {
+                self.request_redraw();
             }
         }
-        el.set_control_flow(ControlFlow::WaitUntil(now + Duration::from_millis(250)));
+        if self.next_frame.is_some_and(|t| t <= now) {
+            self.next_frame = None;
+            self.request_redraw();
+        }
+        let wake = self.last_poll + poll;
+        let wake = self.next_frame.map_or(wake, |t| t.min(wake));
+        el.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }
 
