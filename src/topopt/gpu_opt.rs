@@ -12,7 +12,7 @@ use super::gpu_engine::{Engine, NONE, Params, Reduce, Step, dims4, threads};
 use super::gpu_mg::{GpuMg, MAXD};
 use super::mg::MgSettings;
 use super::output::{self, Output, Snapshot};
-use super::{CG_MAXIT, Control, IterStats, LoadBasis, Next, Outcome, Problem, Settings, Stage};
+use super::{CG_MAXIT, IterStats, LoadBasis, LoopState, Next, Outcome, Problem, Settings, Stage};
 use crate::gpu::Gpu;
 
 /// Re-estimate the smoothers' λmax at least every this many optimizer iterations.
@@ -70,7 +70,9 @@ pub(super) fn optimize_gpu(
     let oom = |err: anyhow::Error| {
         anyhow::anyhow!("{err}: {elements:.1}M elements don't fit on this GPU; use a larger --voxel")
     };
-    let mg = gpu.alloc_scoped(|| GpuMg::new(&e, p, basis, &ke, &free, ms)).map_err(oom)??;
+    let mg = gpu
+        .alloc_scoped(|| GpuMg::new(&e, p, basis, &ke, &free, ms))
+        .map_err(oom)??;
     let c = mg.coarsest();
     println!(
         "GPU multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
@@ -234,7 +236,7 @@ pub(super) fn optimize_gpu(
         }
     );
     let t_start = Instant::now();
-    let mut control = Control::default();
+    let mut control = stage.state.control.clone();
     let mut output = Output::new(p, out);
     let mut result = Outcome {
         iterations: 0,
@@ -242,11 +244,14 @@ pub(super) fn optimize_gpu(
         max_disp: 0.0,
         stats: vec![],
         design: vec![],
+        beta: 0.0,
+        state: LoopState::default(),
+        stopped: false,
     };
     // the last iteration whose fields are not written yet
     let mut pending = false;
-    let mut lambda = 1.0f64;
-    let mut last_change = 1.0f64;
+    let mut lambda = stage.state.lambda;
+    let mut last_change = stage.state.last_change;
     let target = s.volfrac * ndesign as f64;
     // optimizer iterations since the smoothers' λmax was estimated (None: estimate next time)
     let mut estimate_age: Option<usize> = None;
@@ -374,10 +379,6 @@ pub(super) fn optimize_gpu(
         result.compliance = compliance;
         result.max_disp = max_disp;
         result.stats.push(st);
-        if output::stop_requested() {
-            println!("stopped: writing the result of iteration {}", stage.it0 + it);
-            break;
-        }
         match control.next(s, beta, compliance, change) {
             Next::Go => {}
             Next::Beta(b) => {
@@ -389,7 +390,19 @@ pub(super) fn optimize_gpu(
             }
             Next::Stop => break,
         }
+        // after the stopping rule, so a resumed run continues exactly where this one would have
+        if output::stop_requested() {
+            println!("stopped: writing the result of iteration {}", stage.it0 + it);
+            result.stopped = true;
+            break;
+        }
     }
+    result.beta = beta;
+    result.state = LoopState {
+        control,
+        lambda,
+        last_change,
+    };
     if pending {
         output.finish(snapshot()?)?;
     } else {
@@ -481,7 +494,12 @@ mod tests {
             let gpu_r = optimize(&p, &settings(Solver::Gpu(ms)), &dir.join("gpu.vti"), Some(&gpu)).unwrap();
             assert_eq!(cpu.iterations, gpu_r.iterations);
             let rel = (cpu.max_disp - gpu_r.max_disp).abs() / cpu.max_disp;
-            assert!(rel < 2e-3, "max displacement {} (CPU) vs {} (GPU)", cpu.max_disp, gpu_r.max_disp);
+            assert!(
+                rel < 2e-3,
+                "max displacement {} (CPU) vs {} (GPU)",
+                cpu.max_disp,
+                gpu_r.max_disp
+            );
             for (it, (a, b)) in cpu.stats.iter().zip(&gpu_r.stats).enumerate() {
                 let rel = (a.compliance - b.compliance).abs() / a.compliance;
                 assert!(
@@ -501,12 +519,18 @@ mod tests {
             assert!(diff < 0.05, "beta_max {beta_max}: density differs by {diff}");
             // and the combined case's displacement
             let disp = |v: &crate::vti::VtiFile| {
-                v.arrays.iter().find(|a| a.name == "displacement_3").map(|a| a.data.clone())
+                v.arrays
+                    .iter()
+                    .find(|a| a.name == "displacement_3")
+                    .map(|a| a.data.clone())
             };
             let (a, b) = (disp(&c).unwrap(), disp(&g).unwrap());
             let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs()));
             let diff = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-            assert!(diff < 1e-2 * scale, "beta_max {beta_max}: case 3 displacement differs by {diff}");
+            assert!(
+                diff < 1e-2 * scale,
+                "beta_max {beta_max}: case 3 displacement differs by {diff}"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }

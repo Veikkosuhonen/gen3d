@@ -206,7 +206,7 @@ gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
 gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
-gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--modulus MPA] [--nu V] [-o out.vti]
+gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--modulus MPA] [--nu V] [-o out.vti] [--resume]
 
 .vti options (render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
@@ -373,6 +373,13 @@ at most ~10% of the time; every iteration on small grids), so you watch the desi
 over 4M elements the live file is a preview: the density averaged over k×k×k blocks. The full fields
 come at the end. **Stop** finishes the current iteration and writes its full result (stopping twice
 ends it at once).
+
+A run stopped before it converges also leaves a checkpoint next to the result (`NAME_topopt.vti.resume`:
+the design variables, β, the iteration count and the stopping rule's state). **Resume** in the app, or
+`--resume` with the same settings on the command line, continues the run where it would have gone on:
+the iterations and the final design match an uninterrupted run. A different shape or setting is
+refused with the difference shown; `--iters` (still counted from the run's start), the solver and its
+tolerance may change. A run that finishes, or a fresh one (**Start over**), removes the checkpoint.
 
 - **Output:** cell arrays `density` (0..1) and `energy` (strain energy density, MPa: where the part
   works hardest), and point array `displacement` (mm). Colour by `energy` or `displacement` to see how

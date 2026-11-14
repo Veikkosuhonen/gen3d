@@ -27,12 +27,14 @@ use std::time::Instant;
 
 use anyhow::{Result, bail};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::gpu::Gpu;
 use crate::mesher::{Grid, sample_field};
 use crate::shape::Shape;
 use output::Snapshot;
 
+mod checkpoint;
 mod gpu_engine;
 mod gpu_mg;
 mod gpu_opt;
@@ -268,9 +270,7 @@ impl LoadBasis {
 fn solve_dense(m: &mut [Vec<f64>]) -> Vec<f64> {
     let k = m.len();
     for i in 0..k {
-        let piv = (i..k)
-            .max_by(|&a, &b| m[a][i].abs().total_cmp(&m[b][i].abs()))
-            .unwrap();
+        let piv = (i..k).max_by(|&a, &b| m[a][i].abs().total_cmp(&m[b][i].abs())).unwrap();
         m.swap(i, piv);
         for r in i + 1..k {
             let f = m[r][i] / m[i][i];
@@ -1031,6 +1031,33 @@ pub struct Outcome {
     pub stats: Vec<IterStats>,
     /// the design variables x after the last update, per element
     pub design: Vec<f64>,
+    /// the projection's β for the next iteration
+    pub beta: f64,
+    /// the loop's state for the next iteration (to resume a stopped run)
+    pub(crate) state: LoopState,
+    /// Stop was requested: the run ended before converging
+    pub stopped: bool,
+}
+
+/// What an optimizer loop carries from one iteration to the next besides the design: enough to
+/// resume a stopped run where it would have continued.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct LoopState {
+    control: Control,
+    /// OC's Lagrange multiplier (the next bisection brackets it)
+    lambda: f64,
+    /// the last maximum density change (sets the adaptive CG tolerance)
+    last_change: f64,
+}
+
+impl Default for LoopState {
+    fn default() -> Self {
+        LoopState {
+            control: Control::default(),
+            lambda: 1.0,
+            last_change: 1.0,
+        }
+    }
 }
 
 /// Where an optimizer stage starts, and how it reports.
@@ -1042,6 +1069,8 @@ pub(crate) struct Stage {
     it0: usize,
     /// an earlier stage: no "done" line (the app reads it as the end of the run)
     quiet: bool,
+    /// the loop's state (resuming a stopped run; otherwise fresh)
+    state: LoopState,
 }
 
 const CG_MAXIT: usize = 20_000;
@@ -1056,6 +1085,11 @@ pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Res
     optimize_stage(p, s, out, gpu, &Stage::default())
 }
 
+/// The checkpoint a stopped run writing `out` leaves (it exists while there is a run to resume).
+pub fn resume_path(out: &Path) -> std::path::PathBuf {
+    checkpoint::path(out)
+}
+
 /// Fewest domain elements of the coarse grid for a coarse start. Below this the coarse grid loses
 /// thin features, and supports and loads (1.5 elements thick) get much thicker than on the fine grid.
 const COARSE_MIN_ELEMENTS: usize = 10_000;
@@ -1066,40 +1100,91 @@ const COARSE_MIN_ELEMENTS: usize = 10_000;
 /// half the iterations) runs on a grid of twice the element size first: 1/8 of the elements, until
 /// its compliance stalls. The fine grid then starts from that design (interpolated) at β = 2. The
 /// filter radius stays `rmin` voxels on both grids, so it is twice as wide on the coarse one.
-pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu) -> Result<Outcome> {
+pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> Result<Outcome> {
+    let t_start = Instant::now();
+    let ck = if resume {
+        Some(checkpoint::read(out, s)?)
+    } else {
+        checkpoint::remove(out);
+        None
+    };
     let fine = setup(shape, s, gpu)?;
     let ndomain = fine.domain.iter().filter(|d| **d).count();
-    if !s.coarse_start || s.beta_max <= 1.0 || ndomain / 8 < COARSE_MIN_ELEMENTS {
-        return optimize(&fine, s, out, Some(gpu));
-    }
-    let t_start = Instant::now();
-    let cs = Settings {
-        voxel: 2.0 * s.voxel,
-        beta_max: 1.0,
-        ..s.clone()
-    };
-    println!("coarse start: the beta 1 stage at {:.3} mm", cs.voxel);
-    let coarse = setup(shape, &cs, gpu)?;
-    let rc = optimize_stage(&coarse, &cs, out, Some(gpu), &Stage { quiet: true, ..Default::default() })?;
-    if output::stop_requested() {
-        print_done(&rc, t_start, out);
-        return Ok(rc);
-    }
-    let x = prolong_design(&coarse, &rc.design, &fine, s.volfrac);
-    println!("fine grid: continuing from the coarse design");
-    let stage = Stage {
-        start: Some((x, 2.0)),
-        it0: rc.iterations,
-        quiet: true,
+    let coarse_start = s.coarse_start && s.beta_max > 1.0 && ndomain / 8 >= COARSE_MIN_ELEMENTS;
+    let resumed = |c: &checkpoint::Checkpoint, p: &Problem, grid: &str| -> Result<Stage> {
+        c.check(p)?;
+        let h = &c.header;
+        println!(
+            "resuming after iteration {} ({grid} grid, beta {})",
+            h.iterations, h.beta
+        );
+        Ok(Stage {
+            start: Some((c.x.clone(), h.beta)),
+            it0: h.iterations,
+            quiet: true,
+            state: h.state.clone(),
+        })
     };
     // --iters caps the whole run
-    let fs = Settings {
-        iters: s.iters.saturating_sub(rc.iterations).max(1),
+    let left = |done: usize| Settings {
+        iters: s.iters.saturating_sub(done).max(1),
         ..s.clone()
     };
-    let mut rf = optimize_stage(&fine, &fs, out, Some(gpu), &stage)?;
-    rf.iterations += rc.iterations;
-    rf.stats.splice(0..0, rc.stats);
+    let mut earlier = vec![];
+    let stage = match &ck {
+        Some(c) if !c.header.coarse => resumed(c, &fine, "fine")?,
+        _ if coarse_start => {
+            let cs = Settings {
+                voxel: 2.0 * s.voxel,
+                beta_max: 1.0,
+                ..s.clone()
+            };
+            println!("coarse start: the beta 1 stage at {:.3} mm", cs.voxel);
+            let coarse = setup(shape, &cs, gpu)?;
+            let stage = match &ck {
+                Some(c) => resumed(c, &coarse, "coarse")?,
+                None => Stage {
+                    quiet: true,
+                    ..Default::default()
+                },
+            };
+            let cs = Settings {
+                iters: left(stage.it0).iters,
+                ..cs
+            };
+            let mut rc = optimize_stage(&coarse, &cs, out, Some(gpu), &stage)?;
+            let done = stage.it0 + rc.iterations;
+            if rc.stopped {
+                checkpoint::write(out, s, &coarse, true, done, rc.beta, &rc.state, &rc.design)?;
+                rc.iterations = done;
+                print_done(&rc, t_start, out);
+                return Ok(rc);
+            }
+            let x = prolong_design(&coarse, &rc.design, &fine, s.volfrac);
+            println!("fine grid: continuing from the coarse design");
+            earlier = rc.stats;
+            Stage {
+                start: Some((x, 2.0)),
+                it0: done,
+                quiet: true,
+                ..Default::default()
+            }
+        }
+        Some(_) => bail!("the checkpoint is from a coarse start, which no longer applies; run without --resume"),
+        None => Stage {
+            quiet: true,
+            ..Default::default()
+        },
+    };
+    let mut rf = optimize_stage(&fine, &left(stage.it0), out, Some(gpu), &stage)?;
+    let done = stage.it0 + rf.iterations;
+    if rf.stopped {
+        checkpoint::write(out, s, &fine, false, done, rf.beta, &rf.state, &rf.design)?;
+    } else {
+        checkpoint::remove(out);
+    }
+    rf.iterations = done;
+    rf.stats.splice(0..0, earlier);
     print_done(&rf, t_start, out);
     Ok(rf)
 }
@@ -1194,13 +1279,16 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
     let mut xphys = proj.densities(p, &xtilde);
     let mut us: Vec<Vec<f64>> = fs.iter().map(|f| vec![0.0; f.len()]).collect();
     let t_start = Instant::now();
-    let mut control = Control::default();
+    let mut control = stage.state.control.clone();
     let mut result = Outcome {
         iterations: 0,
         compliance: 0.0,
         max_disp: 0.0,
         stats: vec![],
         design: vec![],
+        beta: 0.0,
+        state: LoopState::default(),
+        stopped: false,
     };
     println!(
         "SIMP: volume fraction {}, penalty {}, filter radius {} voxels, E = {} MPa, nu = {}, {} load case{}, {}",
@@ -1226,8 +1314,8 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
     let mut pending: Option<Snapshot> = None;
     let mut output = output::Output::new(p, out);
     // OC's Lagrange multiplier, for the next iteration's bracket
-    let mut lambda = 1.0;
-    let mut last_change = 1.0f64;
+    let mut lambda = stage.state.lambda;
+    let mut last_change = stage.state.last_change;
     for it in 1..=s.iters {
         let t0 = Instant::now();
         let mut st = IterStats::default();
@@ -1417,10 +1505,6 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
         result.compliance = compliance;
         result.max_disp = max_disp;
         result.stats.push(st);
-        if output::stop_requested() {
-            println!("stopped: writing the result of iteration {}", stage.it0 + it);
-            break;
-        }
         match control.next(s, proj.beta, compliance, change) {
             Next::Go => {}
             Next::Beta(b) => {
@@ -1429,7 +1513,19 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
             }
             Next::Stop => break,
         }
+        // after the stopping rule, so a resumed run continues exactly where this one would have
+        if output::stop_requested() {
+            println!("stopped: writing the result of iteration {}", stage.it0 + it);
+            result.stopped = true;
+            break;
+        }
     }
+    result.beta = proj.beta;
+    result.state = LoopState {
+        control,
+        lambda,
+        last_change,
+    };
     match pending {
         Some(snap) => {
             output.finish(snap)?;
@@ -1492,7 +1588,7 @@ enum Next {
 }
 
 /// Convergence and β continuation, shared by the CPU and GPU loops.
-#[derive(Default)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 struct Control {
     stalled: usize,
     stage_its: usize,
@@ -1552,10 +1648,9 @@ impl Control {
 pub(super) mod tests {
     use super::*;
 
-    #[test]
-    fn prolonged_design_interpolates_inside_the_domain() {
-        // coarse 4x2x2 at h = 2, fine 8x4x4 at h = 1, same origin; the coarse design is a ramp in x
-        let grid = |n: [usize; 3], h: f64| Problem {
+    /// An all-domain grid with no supports or loads.
+    pub(in crate::topopt) fn grid(n: [usize; 3], h: f64) -> Problem {
+        Problem {
             n,
             h,
             origin: [0.0; 3],
@@ -1564,7 +1659,12 @@ pub(super) mod tests {
             fixed: vec![0; n.map(|v| v + 1).iter().product()],
             loads: vec![],
             cases: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn prolonged_design_interpolates_inside_the_domain() {
+        // coarse 4x2x2 at h = 2, fine 8x4x4 at h = 1, same origin; the coarse design is a ramp in x
         let mut coarse = grid([4, 2, 2], 2.0);
         let mut fine = grid([8, 4, 4], 1.0);
         let xc: Vec<f64> = (0..16).map(|e| 0.1 + 0.2 * (e % 4) as f64).collect();
@@ -1603,7 +1703,10 @@ pub(super) mod tests {
         g[1] = [1.0, 0.0, 0.0];
         g[5] = [0.5, 0.0, 0.0];
         let rocked = |s: f64| -> Vec<[f64; 3]> {
-            f.iter().zip(&g).map(|(a, b)| std::array::from_fn(|c| a[c] + s * 0.5 * b[c])).collect()
+            f.iter()
+                .zip(&g)
+                .map(|(a, b)| std::array::from_fn(|c| a[c] + s * 0.5 * b[c]))
+                .collect()
         };
         // a load on a clamped node only: no load at all
         let mut clamped = vec![[0.0; 3]; nn];

@@ -312,6 +312,10 @@ enum Cmd {
         /// output .vti (default out/NAME_topopt.vti), rewritten as it runs
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// continue a stopped run from the checkpoint it left next to the output (same settings;
+        /// --iters still counts from the run's start)
+        #[arg(long)]
+        resume: bool,
         #[command(flatten)]
         solver: SolverArgs,
     },
@@ -632,6 +636,7 @@ fn run(cli: Cli) -> Result<()> {
             modulus,
             nu,
             output,
+            resume,
             solver,
         } => {
             if viewer::is_vti(&s.shape) {
@@ -663,7 +668,7 @@ fn run(cli: Cli) -> Result<()> {
                 coarse_start: !no_coarse_start,
             };
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
-            topopt::run(&shape, &settings, &out, &gpu)?;
+            topopt::run(&shape, &settings, &out, &gpu, resume)?;
             Ok(())
         }
         Cmd::BenchTopopt {

@@ -2371,7 +2371,8 @@ impl App {
         self.out_job.start("open", a, target);
     }
 
-    fn start_optimize(&mut self) {
+    /// Start an optimization; `resume` continues the stopped run that wrote the result.
+    fn start_optimize(&mut self, resume: bool) {
         let (Some(design), Some(result), Some(shape)) = (self.design.clone(), self.result_path(), &self.design_shape)
         else {
             return;
@@ -2400,6 +2401,9 @@ impl App {
             a.extend(["--ground".into(), o.ground.name().into()]);
         }
         a.extend(["-o".into(), result.display().to_string()]);
+        if resume {
+            a.push("--resume".into());
+        }
         self.opt_job.start("optimize", a, result);
     }
 
@@ -3334,12 +3338,28 @@ impl App {
             } else {
                 "Optimize"
             };
-            if primary(ui, !busy, label)
-                .on_hover_text("runs in the background; the design forms live in the view")
-                .clicked()
-            {
-                self.start_optimize();
-            }
+            let resumable = result.as_ref().is_some_and(|r| crate::topopt::resume_path(r).exists());
+            ui.horizontal(|ui| {
+                if resumable
+                    && primary(ui, !busy, "Resume")
+                        .on_hover_text(
+                            "continue the stopped run where it left off (needs the same settings; \
+                             the iteration limit counts from the run's start)",
+                        )
+                        .clicked()
+                {
+                    self.start_optimize(true);
+                }
+                let fresh = if resumable {
+                    ui.add_enabled(!busy, egui::Button::new("Start over").min_size(egui::vec2(0.0, 26.0)))
+                        .on_hover_text("discard the stopped run and optimize from the beginning")
+                } else {
+                    primary(ui, !busy, label).on_hover_text("runs in the background; the design forms live in the view")
+                };
+                if fresh.clicked() {
+                    self.start_optimize(false);
+                }
+            });
             if busy {
                 ui.weak(format!("another optimization is running ({})", file_name(&job.target)));
             }

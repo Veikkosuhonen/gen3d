@@ -3,6 +3,45 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Stop and resume an optimization
+
+**Why:** Stop kept the current design but threw away the run: optimizing again started from scratch.
+On large grids a run takes minutes, and it is natural to stop one (to free the GPU, or to look at
+the design) and carry on later.
+
+**What:**
+- On a user Stop before convergence, `run` writes `<result>.resume` (`topopt/checkpoint.rs`): a JSON
+  header line (stage coarse/fine, grid size, settings key, problem fingerprint, iterations done, β,
+  the loop state), then x as f32 per element.
+- The loop state is what the CPU and GPU loops carry between iterations besides x: `Control` (the
+  stopping rule's counters, now serializable), OC's λ (the next bisection's bracket) and the last
+  density change (the adaptive CG tolerance). `Stage.state` starts a loop from it; `Outcome` returns
+  it with β and `stopped`.
+- The Stop check now comes after `Control::next`, so a stopped iteration still gets its β step or
+  convergence test. A run that converges in the iteration it was stopped leaves no checkpoint.
+- `--resume`: refused unless the settings key matches (voxel, volume fraction, penalty, rmin, E, ν,
+  force, β max, E_min, ground, coarse start; not iterations, tolerances or solver) and the problem
+  fingerprint (FNV-1a over grid, domain, kept regions, supports and loads) matches the grid it was
+  stopped on. A coarse-stage checkpoint resumes the coarse stage, then continues to the fine grid as
+  usual. Iteration numbering continues, and `--iters` still caps the whole run.
+- A finished run, or a run without `--resume`, removes the checkpoint.
+- App: while a checkpoint exists for the result, the Optimize step shows **Resume** (primary) and
+  **Start over** instead of Optimize.
+
+**Result** (bracket_domain, coarse start): uninterrupted 60 iterations, compliance 8.2021. Stopped at
+iteration 11 (coarse stage) and resumed: iterations 12 and 13 match the uninterrupted run exactly,
+60 iterations, 8.2020. Stopped at 41 (fine grid, β = 2) and resumed: iteration 42 within 0.01% (the
+multigrid's warm start and λmax estimate are not saved), 60 iterations, 8.2019.
+
+**Verified:** `checkpoint_round_trip` (design, β, iterations and state come back; other settings and
+another load are refused; the iteration limit may change). By hand: the runs above, `--resume`
+without a checkpoint, with `--volfrac` changed (shows both settings lines), and the app panel
+(offscreen snapshot). topopt tests pass; clippy clean.
+
+**Not done:** the solver's warm start (u per load case) isn't saved, so the first resumed iteration
+needs a few more CG iterations. Continuing a run that ended at its iteration limit (rather than
+stopped) isn't offered.
+
 ## 2026-11-14: Solve only the linearly independent load cases
 
 **Why:** on the table (`item on top` with rocking: 5 cases) the solve was 88% of the run time. A
