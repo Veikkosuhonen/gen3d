@@ -447,6 +447,8 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
   - The default element size gives about 300k elements in the bounds with the GPU solver (the bracket:
     0.64 mm, 50 iterations in 2.7 s) and 40k with the CPU ones (1.3 mm, 7.6 s). It can be finer than
     the shape's `//! voxel`, which is only its meshing and preview resolution.
+  - The grid is cropped to the design domain plus one empty cell (symmetric about mirror planes), so
+    bounds larger than the part cost nothing in the solve.
   - Per iteration on an RTX 3080: 0.14 s at 1.2M elements, 1.0 s at 9.5M, 2.7 s at 22M, 5.6 s at
     44M.
   - CPU multigrid: 7.7 s at 1.2M; the old Jacobi-preconditioned CG (`--solver jacobi`): 76 s.

@@ -3,6 +3,39 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Crop the optimizer grid to the design domain
+
+**Why:** the optimizer's grid spanned the shape's bounds, which can be much larger than the part: a
+generous `//! bounds`, a part off-centre from a mirror plane, a subtracted cut that removes most of a
+box. Empty cells still cost memory and time on the GPU (its grid is dense) and in setup.
+
+**What:** `setup` samples `map` (and `field_void`) over the bounds once, finds the cells inside the
+domain, and crops to them plus one empty cell (`crop_box`, `CROP_MARGIN`), symmetric about the middle
+on mirror axes so each plane stays the middle node layer. `field_keep`, supports and loads are then
+sampled on the cropped grid. The solver's element limit applies after cropping; sampling the bounds is
+capped at 200M cells. Coarse and fine grids are cropped separately; `prolong_design` already maps by
+position. Elements outside the domain never entered the solve, filter or volume, so the problem is
+the same.
+
+**Result** (GPU, same voxel, before → after):
+
+| Shape | Grid | Time | Compliance |
+|---|---|---|---|
+| stand_leg @ 1.9 mm | 54×106×54 → 12×106×54 | 29.0 → 12.6 s | 8.8615 → 8.8636 |
+| book_stand1 @ 3.2 mm | 63×41×95 → 63×41×74 | 13.4 → 12.4 s | 3.0212 → 3.0238 |
+| bracket_editor (auto) | 119×40×62 → 114×36×58 | 10.4 → 9.8 s | 16.951, same |
+
+The compliance differences are the GPU multigrid's hierarchy changing with the grid size, within its
+tolerance. (stand_leg's bounds were also oversized by the load-time bounds bug fixed just before.)
+
+**Verified:** `crop_box_fits_the_domain` (margin, mirror centring, empty domain);
+`setup_crops_to_the_domain` (a part in bounds ~4× too large per axis gives the same domain, supports
+and loads as with tight bounds, one empty cell around it). All tests pass.
+
+**Still open:** the automatic element size still comes from the bounds' volume, so oversized bounds
+give a coarser grid than the 300k target; getting it from the domain needs the GPU sampling before
+the size is chosen.
+
 ## 2026-11-14: Primitives-only shapes get bounds that fit them on load
 
 **Why:** a `.wgsl` without `fn map` whose `.prims.json` holds the shape should have bounds that fit

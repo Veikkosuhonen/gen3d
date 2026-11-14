@@ -478,6 +478,51 @@ fn x_fastest(v: &[f32], d: [usize; 3], comps: usize) -> Vec<f32> {
     out
 }
 
+/// The most cells `setup` samples the shape's bounds at (before cropping to the domain).
+const MAX_SAMPLED: usize = 200_000_000;
+
+/// Empty cells kept around the domain when the grid is cropped to it.
+const CROP_MARGIN: usize = 1;
+
+/// The cell range [a, b) per axis that the grid is cropped to: the cells `inside` plus
+/// `CROP_MARGIN`, symmetric about the middle on the `mirror` axes (so a mirror plane stays the
+/// middle node layer). None if nothing is inside.
+fn crop_box(inside: &[bool], n: [usize; 3], mirror: [bool; 3]) -> Option<([usize; 3], [usize; 3])> {
+    let (mut a, mut b) = (n, [0usize; 3]);
+    for (e, _) in inside.iter().enumerate().filter(|(_, i)| **i) {
+        let ijk = [e % n[0], (e / n[0]) % n[1], e / (n[0] * n[1])];
+        for k in 0..3 {
+            a[k] = a[k].min(ijk[k]);
+            b[k] = b[k].max(ijk[k] + 1);
+        }
+    }
+    if b[0] == 0 {
+        return None;
+    }
+    for k in 0..3 {
+        a[k] = a[k].saturating_sub(CROP_MARGIN);
+        b[k] = (b[k] + CROP_MARGIN).min(n[k]);
+        if mirror[k] {
+            let c = n[k] / 2;
+            let half = (c - a[k].min(c)).max(b[k].max(c) - c);
+            (a[k], b[k]) = (c - half, c + half);
+        }
+    }
+    Some((a, b))
+}
+
+/// The cells [a, b) of the x-fastest cell values `v` on an `n` grid.
+fn crop_cells(v: &[f32], n: [usize; 3], a: [usize; 3], b: [usize; 3]) -> Vec<f32> {
+    let mut out = Vec::with_capacity((0..3).map(|k| b[k] - a[k]).product());
+    for z in a[2]..b[2] {
+        for y in a[1]..b[1] {
+            let row = (z * n[1] + y) * n[0];
+            out.extend_from_slice(&v[row + a[0]..row + b[0]]);
+        }
+    }
+    out
+}
+
 /// Sample the shape's domain and boundary-condition fields on the element grid.
 pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     let h = s.voxel;
@@ -522,6 +567,46 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         n[a] = 2 * half;
         origin[a] = c - half as f64 * h;
     }
+    // the bounds are sampled once to find the domain; past this the sampling alone is too much
+    let full: usize = n.iter().product();
+    if full > MAX_SAMPLED {
+        bail!(
+            "{full} elements in the shape's bounds is too many to sample (at most {MAX_SAMPLED}); use a \
+             larger --voxel"
+        );
+    }
+    let cells_at = |n: [usize; 3], origin: [f64; 3]| Grid {
+        vol: vec![],
+        dims: n,
+        origin: origin.map(|o| o + 0.5 * h),
+        step: h,
+    };
+    let at = |grid: &Grid, func: &str| -> Result<Vec<f32>> {
+        Ok(x_fastest(&sample_field(shape, grid, func, 1, gpu)?, grid.dims, 1))
+    };
+    let inside = |sdf: &[f32], void: &Option<Vec<f32>>| -> Vec<bool> {
+        (0..sdf.len())
+            .map(|e| sdf[e] < 0.0 && void.as_ref().is_none_or(|v| v[e] >= 0.0))
+            .collect()
+    };
+    let cells = cells_at(n, origin);
+    let mut sdf = at(&cells, "map")?;
+    let mut void = field("void", 1).map(|f| at(&cells, &f.func)).transpose()?;
+    // crop the grid to the domain: empty cells only cost memory and time (the bounds can be much
+    // larger than the part, e.g. a declared `//! bounds`)
+    if let Some((a, b)) = crop_box(&inside(&sdf, &void), n, mirror) {
+        let m: [usize; 3] = std::array::from_fn(|k| b[k] - a[k]);
+        if m != n {
+            println!(
+                "grid cropped to the design domain: {}x{}x{} -> {}x{}x{}",
+                n[0], n[1], n[2], m[0], m[1], m[2]
+            );
+            sdf = crop_cells(&sdf, n, a, b);
+            void = void.map(|v| crop_cells(&v, n, a, b));
+            origin = std::array::from_fn(|k| origin[k] + a[k] as f64 * h);
+            n = m;
+        }
+    }
     let ne: usize = n.iter().product();
     // the CPU multigrid needs ~1.2 kB per element (mostly the level-1 element matrices)
     let max = match s.solver {
@@ -532,12 +617,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     if ne > max {
         bail!("{ne} elements is too many for this solver (at most {max}); use a larger --voxel");
     }
-    let cells = Grid {
-        vol: vec![],
-        dims: n,
-        origin: origin.map(|o| o + 0.5 * h),
-        step: h,
-    };
+    let cells = cells_at(n, origin);
     let pts = n.map(|v| v + 1);
     let nodes = Grid {
         vol: vec![],
@@ -545,15 +625,8 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         origin,
         step: h,
     };
-    let at_cells =
-        |func: &str| -> Result<Vec<f32>> { Ok(x_fastest(&sample_field(shape, &cells, func, 1, gpu)?, n, 1)) };
-    let sdf = at_cells("map")?;
-    let keep = field("keep", 1).map(|f| at_cells(&f.func)).transpose()?;
-    let void = field("void", 1).map(|f| at_cells(&f.func)).transpose()?;
-
-    let domain: Vec<bool> = (0..ne)
-        .map(|e| sdf[e] < 0.0 && void.as_ref().is_none_or(|v| v[e] >= 0.0))
-        .collect();
+    let keep = field("keep", 1).map(|f| at(&cells, &f.func)).transpose()?;
+    let domain = inside(&sdf, &void);
     let passive: Vec<bool> = (0..ne)
         .map(|e| domain[e] && keep.as_ref().is_some_and(|k| k[e] < 0.0))
         .collect();
@@ -1263,7 +1336,8 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
     Ok(rf)
 }
 
-/// Design variables on `fine` from those on `coarse` (same origin): trilinear in the coarse cell
+/// Design variables on `fine` from those on `coarse` (each cropped on its own, so their origins
+/// may differ): trilinear in the coarse cell
 /// centres, over the coarse domain cells only. Kept-solid elements get 1, others outside the domain 0.
 fn prolong_design(coarse: &Problem, xc: &[f64], fine: &Problem, volfrac: f64) -> Vec<f64> {
     let [cx, cy, cz] = coarse.n;
@@ -2164,6 +2238,59 @@ pub(super) mod tests {
         }
         // the shells around the holes are kept solid
         assert!(p.passive.iter().filter(|b| **b).count() > 50);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The cropped range covers the domain plus the margin, and stays centred on mirror axes.
+    #[test]
+    fn crop_box_fits_the_domain() {
+        let n = [10, 8, 6];
+        let mut inside = vec![false; 480];
+        let at = |i: usize, j: usize, k: usize| (k * 8 + j) * 10 + i;
+        inside[at(6, 5, 2)] = true;
+        inside[at(7, 6, 3)] = true;
+        assert_eq!(crop_box(&inside, n, [false; 3]), Some(([5, 4, 1], [9, 8, 5])));
+        // about the middle (x = 5, y = 4): x 5..9 -> 1..9, y 4..8 -> 0..8
+        assert_eq!(crop_box(&inside, n, [true, true, false]), Some(([1, 0, 1], [9, 8, 5])));
+        assert_eq!(crop_box(&[false; 480], n, [false; 3]), None);
+    }
+
+    /// Declared bounds much larger than the part: the grid shrinks to the part, and the problem is
+    /// the same as with tight bounds (only the origin moves).
+    #[test]
+    fn setup_crops_to_the_domain() {
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("gen3d-crop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = "fn map(p: vec3f) -> f32 {\n  \
+                    let q = abs(p - vec3f(0, 0, 5)) - vec3f(10, 3, 5);\n  \
+                    return length(max(q, vec3f(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);\n}\n\
+                    fn field_fixed(p: vec3f) -> f32 { return p.x + 9.0; }\n\
+                    fn field_load(p: vec3f) -> vec3f { if (p.x > 9.0) { return vec3f(0, 0, -1); } \
+                    return vec3f(0.0); }\n";
+        let load = |name: &str, bounds: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("//! bounds {bounds}\n{body}")).unwrap();
+            crate::shape::load_shape(&path, &[]).unwrap()
+        };
+        let s = Settings {
+            force: 10.0,
+            ..beam_settings(Solver::Jacobi)
+        };
+        let tight = setup(&load("tight.wgsl", "-10 -3 0 10 3 10"), &s, &gpu).unwrap();
+        let wide = setup(&load("wide.wgsl", "-40 -20 -10 30 25 50"), &s, &gpu).unwrap();
+        assert_eq!(tight.n, [20, 6, 10]);
+        assert_eq!(wide.n, [22, 8, 12], "the part plus one empty cell around it");
+        assert_eq!(wide.origin, [-11.0, -4.0, -1.0]);
+        let ne = |p: &Problem| p.domain.iter().filter(|d| **d).count();
+        assert_eq!(ne(&tight), ne(&wide));
+        let held = |p: &Problem| p.fixed.iter().filter(|f| **f != 0).count();
+        assert_eq!(held(&tight), held(&wide));
+        let sum = |p: &Problem| p.loads[0].iter().map(|v| v[2]).sum::<f64>();
+        assert!((sum(&tight) + 10.0).abs() < 1e-9 && (sum(&tight) - sum(&wide)).abs() < 1e-9);
         std::fs::remove_dir_all(&dir).ok();
     }
 
