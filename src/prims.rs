@@ -1048,7 +1048,8 @@ mod tests {
 
         let s = load_shape(&p, &[("R".into(), 6.0)]).unwrap();
         assert!(s.editor && s.script_map);
-        assert!(s.files.contains(&sidecar(&p)));
+        // the loader canonicalizes the path (on macOS the temp dir is a symlink into /private)
+        assert!(s.files.contains(&sidecar(&s.path)), "{:?}", s.files);
         assert!(s.bounds.1[0] > 42.0 && s.base_bounds.1[0] == 10.0, "{:?}", s.bounds);
         let names: Vec<_> = s.params().unwrap().into_iter().map(|p| p.name).collect();
         assert_eq!(names, ["R"]);
