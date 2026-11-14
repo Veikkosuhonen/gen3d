@@ -181,17 +181,19 @@ pub(super) fn optimize_gpu(
     let filter = |out: &mut Vec<Step>, mode: u32, inp: &wgpu::Buffer, outp: &wgpu::Buffer| {
         elem(out, "filter", rmin, [0, mode, mirror, 0], &[&f.flags, inp, outp])
     };
-    // the AM filter, one layer per step: forward from the plate up, the chain rule from the top down
-    let am = s.overhang.then(|| super::overhang::Am::new(p, m.mirror_axes()));
-    let layer = p.n[0] * p.n[1];
-    let am_params = |k: usize| Params {
-        n: dims4(p.n),
-        m: [
-            layer as u32,
-            k as u32,
-            mirror & 3,
-            am.as_ref().map_or(0, |a| a.base as u32),
-        ],
+    // the AM filter, one layer per step: forward from the plate up, the chain rule from the top down.
+    // n.w: the build axis, | 4 when built towards its negative side
+    let am = s.overhang.then(|| super::overhang::Am::new(p, m.mirror_axes(), s.up));
+    let [l0, l1] = s.up.lateral();
+    let layer = p.n[l0] * p.n[l1];
+    let layers = p.n[s.up.axis()];
+    let am_params = |l: usize| Params {
+        n: {
+            let mut n = dims4(p.n);
+            n[3] = s.up.axis() as u32 | (s.up.negative() as u32) << 2;
+            n
+        },
+        m: [layer as u32, l as u32, mirror, am.as_ref().map_or(0, |a| a.base as u32)],
         f: {
             let q = super::overhang::q();
             let pw = super::overhang::P;
@@ -210,11 +212,11 @@ pub(super) fn optimize_gpu(
     let densities = |out: &mut Vec<Step>, xin: &wgpu::Buffer| {
         filter(out, 1, xin, &f.xtilde);
         if let Some(a) = &f.am {
-            for k in 0..p.n[2] {
+            for l in 0..layers {
                 e.step(
                     out,
                     "am_fwd",
-                    am_params(k),
+                    am_params(l),
                     &[&f.flags, &f.xtilde, &a.xhat, &a.mr],
                     threads(layer),
                 );
@@ -258,11 +260,11 @@ pub(super) fn optimize_gpu(
         &[&f.flags, &f.xphys, xhat, &mg.ce, &e.scalars, &f.xnew, &f.dvs],
     );
     if let Some(a) = &f.am {
-        for k in (0..p.n[2]).rev() {
+        for l in (0..layers).rev() {
             e.step(
                 &mut prog_sens,
                 "am_adj",
-                am_params(k),
+                am_params(l),
                 &[&f.flags, &f.xtilde, &a.xhat, &a.mr, &f.xnew, &f.dvs, &a.cc, &a.cv],
                 threads(layer),
             );
@@ -529,8 +531,8 @@ pub(super) fn optimize_gpu(
             break;
         }
     }
-    if !m.mirror_axes()[2] {
-        let am = super::overhang::Am::new(p, m.mirror_axes());
+    if !m.mirror_axes()[s.up.axis()] {
+        let am = super::overhang::Am::new(p, m.mirror_axes(), s.up);
         let xphys: Vec<f64> = e.read_f32(&f.xphys, ne)?.into_iter().map(f64::from).collect();
         am.report(p, &xphys);
     }
@@ -637,7 +639,17 @@ mod tests {
         let p = cantilever();
         let dir = std::env::temp_dir().join(format!("gen3d-gpuloop-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        for (beta_max, overhang) in [(0.0, false), (8.0, false), (0.0, true), (8.0, true)] {
+        use crate::mesh::Up;
+        let runs = [
+            (0.0, false, Up::PlusZ),
+            (8.0, false, Up::PlusZ),
+            (0.0, true, Up::PlusZ),
+            (8.0, true, Up::PlusZ),
+            (8.0, true, Up::MinusX),
+            (0.0, true, Up::PlusY),
+            (8.0, true, Up::MinusZ),
+        ];
+        for (beta_max, overhang, up) in runs {
             let settings = |solver| Settings {
                 voxel: 1.0,
                 volfrac: 0.3,
@@ -657,6 +669,7 @@ mod tests {
                 coarse_start: false,
                 symmetry: true,
                 overhang,
+                up,
             };
             let ms = MgSettings::default();
             let cpu = optimize(&p, &settings(Solver::Multigrid(ms)), &dir.join("cpu.vti"), None).unwrap();
@@ -673,7 +686,7 @@ mod tests {
                 let rel = (a.compliance - b.compliance).abs() / a.compliance;
                 assert!(
                     rel < 2e-3,
-                    "beta_max {beta_max} overhang {overhang}, iteration {}: compliance {} (CPU) vs {} (GPU)",
+                    "beta_max {beta_max} overhang {overhang} {up:?}, iteration {}: compliance {} (CPU) vs {} (GPU)",
                     it + 1,
                     a.compliance,
                     b.compliance
@@ -687,7 +700,7 @@ mod tests {
             let diff = dc.iter().zip(&dg).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
             assert!(
                 diff < 0.05,
-                "beta_max {beta_max} overhang {overhang}: density differs by {diff}"
+                "beta_max {beta_max} overhang {overhang} {up:?}: density differs by {diff}"
             );
             // and the combined case's displacement
             let disp = |v: &crate::vti::VtiFile| {

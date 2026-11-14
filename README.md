@@ -174,13 +174,15 @@ camera presets, section view, bounds box, clipping and render resolution.
   hidden inside script geometry can still be clicked.
 - **2 Optimize** (for shapes with `field_fixed` and `field_load`, see
   [Topology optimization](#topology-optimization)): material share, load, element size, minimum member
-  size, iterations, crisp 0/1, printable without supports (on by default, see
-  [overhang control](#overhang-control)). **Optimize** runs in the background with a progress bar; from the first
+  size, iterations, crisp 0/1, printable without supports and which side is printed up (on by default,
+  +z up; see [overhang control](#overhang-control)). With another side up the viewport shows the
+  build plate. **Optimize** runs in the background with a progress bar; from the first
   iteration the viewport shows the result growing. Then pick the threshold on its histogram (with the
   material volume in cm³ and grams), optionally colour by `energy` or `displacement`, and continue
   with **Print the result**.
-- **3 Print:** print the design or the optimized result. Mesh voxel and triangle reduction (for
-  shapes), STL or 3MF, **Export mesh**. Pick a printer profile from `printers/` (or *auto*: the shape's
+- **3 Print:** print the design or the optimized result. Which side is printed up (the same setting as
+  Optimize's; the mesh is turned so that side faces up and set on the plate), mesh voxel and triangle
+  reduction (for shapes), STL or 3MF, **Export mesh**. Pick a printer profile from `printers/` (or *auto*: the shape's
   `//! slicer`, else `printers/default.ini`), optionally override layer height, infill and supports
   (PrusaSlicer), then **Slice to G-code** or **Open in slicer**. The result shows print time,
   filament and settings, read from the G-code.
@@ -209,13 +211,13 @@ Keys are matched by physical position (US layout), so `[` `]` work without AltGr
 ```
 gen3d                                   the app
 gen3d view   [FILE] [-D NAME=VAL]...    the app with a .wgsl shape or .vti grid open
-gen3d export SHAPE [-o out.stl] [--format stl|3mf|obj|ply|vti] [--voxel MM] [--bounds X0 Y0 Z0 X1 Y1 Z1] [--decimate F]
+gen3d export SHAPE [-o out.stl] [--format stl|3mf|obj|ply|vti] [--voxel MM] [--bounds X0 Y0 Z0 X1 Y1 Z1] [--decimate F] [--up=+z|-z|+x|-x|+y|-y]
             [.vti: --smooth N] [--fair | --no-fair]
 gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh opts] [-- extra slicer args]
-gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
+gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf] [mesh opts]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
 gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
-gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--no-symmetry] [--no-overhang] [--modulus MPA] [--nu V] [-o out.vti] [--resume]
+gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--no-symmetry] [--no-overhang] [--up=+z|...] [--modulus MPA] [--nu V] [-o out.vti] [--resume]
 
 .vti options (render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
@@ -437,9 +439,10 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
     `--no-symmetry` solves the whole part (on the same aligned grid). A problem that isn't symmetric
     after all (a script's own supports, `--ground` with a Z plane) is solved whole, with a note.
 - **Overhang control** (on by default; `--no-overhang`, or untick *Printable without supports* in
-  the app, turns it off): the result is printable as the shape stands, +z up, without support
-  material. No surface faces down more than 45° from vertical. The lowest layer of the design domain
-  is the build plate. This is Langelaar's additive-manufacturing filter (2017): going up layer by
+  the app, turns it off): the result is printable without support material with the `--up` side up
+  (+z by default: as the shape stands). No surface faces down more than 45° from vertical. The design
+  domain's first layer along that direction is on the build plate (the lowest one for +z, the highest
+  x for -x). This is Langelaar's additive-manufacturing filter (2017): going up layer by
   layer, an element is only as dense as a smooth maximum of the 5 elements under it (below, and the 4
   beside that one) allows. It sits between the density filter and the projection, and the optimizer
   differentiates through it, so it grows 45° chamfers and arches instead of ledges rather than having
@@ -448,9 +451,15 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
   - Kept-solid regions are printed as given: one that overhangs (a horizontal hole's ring arching
     over the hole, a tabletop marked keep solid) still needs supports or bridging, and is counted
     separately. Material can stand on them.
-  - 45° is along x and y; diagonally the limit is a little steeper (about 55°). Bridges are not
-    allowed either. Rotate the shape to print it another way up.
-  - A mirror plane in z isn't used (printing breaks that symmetry); x and y planes are.
+  - **Print orientation** (`--up`, *printed … up* in the app): any of the six axis directions, so the
+    layers stay voxel layers. Pass the same `--up` to `export`, `slice` and `open`, which turn the
+    mesh so that side faces up and set it on z = 0 (the app does this for you). Other angles: rotate
+    the shape. The orientation matters: the bracket printed on its wall plate (`--up=+x`) reaches
+    compliance 7.83 in 58 iterations (8.5 s), against 7.88 in 115 (16.5 s) standing as modelled.
+  - 45° is along the layer's two axes; diagonally the limit is a little steeper (about 55°). Bridges
+    are not allowed either.
+  - A mirror plane across the build direction isn't used (printing breaks that symmetry); the others
+    are.
   - Cost: per iteration a few percent (two sweeps over the layers, one up and one down). The runs
     tend to take more iterations.
 - **Projection or not:** with projection the result is crisp (0% grey on the bracket against 24%
@@ -476,7 +485,7 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
   - The GPU path needs 164 B per element (`optimize` prints it), so a 10 GB card holds about 45M.
     Past that, `optimize` says it doesn't fit. The CPU solver allows 8M (~1.2 kB each).
 - **Shortcuts in this version:**
-  - Overhang control only prints along +z, at 45°.
+  - Overhang control: 45° only, and the print direction is one of the six axis directions.
 
 ## Mesh quality notes
 

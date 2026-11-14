@@ -199,6 +199,10 @@ struct MeshArgs {
     no_fair: bool,
     #[arg(long, value_enum, default_value = "stl")]
     format: Format,
+    /// the side of the part that faces up on the printer: the mesh is turned so it does and set on
+    /// z = 0 (+z leaves it as it is)
+    #[arg(long, value_enum, default_value = "+z", allow_hyphen_values = true)]
+    up: mesh::Up,
 }
 
 #[derive(Subcommand)]
@@ -305,6 +309,10 @@ enum Cmd {
         /// (no overhang shallower than 45°, the lowest layer of the design domain on the plate)
         #[arg(long)]
         no_overhang: bool,
+        /// the side of the part that faces up on the printer (the build direction for overhang
+        /// control); pass the same --up to export / slice / open
+        #[arg(long, value_enum, default_value = "+z", allow_hyphen_values = true)]
+        up: mesh::Up,
         /// density filter radius in voxels (larger = thicker, simpler members)
         #[arg(long, default_value_t = 1.5)]
         rmin: f64,
@@ -374,6 +382,9 @@ enum Cmd {
         /// with --mesh: draw the triangle edges
         #[arg(long)]
         edges: bool,
+        /// the side printed up (Optimize and Print)
+        #[arg(long, value_enum, default_value = "+z", allow_hyphen_values = true)]
+        up: mesh::Up,
         #[arg(long, num_args = 2, value_names = ["W", "H"], default_values_t = [1440u32, 900])]
         size: Vec<u32>,
         #[arg(short, long, default_value = "out/snapshot.png")]
@@ -439,6 +450,9 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
         && (m.format == Format::Vti
             || output.is_some_and(|o| o.extension().is_some_and(|e| e.eq_ignore_ascii_case("vti"))));
     if vti {
+        if m.up != mesh::Up::PlusZ {
+            bail!("--up applies to meshes, not to a .vti export");
+        }
         let out = output.map_or_else(|| default_out(&shape.path, ".vti", &defines), Path::to_path_buf);
         let gpu = gpu::headless()?;
         let grid = mesher::sample_grid(&shape, m.voxel, &gpu)?;
@@ -467,7 +481,8 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
         bail!("--smooth and --fair apply to .vti grids (shapes are meshed from their exact distance field)");
     }
     let decimate = m.decimate.or(shape.decimate());
-    let mesh = mesher::build_mesh(&shape, m.voxel, decimate)?;
+    let mut mesh = mesher::build_mesh(&shape, m.voxel, decimate)?;
+    mesh.orient(m.up);
     mesher::report(&mesh);
     let out = match (ext, output) {
         (None, Some(o)) => o.to_path_buf(),
@@ -521,7 +536,8 @@ fn export_volume(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option
         t0.elapsed().as_secs_f64(),
         mesh.tris.len()
     );
-    let mesh = mesher::decimate_checked(mesh, m.decimate);
+    let mut mesh = mesher::decimate_checked(mesh, m.decimate);
+    mesh.orient(m.up);
     mesher::report(&mesh);
     let shape = vol.shape(&s.shape);
     let out = match (ext, output) {
@@ -549,6 +565,7 @@ fn run(cli: Cli) -> Result<()> {
             select,
             mesh,
             edges,
+            up,
             size,
             output,
         } => {
@@ -560,6 +577,7 @@ fn run(cli: Cli) -> Result<()> {
                 select,
                 mesh,
                 edges,
+                up,
             };
             app::snapshot(
                 file.as_deref(),
@@ -651,6 +669,7 @@ fn run(cli: Cli) -> Result<()> {
             no_coarse_start,
             no_symmetry,
             no_overhang,
+            up,
             rmin,
             penal,
             force,
@@ -690,6 +709,7 @@ fn run(cli: Cli) -> Result<()> {
                 coarse_start: !no_coarse_start,
                 symmetry: !no_symmetry,
                 overhang: !no_overhang,
+                up,
             };
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
             topopt::run(&shape, &settings, &out, &gpu, resume)?;
@@ -727,6 +747,7 @@ fn run(cli: Cli) -> Result<()> {
                     coarse_start: false,
                     symmetry: true,
                     overhang: false,
+                    up: crate::mesh::Up::PlusZ,
                 };
                 let problem = topopt::setup(&shape, &settings, &gpu)?;
                 let ne = problem.domain.iter().filter(|d| **d).count();

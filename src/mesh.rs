@@ -6,6 +6,75 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
+/// The side of the part that faces up on the printer (`--up`): the build direction. Axis-aligned, so
+/// the optimizer's layers are voxel layers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Up {
+    #[default]
+    #[value(name = "+z")]
+    PlusZ,
+    #[value(name = "-z")]
+    MinusZ,
+    #[value(name = "+x")]
+    PlusX,
+    #[value(name = "-x")]
+    MinusX,
+    #[value(name = "+y")]
+    PlusY,
+    #[value(name = "-y")]
+    MinusY,
+}
+
+impl Up {
+    pub const ALL: [Up; 6] = [Up::PlusZ, Up::MinusZ, Up::PlusX, Up::MinusX, Up::PlusY, Up::MinusY];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Up::PlusZ => "+z",
+            Up::MinusZ => "-z",
+            Up::PlusX => "+x",
+            Up::MinusX => "-x",
+            Up::PlusY => "+y",
+            Up::MinusY => "-y",
+        }
+    }
+
+    /// The build axis (0 x, 1 y, 2 z).
+    pub fn axis(self) -> usize {
+        match self {
+            Up::PlusX | Up::MinusX => 0,
+            Up::PlusY | Up::MinusY => 1,
+            Up::PlusZ | Up::MinusZ => 2,
+        }
+    }
+
+    /// The two axes across the build axis, in order.
+    pub fn lateral(self) -> [usize; 2] {
+        match self.axis() {
+            0 => [1, 2],
+            1 => [0, 2],
+            _ => [0, 1],
+        }
+    }
+
+    /// Whether the part is built towards the axis' negative side (its high end is on the plate).
+    pub fn negative(self) -> bool {
+        matches!(self, Up::MinusX | Up::MinusY | Up::MinusZ)
+    }
+
+    /// The rotation that turns this side up (a proper rotation, so faces keep their winding).
+    pub fn rotate(self, [x, y, z]: [f32; 3]) -> [f32; 3] {
+        match self {
+            Up::PlusZ => [x, y, z],
+            Up::MinusZ => [x, -y, -z],
+            Up::PlusX => [-z, y, x],
+            Up::MinusX => [z, y, -x],
+            Up::PlusY => [x, -z, y],
+            Up::MinusY => [x, z, -y],
+        }
+    }
+}
+
 /// Applied to each vertex after a smoothing pass (`Mesh::smooth`).
 pub type VertexConstraint = dyn Fn(&mut [f32; 3]) + Sync;
 
@@ -16,6 +85,23 @@ pub struct Mesh {
 }
 
 impl Mesh {
+    /// Turn `up` to +z and set the part on z = 0 (as the slicer will print it). +z leaves the mesh
+    /// as it is.
+    pub fn orient(&mut self, up: Up) {
+        if up == Up::PlusZ {
+            return;
+        }
+        for v in &mut self.verts {
+            *v = up.rotate(*v);
+        }
+        let zmin = self.verts.iter().map(|v| v[2]).fold(f32::INFINITY, f32::min);
+        if zmin.is_finite() {
+            for v in &mut self.verts {
+                v[2] -= zmin;
+            }
+        }
+    }
+
     /// Signed volume (positive when faces point outward).
     pub fn volume(&self) -> f64 {
         self.tris
@@ -570,6 +656,59 @@ mod tests {
         assert_eq!(names.len(), 3, "temporary files left: {names:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
+    /// Each `--up` turns that side of the part up, keeps the faces outward (positive volume) and
+    /// sets the part on z = 0 (except +z, which leaves it as it is).
+    #[test]
+    fn orient_turns_the_chosen_side_up() {
+        use super::Up;
+        // a box 1 x 2 x 3 at (10, 20, 30); its marker vertex is the middle of the face to turn up
+        let mut vol = vec![0.5f32; 8 * 8 * 8];
+        for x in 1..3 {
+            for y in 1..4 {
+                for z in 1..5 {
+                    vol[(x * 8 + y) * 8 + z] = -0.5;
+                }
+            }
+        }
+        let m = crate::mc::polygonize(&vol, [8, 8, 8], [10.0, 20.0, 30.0], 1.0);
+        let v0 = m.volume();
+        assert!(v0 > 0.0);
+        let extent = |m: &Mesh, a: usize| {
+            let it = m.verts.iter().map(|v| v[a]);
+            (
+                it.clone().fold(f32::INFINITY, f32::min),
+                it.fold(f32::NEG_INFINITY, f32::max),
+            )
+        };
+        let ((x0, x1), (y0, y1), (z0, z1)) = (extent(&m, 0), extent(&m, 1), extent(&m, 2));
+        for up in Up::ALL {
+            let mut o = m.clone();
+            o.orient(up);
+            assert!(
+                (o.volume() - v0).abs() < 1e-3 * v0,
+                "{up:?}: volume {} vs {v0}",
+                o.volume()
+            );
+            let (lo, hi) = extent(&o, 2);
+            // +z leaves the mesh where it is
+            assert!(up == Up::PlusZ || lo.abs() < 1e-5, "{up:?}: on the plate");
+            // the part's height is its extent along the build axis
+            let h = [x1 - x0, y1 - y0, z1 - z0][up.axis()];
+            assert!((hi - lo - h).abs() < 1e-4, "{up:?}: height {} vs {h}", hi - lo);
+            // the top is the chosen side: the highest vertex came from that end of the axis
+            let top = o
+                .verts
+                .iter()
+                .zip(&m.verts)
+                .max_by(|a, b| a.0[2].total_cmp(&b.0[2]))
+                .unwrap()
+                .1;
+            let (lo0, hi0) = [(x0, x1), (y0, y1), (z0, z1)][up.axis()];
+            let want = if up.negative() { lo0 } else { hi0 };
+            assert!((top[up.axis()] - want).abs() < 1e-4, "{up:?}: top {top:?}");
+        }
+    }
+
     /// Marching cubes of a sphere from a voxel-quantized field (each sample rounded to whole
     /// voxels, so the surface has voxel steps): smoothing removes the steps without shrinking it.
     #[test]

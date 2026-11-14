@@ -3,6 +3,39 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Choose the print orientation
+
+**Why:** overhang control printed along +z only, as the shape is modelled. A part is often better
+printed another way up (a wall bracket on its wall plate), and the mesh then has to reach the slicer
+that way up too.
+
+**What:** `mesh::Up`: one of the six axis directions, the side that faces up on the printer.
+- `optimize --up`: the AM filter sweeps layers along that axis, from the domain's first layer in
+  build order (`Am::elem` maps a layer and a position across it to the element). The GPU kernels
+  take the axis and sign in `P.n.w`, and the mirror planes in all three bits (the lateral ones
+  reflect the stencil, all three the density filter's weight sums). The mirror plane across the
+  build direction is dropped (it was z only). The checkpoint key includes it.
+- `export` / `slice` / `open --up`: `Mesh::orient` turns that side up with a proper rotation (faces
+  keep their winding) and sets the part on z = 0. `+z` leaves the mesh as before.
+- App: a shared *printed … up* selector, next to *Printable without supports* in Optimize and at the
+  top of Print's Mesh section. Both steps pass it as `--up`. With another side than +z up, Optimize
+  draws the build plate on the bounds face it means. `snapshot --up` for checking that.
+
+**Result:** the bracket printed on its wall plate (`--up=+x`): compliance 7.826 in 58 iterations,
+8.5 s, 0 unsupported design elements. Standing as modelled (+z) it took 115 iterations and 16.5 s
+for 7.878; without overhang control, 8.202 in 60. Its exported STL stands on the wall plate:
+40.3 × 24.3 × 78.8 mm, watertight, one body.
+
+**Verified:** `orient_turns_the_chosen_side_up` (each direction: that end on top, the volume
+unchanged and positive, on the plate). `build_direction_sets_what_is_supported` (a horizontal bar
+floats ±z up and stands ±x up; a -z plate is the top layer). Finite differences match the adjoint
+for -y and +x with lateral mirror planes. `gpu_loop_matches_cpu_loop` also runs -x, +y and -z. The
+Optimize step with `--up=-x` checked with `snapshot`. All tests pass; clippy clean.
+
+**Still open:** the setting isn't saved with the shape or the result, so reopening the app starts at
++z (and Print uses whatever is selected, not what the result was optimized for). Arbitrary angles
+need the shape rotated.
+
 ## 2026-11-14: Overhang control (AM filter), on by default
 
 **Why:** optimized parts were full of ledges and down-facing surfaces that need support material,

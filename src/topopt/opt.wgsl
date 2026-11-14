@@ -201,19 +201,46 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel am_fwd
-// The AM filter (overhang.rs) on layer k = P.m.y: printed densities xi (design elements:
-// smin(x, smax of the supports' xi in the layer below), kept-solid 1, else 0; x itself on the plate
-// layer P.m.w and below) and per element its supports' largest xi m and r = Σ (xi / m)^P (`mr`). One
-// thread per element of the layer (P.m.x of them). P.m.z: mirror axes (bits x, y).
-// P.f = (P, 1/Q, ε, P/Q)
+// The AM filter (overhang.rs) on layer l = P.m.y (in build order): printed densities xi (design
+// elements: smin(x, smax of the supports' xi in the layer below), kept-solid 1, else 0; x itself on
+// the plate layer P.m.w and before) and per element its supports' largest xi m and r = Σ (xi / m)^P
+// (`mr`). One thread per element of the layer (P.m.x of them). P.f = (P, 1/Q, ε, P/Q)
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
 @group(0) @binding(2) var<storage, read> x: array<f32>;
 @group(0) @binding(3) var<storage, read_write> xi: array<f32>;
 @group(0) @binding(4) var<storage, read_write> mr: array<vec2<f32>>;
 
-// support st (0..5: below, -x, +x, -y, +y) of column (i, j): its column in the layer, or -1
-fn support(i: i32, j: i32, st: u32) -> i32 {
+// The build axis b = P.n.w & 3, built towards -b when P.n.w & 4. Layers l in build order, each
+// element in a layer at lateral (u, v) along the two other axes (in order).
+fn lat_axes() -> vec2<u32> {
+    let b = P.n.w & 3u;
+    if b == 0u { return vec2<u32>(1u, 2u); }
+    if b == 1u { return vec2<u32>(0u, 2u); }
+    return vec2<u32>(0u, 1u);
+}
+
+fn lat_dims() -> vec2<i32> {
     let n = vec3<i32>(P.n.xyz);
+    let a = lat_axes();
+    return vec2<i32>(n[a.x], n[a.y]);
+}
+
+fn elem_at(c: vec2<i32>, l: u32) -> u32 {
+    let n = vec3<i32>(P.n.xyz);
+    let b = P.n.w & 3u;
+    let a = lat_axes();
+    var p = vec3<i32>(0, 0, 0);
+    p[a.x] = c.x;
+    p[a.y] = c.y;
+    var w = i32(l);
+    if (P.n.w & 4u) != 0u { w = n[b] - 1 - w; }
+    p[b] = w;
+    return u32((p.z * n.y + p.y) * n.x + p.x);
+}
+
+// support st (0..5: below, -u, +u, -v, +v) of lateral position c: its position, or x = -1. The
+// mirror planes (P.m.z, bits x y z) on the lateral axes' low faces reflect it.
+fn support(c: vec2<i32>, st: u32) -> vec2<i32> {
     var d = vec2<i32>(0, 0);
     switch st {
         case 1u: { d = vec2<i32>(-1, 0); }
@@ -222,12 +249,13 @@ fn support(i: i32, j: i32, st: u32) -> i32 {
         case 4u: { d = vec2<i32>(0, 1); }
         default: {}
     }
-    var a = i + d.x;
-    var b = j + d.y;
-    if a < 0 && (P.m.z & 1u) != 0u { a = -a - 1; }
-    if b < 0 && (P.m.z & 2u) != 0u { b = -b - 1; }
-    if a < 0 || b < 0 || a >= n.x || b >= n.y { return -1; }
-    return b * n.x + a;
+    let a = lat_axes();
+    let nl = lat_dims();
+    var q = c + d;
+    if q.x < 0 && ((P.m.z >> a.x) & 1u) != 0u { q.x = -q.x - 1; }
+    if q.y < 0 && ((P.m.z >> a.y) & 1u) != 0u { q.y = -q.y - 1; }
+    if q.x < 0 || q.y < 0 || q.x >= nl.x || q.y >= nl.y { return vec2<i32>(-1, -1); }
+    return q;
 }
 
 fn powp(v: f32, e: f32) -> f32 {
@@ -239,9 +267,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         @builtin(local_invocation_index) li: u32) {
     let t = flat(wg, nwg, li);
     if t >= P.m.x { return; }
-    let n = vec3<i32>(P.n.xyz);
-    let k = P.m.y;
-    let e = k * P.m.x + t;
+    let l = P.m.y;
+    let nl = lat_dims();
+    let c = vec2<i32>(i32(t) % nl.x, i32(t) / nl.x);
+    let e = elem_at(c, l);
     let f = flags[e];
     var v = 0.0;
     var m = 0.0;
@@ -249,21 +278,18 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     if (f & 2u) != 0u {
         v = 1.0;
     } else if (f & 1u) != 0u {
-        if k <= P.m.w {
+        if l <= P.m.w {
             v = x[e];
         } else {
-            let below = (k - 1u) * P.m.x;
-            let i = i32(t) % n.x;
-            let j = i32(t) / n.x;
             for (var st = 0u; st < 5u; st++) {
-                let c = support(i, j, st);
-                if c >= 0 { m = max(m, xi[below + u32(c)]); }
+                let q = support(c, st);
+                if q.x >= 0 { m = max(m, xi[elem_at(q, l - 1u)]); }
             }
             var b = 0.0;
             if m > 0.0 {
                 for (var st = 0u; st < 5u; st++) {
-                    let c = support(i, j, st);
-                    if c >= 0 { r += powp(xi[below + u32(c)] / m, P.f.x); }
+                    let q = support(c, st);
+                    if q.x >= 0 { r += powp(xi[elem_at(q, l - 1u)] / m, P.f.x); }
                 }
                 b = pow(m, P.f.w) * pow(r, P.f.y);
             }
@@ -277,7 +303,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 }
 
 //// kernel am_adj
-// The AM filter's chain rule on layer k = P.m.y, run from the top layer down (overhang.rs's
+// The AM filter's chain rule on layer l = P.m.y, run from the last layer back (overhang.rs's
 // `sensitivities`): dc and dv hold df/dxi of the design elements and become df/dx divided by the
 // filter weight sums (ready for the density filter's transpose, as `sens` leaves them without the
 // AM filter). cc / cv carry each element's λ ∂ξ/∂smax (P/Q) smax / (m r) to the layer below,
@@ -292,8 +318,37 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(7) var<storage, read_write> cc: array<f32>;
 @group(0) @binding(8) var<storage, read_write> cv: array<f32>;
 
-fn support(i: i32, j: i32, st: u32) -> i32 {
+// The build axis b = P.n.w & 3, built towards -b when P.n.w & 4. Layers l in build order, each
+// element in a layer at lateral (u, v) along the two other axes (in order).
+fn lat_axes() -> vec2<u32> {
+    let b = P.n.w & 3u;
+    if b == 0u { return vec2<u32>(1u, 2u); }
+    if b == 1u { return vec2<u32>(0u, 2u); }
+    return vec2<u32>(0u, 1u);
+}
+
+fn lat_dims() -> vec2<i32> {
     let n = vec3<i32>(P.n.xyz);
+    let a = lat_axes();
+    return vec2<i32>(n[a.x], n[a.y]);
+}
+
+fn elem_at(c: vec2<i32>, l: u32) -> u32 {
+    let n = vec3<i32>(P.n.xyz);
+    let b = P.n.w & 3u;
+    let a = lat_axes();
+    var p = vec3<i32>(0, 0, 0);
+    p[a.x] = c.x;
+    p[a.y] = c.y;
+    var w = i32(l);
+    if (P.n.w & 4u) != 0u { w = n[b] - 1 - w; }
+    p[b] = w;
+    return u32((p.z * n.y + p.y) * n.x + p.x);
+}
+
+// support st (0..5: below, -u, +u, -v, +v) of lateral position c: its position, or x = -1. The
+// mirror planes (P.m.z, bits x y z) on the lateral axes' low faces reflect it.
+fn support(c: vec2<i32>, st: u32) -> vec2<i32> {
     var d = vec2<i32>(0, 0);
     switch st {
         case 1u: { d = vec2<i32>(-1, 0); }
@@ -302,12 +357,13 @@ fn support(i: i32, j: i32, st: u32) -> i32 {
         case 4u: { d = vec2<i32>(0, 1); }
         default: {}
     }
-    var a = i + d.x;
-    var b = j + d.y;
-    if a < 0 && (P.m.z & 1u) != 0u { a = -a - 1; }
-    if b < 0 && (P.m.z & 2u) != 0u { b = -b - 1; }
-    if a < 0 || b < 0 || a >= n.x || b >= n.y { return -1; }
-    return b * n.x + a;
+    let a = lat_axes();
+    let nl = lat_dims();
+    var q = c + d;
+    if q.x < 0 && ((P.m.z >> a.x) & 1u) != 0u { q.x = -q.x - 1; }
+    if q.y < 0 && ((P.m.z >> a.y) & 1u) != 0u { q.y = -q.y - 1; }
+    if q.x < 0 || q.y < 0 || q.x >= nl.x || q.y >= nl.y { return vec2<i32>(-1, -1); }
+    return q;
 }
 
 fn powp(v: f32, e: f32) -> f32 {
@@ -350,8 +406,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let t = flat(wg, nwg, li);
     if t >= P.m.x { return; }
     let n = vec3<i32>(P.n.xyz);
-    let k = P.m.y;
-    let e = k * P.m.x + t;
+    let l = P.m.y;
+    let nl = lat_dims();
+    let c = vec2<i32>(i32(t) % nl.x, i32(t) / nl.x);
+    let e = elem_at(c, l);
     let f = flags[e];
     if (f & 4u) == 0u {
         dc[e] = 0.0;
@@ -360,31 +418,26 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         cv[e] = 0.0;
         return;
     }
-    let i = i32(t) % n.x;
-    let j = i32(t) / n.x;
     var lc = dc[e];
     var lv = dv[e];
-    // the elements above whose supports include this one (mirrored ones may include it twice)
-    if i32(k) + 1 < n.z {
+    // the elements of the next layer whose supports include this one
+    if i32(l) + 1 < n[P.n.w & 3u] {
         var gc = 0.0;
         var gv = 0.0;
-        let above = (k + 1u) * P.m.x;
         for (var nb = 0u; nb < 5u; nb++) {
-            // the stencil is symmetric, so the columns whose supports include (i, j) are the ones
-            // among its own supports; on a mirror plane its own column appears twice there (and
-            // includes it twice, counted by `mult`)
-            let c = support(i, j, nb);
-            if c < 0 || (nb == 1u && c == support(i, j, 0u)) || (nb == 3u && c == support(i, j, 0u)) {
+            // the stencil is symmetric, so the positions whose supports include c are among its own
+            // supports; on a mirror plane its own position appears twice there (and includes it
+            // twice, counted by `mult`)
+            let q = support(c, nb);
+            if q.x < 0 || ((nb == 1u || nb == 3u) && all(q == support(c, 0u))) {
                 continue;
             }
-            let ci = c % n.x;
-            let cj = c / n.x;
             var mult = 0.0;
             for (var st = 0u; st < 5u; st++) {
-                if support(ci, cj, st) == j * n.x + i { mult += 1.0; }
+                if all(support(q, st) == c) { mult += 1.0; }
             }
             if mult == 0.0 { continue; }
-            let a = above + u32(c);
+            let a = elem_at(q, l + 1u);
             let m = mr[a].x;
             if m <= 0.0 { continue; }
             let w = mult * powp(xi[e] / m, P.f.x - 1.0);
@@ -397,7 +450,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     var da = 1.0;
     var occ = 0.0;
     var ocv = 0.0;
-    if k > P.m.w {
+    if l > P.m.w {
         let m = mr[e].x;
         let r = mr[e].y;
         var b = 0.0;

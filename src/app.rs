@@ -27,6 +27,7 @@ use winit::window::{Window, WindowId};
 use crate::browser::{Browser, Pick, ago};
 use crate::gpu::Gpu;
 use crate::jobs::{Job, Slot, mesh_report, opt_progress};
+use crate::mesh::Up;
 use crate::prims::{self, Kind, Op, Prim, Role};
 use crate::shape::{Field, Param, ParamKind, Shape};
 use crate::slicer;
@@ -376,6 +377,9 @@ struct App {
     edit: EditUi,
     opt: OptUi,
     print: PrintUi,
+    /// the side of the part that faces up on the printer: the build direction of Optimize's overhang
+    /// control, and how Print turns the mesh (`--up`)
+    up: Up,
     slicer: Option<(slicer::Kind, PathBuf)>,
     browser: Browser,
     /// What the viewport shows (the design's shape, or a grid's generated shape).
@@ -634,6 +638,23 @@ fn case_color(case: u32) -> egui::Color32 {
 }
 
 /// The Optimize step's summary of the editor primitives' supports and loads, by load case.
+/// Which side of the part faces up on the printer (shared by Optimize and Print).
+fn up_ui(ui: &mut egui::Ui, up: &mut Up, id: &str) {
+    let label = |u: Up| format!("{} up", u.name());
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(label(*up))
+        .show_ui(ui, |ui| {
+            for u in Up::ALL {
+                ui.selectable_value(up, u, label(u));
+            }
+        })
+        .response
+        .on_hover_text(
+            "the side of the part that faces up on the printer. Optimize keeps the part printable that \
+             way up; Print turns the mesh so it is (and sets it on the plate).",
+        );
+}
+
 fn supports_and_loads_ui(ui: &mut egui::Ui, prims: &[Prim], ground: Ground, bounds: ([f32; 3], [f32; 3])) {
     let fixed: Vec<String> = prims
         .iter()
@@ -911,6 +932,7 @@ impl App {
             edit: EditUi::default(),
             opt: OptUi::default(),
             print: PrintUi::default(),
+            up: Up::PlusZ,
             slicer: slicer::find_slicer(None),
             browser: Browser::new(cwd.clone()),
             shape: Shape::placeholder(&cwd),
@@ -1640,13 +1662,15 @@ impl App {
     }
 
     /// Supports, loads and the ground drawn over the view (Design and Optimize steps): an arrow per
-    /// load (coloured by load case, with its rocking pushes), a marker per support, the ground plane.
+    /// load (coloured by load case, with its rocking pushes), a marker per support, the ground plane,
+    /// and in Optimize the build plate when the part is printed another side than +z up.
     fn bc_overlay(&self, ui: &egui::Ui, rect: egui::Rect) {
         if self.step == Step::Print || self.volume.is_some() && self.step == Step::Design {
             return;
         }
         let Some(shape) = &self.design_shape else { return };
-        if !shape.editor && self.opt.ground == Ground::None {
+        let plate = self.step == Step::Optimize && self.opt.overhang && self.up != Up::PlusZ;
+        if !shape.editor && self.opt.ground == Ground::None && !plate {
             return;
         }
         let prims = self.prims();
@@ -1682,6 +1706,39 @@ impl App {
                     "ground (grips)"
                 };
                 painter.text(pts[0], egui::Align2::LEFT_TOP, name, font.clone(), text);
+            }
+        }
+        // the build plate: the bounds' face the part is printed from, a little wider
+        if plate {
+            let b = self.up.axis();
+            let [l0, l1] = self.up.lateral();
+            let w = if self.up.negative() { hi[b] } else { lo[b] };
+            let m = 0.08 * scale;
+            let corner = |a: f32, c: f32| {
+                let mut p = [0.0; 3];
+                p[b] = w;
+                p[l0] = a;
+                p[l1] = c;
+                p
+            };
+            let c = [
+                corner(lo[l0] - m, lo[l1] - m),
+                corner(hi[l0] + m, lo[l1] - m),
+                corner(hi[l0] + m, hi[l1] + m),
+                corner(lo[l0] - m, hi[l1] + m),
+            ];
+            let pts: Vec<_> = c.iter().filter_map(|p| project(*p)).collect();
+            if pts.len() == 4 {
+                let col = egui::Color32::from_rgb(120, 160, 220);
+                painter.add(egui::Shape::convex_polygon(
+                    pts.clone(),
+                    egui::Color32::from_rgba_unmultiplied(120, 160, 220, 35),
+                    egui::Stroke::new(1.5, col),
+                ));
+                let name = format!("build plate ({} up)", self.up.name());
+                // in its middle (a corner may be off-screen)
+                let at = pts.iter().fold(egui::Pos2::ZERO, |a, p| a + p.to_vec2() / 4.0);
+                painter.text(at, egui::Align2::CENTER_CENTER, name, font.clone(), text);
             }
         }
         if !shape.editor {
@@ -2415,6 +2472,9 @@ impl App {
         if let Some(d) = self.print.decimate {
             a.extend(["--decimate".into(), fmt_num(d as f64)]);
         }
+        if self.up != Up::PlusZ {
+            a.push(format!("--up={}", self.up.name()));
+        }
         a
     }
 
@@ -2513,6 +2573,9 @@ impl App {
         }
         if !o.overhang {
             a.push("--no-overhang".into());
+        }
+        if self.up != Up::PlusZ {
+            a.push(format!("--up={}", self.up.name()));
         }
         if o.ground != Ground::None {
             a.extend(["--ground".into(), o.ground.name().into()]);
@@ -3301,13 +3364,16 @@ impl App {
             });
         });
         ui.add_enabled_ui(!self.opt_job.running(), |ui| {
-            ui.checkbox(&mut self.opt.overhang, "Printable without supports")
-                .on_hover_text(
-                    "no overhang shallower than 45°, printed as the shape stands (+z up) from the bottom of \
-                 the design domain. Material is only placed where the layer below can carry it, so the \
-                 part may be a little less stiff. Kept-solid regions are printed as they are: one that \
-                 overhangs still needs supports. Rotate the shape to print it another way up.",
-                );
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.opt.overhang, "Printable without supports,")
+                    .on_hover_text(
+                        "no overhang shallower than 45° when printed with the chosen side up, from the \
+                         design domain's face on the plate. Material is only placed where the layer below \
+                         can carry it, so the part may be a little less stiff. Kept-solid regions are \
+                         printed as they are: one that overhangs still needs supports.",
+                    );
+                up_ui(ui, &mut self.up, "opt_up");
+            });
         });
         if self.design_shape.as_ref().is_some_and(|s| s.editor) && !self.opt_job.running() {
             ui.horizontal_wrapped(|ui| {
@@ -3545,6 +3611,12 @@ impl App {
         }
 
         section(ui, "Mesh");
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Printed");
+                up_ui(ui, &mut self.up, "print_up");
+            });
+        });
         if grid {
             match &self.volume {
                 Some(v) if self.shown == src => {
@@ -4231,6 +4303,7 @@ pub struct SnapshotSetup {
     /// Print step: show the exported mesh (with its edges)
     pub mesh: bool,
     pub edges: bool,
+    pub up: Up,
 }
 
 /// Draw the app's window offscreen, without opening one, and save it as a PNG: for checking the
@@ -4260,6 +4333,7 @@ pub fn snapshot(
     app.opts.section = setup.section;
     app.print.show_mesh = setup.mesh;
     app.print.edges = setup.edges;
+    app.up = setup.up;
     match setup.step.as_str() {
         "design" => {}
         "optimize" => app.set_step(Step::Optimize),

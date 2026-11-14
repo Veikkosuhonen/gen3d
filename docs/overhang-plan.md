@@ -26,7 +26,9 @@ them out.
 | App toggle (*Printable without supports*), on by default | done |
 | Overhang report for any mesh in the Print step (downward area past 45°, highlighted) | open |
 | Other angles: a multi-layer stencil (e.g. 2 up per 1 across for ~63°) | open, if needed |
-| Print direction other than +z | open; rotate the shape for now |
+| Print direction: any of ±x, ±y, ±z (`--up`), mesh turned to match in Print / export | done |
+| Saving the print direction with the shape or result | open |
+| Arbitrary print angles (resampling the grid) | open; rotate the shape for now |
 
 ## Decisions
 

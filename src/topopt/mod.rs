@@ -91,8 +91,10 @@ pub struct Settings {
     pub coarse_start: bool,
     /// use the shape's mirror planes: solve one side of a symmetric problem (see `symmetry.rs`)
     pub symmetry: bool,
-    /// keep overhangs to 45° or steeper when printed along +z (the AM filter, `overhang.rs`)
+    /// keep overhangs to 45° or steeper when printed along `up` (the AM filter, `overhang.rs`)
     pub overhang: bool,
+    /// the build direction: the side of the part that faces up on the printer
+    pub up: crate::mesh::Up,
 }
 
 /// How the bottom of the design domain is supported (`--ground`). The optimizer decides where the
@@ -1204,10 +1206,15 @@ fn mirror_axes(shape: &Shape, s: &Settings) -> [bool; 3] {
         return [false; 3];
     }
     let mut axes = shape.mirror.map(|m| m.is_some());
-    // printing along +z breaks the symmetry about a plane in z
-    if s.overhang && axes[2] {
-        println!("symmetry: not using the mirror plane in z (overhang control prints along +z)");
-        axes[2] = false;
+    // printing breaks the symmetry about a plane across the build direction
+    let b = s.up.axis();
+    if s.overhang && axes[b] {
+        println!(
+            "symmetry: not using the mirror plane in {} (overhang control prints along {})",
+            ["x", "y", "z"][b],
+            s.up.name()
+        );
+        axes[b] = false;
     }
     axes
 }
@@ -1419,7 +1426,7 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
         .collect();
     let emin = s.e0 * s.emin;
     let filter = Filter::new(p, s.rmin, m.mirror_axes());
-    let am = s.overhang.then(|| overhang::Am::new(p, m.mirror_axes()));
+    let am = s.overhang.then(|| overhang::Am::new(p, m.mirror_axes(), s.up));
     // x̃ → x̂: the AM filter's printed densities (with its forward pass), or x̃ itself
     let print = |xtilde: Vec<f64>| -> (Vec<f64>, Option<overhang::Printed>) {
         match &am {
@@ -1489,7 +1496,11 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
         }
     );
     if let Some(am) = &am {
-        println!("overhang: at most 45°, printed along +z from layer {}", am.base);
+        println!(
+            "overhang: at most 45°, printed {} up from layer {}",
+            s.up.name(),
+            am.base
+        );
     }
     // the last iteration's output, until it is written
     // the last iteration's full fields, until written
@@ -1743,9 +1754,9 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
             break;
         }
     }
-    // also without overhang control (when it can tell: no mirror plane in z)
-    if !m.mirror_axes()[2] {
-        overhang::Am::new(p, m.mirror_axes()).report(p, &xphys);
+    // also without overhang control (when it can tell: no mirror plane across the build direction)
+    if !m.mirror_axes()[s.up.axis()] {
+        overhang::Am::new(p, m.mirror_axes(), s.up).report(p, &xphys);
     }
     result.beta = proj.beta;
     result.state = LoopState {
@@ -1992,6 +2003,7 @@ pub(super) mod tests {
             coarse_start: false,
             symmetry: true,
             overhang: false,
+            up: crate::mesh::Up::PlusZ,
         }
     }
 
@@ -2130,6 +2142,7 @@ pub(super) mod tests {
             coarse_start: false,
             symmetry: true,
             overhang: false,
+            up: crate::mesh::Up::PlusZ,
         };
         // iterations until `next` says Stop at β, for a compliance sequence
         let run = |beta: f64, seq: &dyn Fn(usize) -> f64| {
@@ -2250,6 +2263,7 @@ pub(super) mod tests {
             coarse_start: false,
             symmetry: true,
             overhang: false,
+            up: crate::mesh::Up::PlusZ,
         };
         let p = setup(&shape, &s, &gpu).unwrap();
         assert_eq!(p.cases, [1, 2]);
@@ -2378,6 +2392,7 @@ pub(super) mod tests {
             coarse_start: false,
             symmetry: true,
             overhang: false,
+            up: crate::mesh::Up::PlusZ,
         };
         let err = setup(&shape, &s, &gpu).err().unwrap().to_string();
         assert!(err.contains("needs supports"), "{err}");
