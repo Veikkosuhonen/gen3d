@@ -21,8 +21,8 @@
 use anyhow::{Result, bail};
 
 use super::gpu_engine::{Engine, NONE, Params, Reduce, Step, dims4, groups, threads};
-use super::{CaseSolve, LoadBasis, Problem};
 use super::mg::{self, MgSettings, Smoother};
+use super::{CaseSolve, LoadBasis, Problem};
 
 /// Entries of a symmetric 24×24 element matrix's upper triangle (how coarse levels are stored).
 const SYM: usize = 300;
