@@ -295,7 +295,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             }
             let a = x[e];
             let eps = P.f.z;
-            v = 0.5 * (a + b - sqrt((a - b) * (a - b) + eps) + sqrt(eps));
+            // ≥ 0 but for rounding (as on the CPU)
+            v = max(0.5 * (a + b - sqrt((a - b) * (a - b) + eps) + sqrt(eps)), 0.0);
         }
     }
     xi[e] = v;

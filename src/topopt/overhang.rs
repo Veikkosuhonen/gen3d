@@ -43,9 +43,10 @@ pub(super) fn q() -> f64 {
     P + (SUPPORTS as f64).ln() / 0.5f64.ln()
 }
 
-/// Smooth minimum of a and b (≈ min, exact when a = b = 0).
+/// Smooth minimum of a and b (≈ min, exact when a = b = 0). Never below 0 for a, b ≥ 0, but
+/// rounding can take it a hair under (in f32 about -4e-8), so it is clamped at 0.
 fn smin(a: f64, b: f64) -> f64 {
-    0.5 * (a + b - ((a - b) * (a - b) + EPS).sqrt() + EPS.sqrt())
+    (0.5 * (a + b - ((a - b) * (a - b) + EPS).sqrt() + EPS.sqrt())).max(0.0)
 }
 
 /// ∂smin/∂a and ∂smin/∂b.

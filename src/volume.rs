@@ -152,8 +152,9 @@ impl Volume {
     }
 
     /// Show array `i` with its default threshold: 0 with inside below for SDF-like arrays (named
-    /// *sdf* or with values on both sides of 0), the middle of the range with inside above otherwise
-    /// (densities, masks).
+    /// *sdf*, or with values on both sides of 0 and not named *density*: an optimizer's density can
+    /// round a hair below 0), the middle of the range with inside above otherwise (densities,
+    /// masks).
     pub fn select(&mut self, i: usize) {
         self.array = i;
         let a = &self.file.arrays[i];
@@ -186,7 +187,8 @@ impl Volume {
             let t = if hi > lo { (v - lo) / (hi - lo) } else { 0.0 };
             self.hist[((t * HIST_BINS as f32) as usize).min(HIST_BINS - 1)] += 1;
         }
-        let sdf_like = a.comps == 1 && (a.name.to_lowercase().contains("sdf") || (lo < 0.0 && hi > 0.0));
+        let name = a.name.to_lowercase();
+        let sdf_like = a.comps == 1 && (name.contains("sdf") || (!name.contains("density") && lo < 0.0 && hi > 0.0));
         self.below = sdf_like;
         self.iso = if sdf_like { 0.0 } else { 0.5 * (lo + hi) };
     }
