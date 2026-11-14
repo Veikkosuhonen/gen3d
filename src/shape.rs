@@ -748,7 +748,6 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
             (shape.prims, shape.mirror) = prims::load_file(&sidecar)?;
         }
         shape.editor = true;
-        shape.update_bounds();
         let (fixed, load, keep) = prims::role_fields(&shape.prims);
         let mut wrap =
             |name: &str, on: bool| -> Result<bool> { Ok(on && prims::rename_script_fn(&mut shape.source, name)?) };
@@ -759,6 +758,8 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
             keep: wrap("field_keep", keep)?,
         };
         shape.script_map = script.map;
+        // after script_map: without a map of its own, the shape is just its primitives
+        shape.update_bounds();
         if script.load {
             shape.script_load = Some("g3d_script_field_load".into());
         }
@@ -943,6 +944,7 @@ mod tests {
             std::fs::write(&p, empty).unwrap();
             let s = load_shape(&p, &[]).unwrap();
             assert!(s.editor && !s.script_map && s.prims.is_empty(), "{empty:?}");
+            assert_eq!(s.bounds, s.base_bounds, "nothing to fit: the default bounds");
             s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
             s.compile_preview(&crate::viewer::preview_harness(&[], true)).unwrap();
         }

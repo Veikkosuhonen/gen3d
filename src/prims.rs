@@ -1202,6 +1202,8 @@ mod tests {
         let s = load_shape(&p, &[]).unwrap();
         assert!(!s.script_map);
         assert!(s.bounds.0[0] < -1.9 && s.bounds.1[0] > 42.0, "{:?}", s.bounds);
+        // only them, not the default bounds of a shape without any
+        assert_eq!(Some(s.bounds), grow_bounds(None, &s.prims, 2.0 * s.voxel));
         s.compile(&crate::mesher::compute_harness("map", 1)).unwrap();
         save(&sidecar(&p), &[], &[None; 3]).unwrap();
         load_shape(&p, &[])

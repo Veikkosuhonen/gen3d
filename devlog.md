@@ -3,6 +3,25 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Primitives-only shapes get bounds that fit them on load
+
+**Why:** a `.wgsl` without `fn map` whose `.prims.json` holds the shape should have bounds that fit
+its primitives. On load it got the default ±50 mm × 100 mm box added on top, so `optimize` and the
+first view used a bigger box than the part; after any edit in the app the bounds shrank to fit. The
+user's `stand_leg` (a 20 × 200 × 100 mm box) got a 102 mm wide grid.
+
+**What:** `load_shape` set the bounds from the primitives before it knew whether the script has a
+map of its own (`script_map` still held its default, `true`), so the default bounds counted as
+declared. The bounds are now computed after.
+
+**Result:** `stand_leg`'s bounds fit it: the automatic element size goes from 1.9 mm (56k elements) to
+1.2 mm (223k), as intended for the GPU solver's 300k target.
+
+**Verified:** the primitives-only test checks the bounds equal the primitives' own; an empty shape
+still gets the default box.
+
+**Still open:** —
+
 ## 2026-11-14: Fair the voxel surface of optimized parts
 
 **Why:** exported optimization results still showed voxel terraces, even with `density_filtered` and
