@@ -297,6 +297,8 @@ struct Win {
     dirty: std::cell::Cell<bool>,
     /// the view uniforms of the image in the viewport target
     drawn: Vec<u8>,
+    /// the same without the animation time: when these change, the view itself changed
+    drawn_still: Vec<u8>,
 }
 
 impl Win {
@@ -333,6 +335,7 @@ impl Win {
             mesh: None,
             dirty: std::cell::Cell::new(true),
             drawn: vec![],
+            drawn_still: vec![],
         }
     }
 
@@ -413,6 +416,8 @@ struct App {
     last_poll: Instant,
     /// when the next frame is due (None: only on input or a change)
     next_frame: Option<Instant>,
+    /// the preview animates until then (see `animating`)
+    anim_until: Option<Instant>,
     /// viewport renders since `fps_t`, and their rate (shown while the viewport redraws)
     preview_frames: u32,
     fps: f32,
@@ -422,6 +427,10 @@ struct App {
 /// Frame rate of the preview's animation (the load bands move 1.5 bands per second, so this looks as
 /// smooth as the display's refresh rate at a fraction of the GPU time).
 const ANIMATION_FPS: f32 = 30.0;
+
+/// How long the preview animates after the view changes (camera, options, overlay, reload); then it
+/// freezes, so an idle window doesn't keep the GPU busy.
+const ANIMATION_SECS: f32 = 3.0;
 
 fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
@@ -940,6 +949,7 @@ impl App {
             win: None,
             last_poll: Instant::now(),
             next_frame: None,
+            anim_until: None,
             preview_frames: 0,
             fps: 0.0,
             fps_t: Instant::now(),
@@ -3785,6 +3795,19 @@ impl App {
         };
         let mut key = bytemuck::bytes_of(&u).to_vec();
         key.push(shown_mesh as u8);
+        // a change other than the animation's time restarts the animation
+        let still = if shown_mesh {
+            key.clone()
+        } else {
+            let t = std::mem::replace(&mut self.opts.time, 0.0);
+            let u = uniforms(&self.shape, &self.cam, &self.opts, win.viewport.size, true);
+            self.opts.time = t;
+            bytemuck::bytes_of(&u).to_vec()
+        };
+        if win.dirty.get() || still != win.drawn_still {
+            win.drawn_still = still;
+            self.anim_until = Some(Instant::now() + Duration::from_secs_f32(ANIMATION_SECS));
+        }
         let preview = (win.dirty.get() || key != win.drawn).then(|| {
             win.gpu.queue.write_buffer(&win.ubuf, 0, bytemuck::bytes_of(&u));
             win.dirty.set(false);
@@ -3829,10 +3852,11 @@ impl App {
     }
 
     /// Whether the preview animates: the moving bands of a shown vector field overlay (the load
-    /// directions). Only then does its time uniform advance and the viewport redraw (at
-    /// `ANIMATION_FPS`). The bands hold still while an optimization runs, which needs the GPU.
+    /// directions), for `ANIMATION_SECS` after the view last changed. Only then does its time
+    /// uniform advance and the viewport redraw (at `ANIMATION_FPS`). The bands hold still while an
+    /// optimization runs, which needs the GPU.
     fn animating(&self) -> bool {
-        if self.opt_job.running() {
+        if self.opt_job.running() || self.anim_until.is_none_or(|t| Instant::now() >= t) {
             return false;
         }
         let mesh_shown = self

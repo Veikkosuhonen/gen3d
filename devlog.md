@@ -3,6 +3,25 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Animate the load bands for 3 s, then freeze
+
+**Why:** even at 30 fps the moving load-direction bands kept the GPU 60–95% busy with the window
+idle (a viewport raymarch takes 21–32 ms), on any shape with loads.
+
+**What:** the preview animates for `ANIMATION_SECS` = 3 after the view changes, then stops.
+"The view changed" means the viewport was marked out of date (`Win::touch`: pipeline, parameters,
+primitives, volume, mesh, size) or its uniforms changed apart from the time (camera, options,
+overlay mode), compared through a second copy of the uniforms with the time zeroed
+(`Win::drawn_still`). The animation's own frames change only the time, so they don't extend it.
+The pause during an optimization stays.
+
+**Result** (GPU utilization per second after opening the window; baseline 0–4%):
+- bracket_editor: 4 96 95 95 0 0 4 0 0 0
+- bracket_domain: 60 63 61 49 5 0 4 0 0 0
+
+**Verified:** the timelines above; clippy clean. Restarting on orbiting or changing the overlay
+mode is by construction (both change the uniforms); not driven by hand here.
+
 ## 2026-11-14: Throttle the preview animation, and pause it while optimizing
 
 **Why:** after on-demand drawing, the moving load-direction bands were the one thing still redrawing
@@ -20,9 +39,8 @@ stops advancing and the viewport redraws only on changes.
 **Verified:** measured as above, with the render rate logged (30 fps). The pause during an
 optimization follows from `animating()`; not measured with a job running from the app.
 
-**Still open:** animating at all costs most of the GPU on heavier shapes. Options: static bands,
-a lower rate, animating only for a few seconds after the overlay appears, or a lower-resolution
-viewport while animating.
+**Still open:** animating at all costs most of the GPU on heavier shapes (since then: it animates
+only for 3 s after a change, see above).
 
 ## 2026-11-14: Draw the viewport on demand
 

@@ -260,8 +260,8 @@ fields it finds.
 
 `view` and `render` draw each field's region as a coloured overlay on the surface and on the section face,
 and print a colour legend. Scalar fields are shown where they are `< 0`, and vector fields where they are
-non-zero, with bands that move in the vector's direction. Overlapping regions alternate in diagonal
-stripes. The lookup happens half a voxel inside the surface (where the exported grid samples the field),
+non-zero, with bands that move in the vector's direction (for 3 s after the view changes, then they
+hold still so an idle window leaves the GPU alone). Overlapping regions alternate in diagonal stripes. The lookup happens half a voxel inside the surface (where the exported grid samples the field),
 so a shell written around a hole shows on the hole wall. Regions buried inside the part only appear in
 the section view (`C`). `F` cycles the overlays.
 
