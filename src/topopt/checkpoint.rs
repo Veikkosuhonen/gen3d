@@ -50,7 +50,7 @@ pub(super) fn path(out: &Path) -> PathBuf {
 /// tolerance and the solver may change.
 fn settings_key(s: &Settings) -> String {
     format!(
-        "voxel {} volfrac {} penal {} rmin {} E {} nu {} force {} beta_max {} emin {} ground {} coarse_start {} symmetry {}",
+        "voxel {} volfrac {} penal {} rmin {} E {} nu {} force {} beta_max {} emin {} ground {} coarse_start {} symmetry {} overhang {}",
         s.voxel,
         s.volfrac,
         s.penal,
@@ -62,7 +62,8 @@ fn settings_key(s: &Settings) -> String {
         s.emin,
         s.ground.name(),
         s.coarse_start,
-        s.symmetry
+        s.symmetry,
+        s.overhang
     )
 }
 
@@ -228,6 +229,7 @@ mod tests {
             ground: Ground::None,
             coarse_start: true,
             symmetry: true,
+            overhang: false,
         }
     }
 

@@ -72,7 +72,8 @@ pub struct Volume {
     pub hist: Vec<u32>,
 }
 
-/// The optimizer's filtered densities (x̃ before the Heaviside projection). Where a file has it, the
+/// The optimizer's filtered densities (x̃ before the Heaviside projection; with overhang control the
+/// AM filter's x̂, which is the projection's input then). Where a file has it, the
 /// surface of `density` is taken from it: x̃ = 0.5 is the same boundary as density = 0.5 (the
 /// projection maps 0.5 to 0.5), but x̃ varies smoothly across it, so the surface is placed between
 /// samples instead of following the voxels in steps. It is NaN outside the design domain, which

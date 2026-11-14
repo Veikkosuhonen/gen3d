@@ -3,6 +3,62 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Overhang control (AM filter), on by default
+
+**Why:** optimized parts were full of ledges and down-facing surfaces that need support material,
+which is hard to remove from organic shapes. 3% of the bracket's solid design elements had nothing
+under them.
+
+**What:** Langelaar's additive-manufacturing filter (`src/topopt/overhang.rs`). It sits between the
+density filter and the projection: x → x̃ → x̂ → x_phys. Going up from the plate (the lowest layer of
+the domain), x̂_e = smin(x̃_e, smax(x̂ of the 5 elements under e: below, and the 4 beside that)). This
+gives 45° in x and y (about 55° diagonally). The filter increases with every input, so OC works
+unchanged. The chain rule is an adjoint sweep from the top layer down.
+- GPU: `am_fwd` / `am_adj` in `opt.wgsl`, one dispatch per layer. `am_adj` gathers from the layer
+  above, handles mirror planes (a column on a plane counts its own column twice) and applies the
+  density filter's 1/weight-sum that `sens` skips in this mode.
+- smax is scaled by the supports' largest density, m·(Σ(ξ/m)^40)^(1/Q). Unscaled, ξ^40 underflows
+  in f32 below ξ ≈ 0.1, where smax is still about 0.07. The GPU drifted 0.8% from the CPU by
+  iteration 5 until that was fixed.
+- `density_filtered` is now x̂, so its 0.5 surface stays the boundary of `density`.
+- `--no-overhang`, the app's *Printable without supports* checkbox, and the overhang setting in the
+  checkpoint key. A mirror plane in z is dropped when overhang control is on.
+- Every run (with or without overhang control) ends with a line counting unsupported solid design
+  elements, and kept-solid ones separately.
+
+**Result** (GPU, default settings; unsupported = solid design elements with no solid support):
+
+| Shape | Overhang | Iterations | Time | Compliance | Unsupported |
+|---|---|---|---|---|---|
+| bracket | off | 60 | 7.4 s | 8.202 | 2640 (3.3%) |
+| bracket | on | 115 | 16.5 s | 7.878 | 0 |
+| bracket_editor | off | 57 | 10.1 s | 16.95 | 1754 (2.3%)* |
+| bracket_editor | on | 125 | 26.4 s | 17.38 | 0* |
+| book_stand1 @ 3.2 mm, grip | off | 70 | 11.0 s | 0.8011 | 31 (0.1%) |
+| book_stand1 @ 3.2 mm, grip | on | 78 | 13.2 s | 0.8347 | 0 |
+| table, grip | off | 55 | 11.2 s | 4.155 | 45 (0.2%) |
+| table, grip | on | 73 | 15.9 s | 4.662 | 0 |
+
+\* bracket_editor's counts are from before the report split off kept-solid elements; the remaining
+228 there are kept-solid.
+
+Compliance is 2–12% higher, except on the bracket, which found a better layout (−4%). A filter pass
+costs little (the bracket's fine update step is 0.04 s either way). The time goes into iterations:
+the design keeps moving longer. Kept-solid regions are printed as given; on the bracket 453 of their
+elements overhang (the top of the horizontal bolt-hole rings). The table's opening becomes a pointed
+arch.
+
+**Verified:** `overhang::tests`: a staircase and a supported top element pass, a floating element
+is removed, the plate is the lowest domain layer, a mirror plane doubles the support. Finite
+differences match the adjoint (with and without mirror planes, and at densities 0.1 where ξ^40
+underflows in f32). `gpu_loop_matches_cpu_loop` now also runs with overhang control at β 0 and 8.
+Checked the UI checkbox with `snapshot`. All tests pass; clippy clean.
+
+**Still open:** an overhang report for any mesh in the Print step; angles other than 45°; print
+directions other than +z (rotate the shape). stand_leg (--ground grip, 1.9 mm) fails with "GPU CG
+diverged" on its fine grid, with or without overhang control or symmetry, on HEAD too: not caused
+by this change, still to investigate.
+
 ## 2026-11-14: Supports and loads mark a region by default
 
 **Why:** a primitive's role (design, keep solid, fixed, load) and its operation (add, subtract,

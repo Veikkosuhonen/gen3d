@@ -71,7 +71,7 @@ struct Grid {
 /// preview).
 pub(super) struct Snapshot {
     pub density: Vec<f32>,
-    /// the filtered densities x̃ before projection: smooth where `density` is nearly binary, with
+    /// the densities before projection (x̃, or with overhang control the AM filter's x̂): smooth where `density` is nearly binary, with
     /// the same 0.5 surface (the projection's threshold), so it is what the mesher polygonizes.
     /// NaN outside the design domain, which tells the mesher where the domain ends.
     pub filtered: Vec<f32>,

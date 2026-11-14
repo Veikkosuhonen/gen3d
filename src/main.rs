@@ -301,6 +301,10 @@ enum Cmd {
         /// problem is solved on one side of them)
         #[arg(long)]
         no_symmetry: bool,
+        /// allow overhangs: by default the part is kept printable along +z without support material
+        /// (no overhang shallower than 45°, the lowest layer of the design domain on the plate)
+        #[arg(long)]
+        no_overhang: bool,
         /// density filter radius in voxels (larger = thicker, simpler members)
         #[arg(long, default_value_t = 1.5)]
         rmin: f64,
@@ -646,6 +650,7 @@ fn run(cli: Cli) -> Result<()> {
             no_projection,
             no_coarse_start,
             no_symmetry,
+            no_overhang,
             rmin,
             penal,
             force,
@@ -684,6 +689,7 @@ fn run(cli: Cli) -> Result<()> {
                 ground,
                 coarse_start: !no_coarse_start,
                 symmetry: !no_symmetry,
+                overhang: !no_overhang,
             };
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
             topopt::run(&shape, &settings, &out, &gpu, resume)?;
@@ -720,6 +726,7 @@ fn run(cli: Cli) -> Result<()> {
                     ground: topopt::Ground::None,
                     coarse_start: false,
                     symmetry: true,
+                    overhang: false,
                 };
                 let problem = topopt::setup(&shape, &settings, &gpu)?;
                 let ne = problem.domain.iter().filter(|d| **d).count();

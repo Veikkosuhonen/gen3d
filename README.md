@@ -174,7 +174,8 @@ camera presets, section view, bounds box, clipping and render resolution.
   hidden inside script geometry can still be clicked.
 - **2 Optimize** (for shapes with `field_fixed` and `field_load`, see
   [Topology optimization](#topology-optimization)): material share, load, element size, minimum member
-  size, iterations, crisp 0/1. **Optimize** runs in the background with a progress bar; from the first
+  size, iterations, crisp 0/1, printable without supports (on by default, see
+  [overhang control](#overhang-control)). **Optimize** runs in the background with a progress bar; from the first
   iteration the viewport shows the result growing. Then pick the threshold on its histogram (with the
   material volume in cm³ and grams), optionally colour by `energy` or `displacement`, and continue
   with **Print the result**.
@@ -214,7 +215,7 @@ gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
 gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
-gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--no-symmetry] [--modulus MPA] [--nu V] [-o out.vti] [--resume]
+gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--no-symmetry] [--no-overhang] [--modulus MPA] [--nu V] [-o out.vti] [--resume]
 
 .vti options (render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
@@ -435,6 +436,23 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
     100k domain elements (below that each pattern's fixed costs outweigh the smaller grid);
     `--no-symmetry` solves the whole part (on the same aligned grid). A problem that isn't symmetric
     after all (a script's own supports, `--ground` with a Z plane) is solved whole, with a note.
+- **Overhang control** (on by default; `--no-overhang`, or untick *Printable without supports* in
+  the app, turns it off): the result is printable as the shape stands, +z up, without support
+  material. No surface faces down more than 45° from vertical. The lowest layer of the design domain
+  is the build plate. This is Langelaar's additive-manufacturing filter (2017): going up layer by
+  layer, an element is only as dense as a smooth maximum of the 5 elements under it (below, and the 4
+  beside that one) allows. It sits between the density filter and the projection, and the optimizer
+  differentiates through it, so it grows 45° chamfers and arches instead of ledges rather than having
+  them cut off afterwards. `optimize` ends with the count of unsupported solid elements (0 for the
+  optimized material; a few at the boundary are possible).
+  - Kept-solid regions are printed as given: one that overhangs (a horizontal hole's ring arching
+    over the hole, a tabletop marked keep solid) still needs supports or bridging, and is counted
+    separately. Material can stand on them.
+  - 45° is along x and y; diagonally the limit is a little steeper (about 55°). Bridges are not
+    allowed either. Rotate the shape to print it another way up.
+  - A mirror plane in z isn't used (printing breaks that symmetry); x and y planes are.
+  - Cost: per iteration a few percent (two sweeps over the layers, one up and one down). The runs
+    tend to take more iterations.
 - **Projection or not:** with projection the result is crisp (0% grey on the bracket against 24%
   without) and stiffer for the same material (compliance 8.96 against 10.36 N·mm). Thresholding at
   0.5 then matches `--volfrac` closely. The cost is about 1.7× the iterations. Because each voxel is now
@@ -458,7 +476,7 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
   - The GPU path needs 164 B per element (`optimize` prints it), so a 10 GB card holds about 45M.
     Past that, `optimize` says it doesn't fit. The CPU solver allows 8M (~1.2 kB each).
 - **Shortcuts in this version:**
-  - No symmetry or overhang (printability) constraints.
+  - Overhang control only prints along +z, at 45°.
 
 ## Mesh quality notes
 
@@ -511,9 +529,10 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/topopt/mod.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
 | `src/topopt/mg.rs` | multigrid preconditioner: Galerkin coarse levels, Chebyshev/Jacobi smoothers, banded Cholesky |
 | `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32) |
-| `src/topopt/gpu_opt.rs`, `opt.wgsl` | the optimizer loop on the GPU: stiffness, sensitivities, filter, projection, OC |
+| `src/topopt/gpu_opt.rs`, `opt.wgsl` | the optimizer loop on the GPU: stiffness, sensitivities, filter, AM filter, projection, OC |
 | `src/topopt/gpu_engine.rs` | GPU kernels as recorded dispatch programs, reductions, scalars, readback |
 | `src/topopt/output.rs` | writing the result as it runs: background writes, decimated previews, full result on Stop |
+| `src/topopt/overhang.rs` | overhang control: the AM filter (layer-by-layer smooth min/max), its adjoint, the unsupported-element count |
 | `src/topopt/symmetry.rs` | mirror symmetry: the reduced model (one side), load parts per symmetric/antisymmetric pattern, expanding the fields back |
 | `src/topopt/checkpoint.rs` | stop and resume: the `.resume` checkpoint next to the result |
 | `src/wgsl/sdf.wgsl` | the SDF library |

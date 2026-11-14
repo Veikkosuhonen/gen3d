@@ -14,7 +14,8 @@
 //! grid) preconditioned by a geometric multigrid V-cycle. The whole iteration runs either on the GPU
 //! in f32 (`gpu_opt`, `gpu_mg`) or on the CPU (`optimize` below with `mg`, multithreaded; the
 //! reference the GPU path is tested against). Jacobi-preconditioned CG is kept as a fallback. It then computes the compliance sensitivities, applies a density filter and updates the
-//! densities with the optimality-criteria method under a volume constraint. The current design is
+//! densities with the optimality-criteria method under a volume constraint. With overhang control
+//! (`overhang.rs`) the AM filter sits between the density filter and the projection. The current design is
 //! written to a .vti as it runs, so `gen3d view` can watch it live.
 //!
 //! Units: mm, N, MPa. With the default PLA-like modulus the displacements are real millimetres.
@@ -41,6 +42,7 @@ mod gpu_mg;
 mod gpu_opt;
 pub mod mg;
 mod output;
+mod overhang;
 mod symmetry;
 
 /// Linear solver for K u = f.
@@ -89,6 +91,8 @@ pub struct Settings {
     pub coarse_start: bool,
     /// use the shape's mirror planes: solve one side of a symmetric problem (see `symmetry.rs`)
     pub symmetry: bool,
+    /// keep overhangs to 45° or steeper when printed along +z (the AM filter, `overhang.rs`)
+    pub overhang: bool,
 }
 
 /// How the bottom of the design domain is supported (`--ground`). The optimizer decides where the
@@ -1187,7 +1191,7 @@ const CG_MAXIT: usize = 20_000;
 /// z = M⁻¹ r
 type Precond<'a> = dyn FnMut(&[f64], &mut [f64]) + 'a;
 
-/// Run the optimization, writing the design to `out` (cell `density`, cell `density_filtered` (x̃,
+/// Run the optimization, writing the design to `out` (cell `density`, cell `density_filtered` (x̂,
 /// what gets meshed), cell `energy` in MPa, point `displacement` in mm). The file is rewritten as often as keeps writing under ~10% of the run
 /// time (every iteration on small grids), and always after the last iteration.
 pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Result<Outcome> {
@@ -1199,7 +1203,13 @@ fn mirror_axes(shape: &Shape, s: &Settings) -> [bool; 3] {
     if !s.symmetry || !shape.editor {
         return [false; 3];
     }
-    shape.mirror.map(|m| m.is_some())
+    let mut axes = shape.mirror.map(|m| m.is_some());
+    // printing along +z breaks the symmetry about a plane in z
+    if s.overhang && axes[2] {
+        println!("symmetry: not using the mirror plane in z (overhang control prints along +z)");
+        axes[2] = false;
+    }
+    axes
 }
 
 /// Fewest domain elements (of the whole part) for solving one side of the mirror planes. Below
@@ -1409,6 +1419,17 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
         .collect();
     let emin = s.e0 * s.emin;
     let filter = Filter::new(p, s.rmin, m.mirror_axes());
+    let am = s.overhang.then(|| overhang::Am::new(p, m.mirror_axes()));
+    // x̃ → x̂: the AM filter's printed densities (with its forward pass), or x̃ itself
+    let print = |xtilde: Vec<f64>| -> (Vec<f64>, Option<overhang::Printed>) {
+        match &am {
+            Some(am) => {
+                let fw = am.forward(p, &xtilde);
+                (fw.xi.clone(), Some(fw))
+            }
+            None => (xtilde, None),
+        }
+    };
     let mut proj = Projection {
         beta: if s.beta_max > 0.0 { 1.0 } else { 0.0 },
         eta: 0.5,
@@ -1430,7 +1451,8 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
         proj.beta = *beta;
     }
     let mut xtilde = filter.densities(p, &x);
-    let mut xphys = proj.densities(p, &xtilde);
+    let (mut xhat, mut printed) = print(xtilde.clone());
+    let mut xphys = proj.densities(p, &xhat);
     let mut us: Vec<Vec<Vec<f64>>> = fs
         .iter()
         .map(|g| g.iter().map(|f| vec![0.0; f.len()]).collect())
@@ -1466,6 +1488,9 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
             "no projection".into()
         }
     );
+    if let Some(am) = &am {
+        println!("overhang: at most 45°, printed along +z from layer {}", am.base);
+    }
     // the last iteration's output, until it is written
     // the last iteration's full fields, until written
     let mut pending: Option<Snapshot> = None;
@@ -1565,13 +1590,21 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
                 }
             })
             .collect();
-        // chain rule: projection, then filter (the volume sensitivity changes with the projection)
-        let dproj: Vec<f64> = (0..ne).map(|e| proj.deriv(xtilde[e])).collect();
+        // chain rule: projection, AM filter, then density filter (the volume sensitivity changes
+        // with the projection and the AM filter)
+        let dproj: Vec<f64> = (0..ne).map(|e| proj.deriv(xhat[e])).collect();
         let dc: Vec<f64> = (0..ne).map(|e| dc[e] * dproj[e]).collect();
+        let (dc, dv) = match (&am, &printed) {
+            (Some(am), Some(fw)) => (
+                am.sensitivities(p, &xtilde, fw, &dc),
+                am.sensitivities(p, &xtilde, fw, &dproj),
+            ),
+            _ => (dc, dproj),
+        };
         let dc = filter.sensitivities(p, &dc);
-        let dv = filter.sensitivities(p, &dproj);
+        let dv = filter.sensitivities(p, &dv);
         let used_xphys = xphys.clone();
-        let used_xtilde = xtilde.clone();
+        let used_xhat = xhat.clone();
 
         // optimality criteria: bisect the Lagrange multiplier to meet the volume. With dc scaled by
         // the compliance, λ is O(1) and moves little between iterations, so the search starts from
@@ -1587,7 +1620,7 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
                 let be = (-dc[e] * cscale).max(0.0) / (dv[e] * lam).max(1e-300);
                 xnew[e] = (x[e] * be.sqrt()).clamp((x[e] - mv).max(0.0), (x[e] + mv).min(1.0));
             }
-            let trial = proj.densities(p, &filter.densities(p, xnew));
+            let trial = proj.densities(p, &print(filter.densities(p, xnew)).0);
             design.iter().map(|&e| trial[e]).sum::<f64>()
         };
         // volume falls as λ grows: find l1 < l2 with vol(l1) > target >= vol(l2)
@@ -1619,7 +1652,8 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
         let change = design.iter().map(|&e| (xnew[e] - x[e]).abs()).fold(0.0, f64::max);
         last_change = change;
         xtilde = filter.densities(p, &xnew);
-        xphys = proj.densities(p, &xtilde);
+        (xhat, printed) = print(xtilde.clone());
+        xphys = proj.densities(p, &xhat);
         x = xnew;
 
         // per case and mirror side: the groups' parts with their signs there
@@ -1654,7 +1688,7 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
         let t3 = Instant::now();
         let snap = Snapshot {
             density: used_xphys.iter().map(|&v| v as f32).collect(),
-            filtered: output::filtered_out(p, used_xtilde.iter().map(|&v| v as f32)),
+            filtered: output::filtered_out(p, used_xhat.iter().map(|&v| v as f32)),
             energy: (0..ne).map(|e| (0.5 * ee[e] * ce[e] / p.h.powi(3)) as f32).collect(),
             // per group, per case (the output combines them)
             disps: us
@@ -1698,7 +1732,7 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
             Next::Go => {}
             Next::Beta(b) => {
                 proj.beta = b;
-                xphys = proj.densities(p, &xtilde);
+                xphys = proj.densities(p, &xhat);
             }
             Next::Stop => break,
         }
@@ -1708,6 +1742,10 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
             result.stopped = true;
             break;
         }
+    }
+    // also without overhang control (when it can tell: no mirror plane in z)
+    if !m.mirror_axes()[2] {
+        overhang::Am::new(p, m.mirror_axes()).report(p, &xphys);
     }
     result.beta = proj.beta;
     result.state = LoopState {
@@ -1953,6 +1991,7 @@ pub(super) mod tests {
             ground: Ground::None,
             coarse_start: false,
             symmetry: true,
+            overhang: false,
         }
     }
 
@@ -2090,6 +2129,7 @@ pub(super) mod tests {
             ground: Ground::None,
             coarse_start: false,
             symmetry: true,
+            overhang: false,
         };
         // iterations until `next` says Stop at β, for a compliance sequence
         let run = |beta: f64, seq: &dyn Fn(usize) -> f64| {
@@ -2209,6 +2249,7 @@ pub(super) mod tests {
             ground: Ground::None,
             coarse_start: false,
             symmetry: true,
+            overhang: false,
         };
         let p = setup(&shape, &s, &gpu).unwrap();
         assert_eq!(p.cases, [1, 2]);
@@ -2336,6 +2377,7 @@ pub(super) mod tests {
             ground: Ground::None,
             coarse_start: false,
             symmetry: true,
+            overhang: false,
         };
         let err = setup(&shape, &s, &gpu).err().unwrap().to_string();
         assert!(err.contains("needs supports"), "{err}");

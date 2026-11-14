@@ -163,6 +163,8 @@ struct OptUi {
     /// Heaviside projection (crisp 0/1 designs)
     projection: bool,
     ground: Ground,
+    /// overhang control: printable along +z without support material
+    overhang: bool,
 }
 
 impl Default for OptUi {
@@ -175,6 +177,7 @@ impl Default for OptUi {
             rmin: 1.5,
             projection: true,
             ground: Ground::None,
+            overhang: true,
         }
     }
 }
@@ -2508,6 +2511,9 @@ impl App {
         if !o.projection {
             a.push("--no-projection".into());
         }
+        if !o.overhang {
+            a.push("--no-overhang".into());
+        }
         if o.ground != Ground::None {
             a.extend(["--ground".into(), o.ground.name().into()]);
         }
@@ -3293,6 +3299,15 @@ impl App {
                 ui.selectable_value(g, Ground::Grip, "grips")
                     .on_hover_text("held in all directions: a grippy surface, or glued down");
             });
+        });
+        ui.add_enabled_ui(!self.opt_job.running(), |ui| {
+            ui.checkbox(&mut self.opt.overhang, "Printable without supports")
+                .on_hover_text(
+                    "no overhang shallower than 45°, printed as the shape stands (+z up) from the bottom of \
+                 the design domain. Material is only placed where the layer below can carry it, so the \
+                 part may be a little less stiff. Kept-solid regions are printed as they are: one that \
+                 overhangs still needs supports. Rotate the shape to print it another way up.",
+                );
         });
         if self.design_shape.as_ref().is_some_and(|s| s.editor) && !self.opt_job.running() {
             ui.horizontal_wrapped(|ui| {
