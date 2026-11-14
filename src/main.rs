@@ -290,6 +290,10 @@ enum Cmd {
         /// element size first (slower; the coarse start applies from 80k domain elements)
         #[arg(long)]
         no_coarse_start: bool,
+        /// solve the whole part even when the shape has mirror planes (by default a symmetric
+        /// problem is solved on one side of them)
+        #[arg(long)]
+        no_symmetry: bool,
         /// density filter radius in voxels (larger = thicker, simpler members)
         #[arg(long, default_value_t = 1.5)]
         rmin: f64,
@@ -629,6 +633,7 @@ fn run(cli: Cli) -> Result<()> {
             beta_max,
             no_projection,
             no_coarse_start,
+            no_symmetry,
             rmin,
             penal,
             force,
@@ -666,6 +671,7 @@ fn run(cli: Cli) -> Result<()> {
                 adaptive_tol: !solver.fixed_cg_tol,
                 ground,
                 coarse_start: !no_coarse_start,
+                symmetry: !no_symmetry,
             };
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
             topopt::run(&shape, &settings, &out, &gpu, resume)?;
@@ -701,6 +707,7 @@ fn run(cli: Cli) -> Result<()> {
                     adaptive_tol: !solver.fixed_cg_tol,
                     ground: topopt::Ground::None,
                     coarse_start: false,
+                    symmetry: true,
                 };
                 let problem = topopt::setup(&shape, &settings, &gpu)?;
                 let ne = problem.domain.iter().filter(|d| **d).count();

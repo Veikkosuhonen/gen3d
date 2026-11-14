@@ -17,7 +17,7 @@ use std::time::Instant;
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 
-use super::Problem;
+use super::symmetry::{Model, Sym};
 
 /// Grids with more elements than this get a decimated, density-only live preview.
 pub(super) const PREVIEW_CELLS: usize = 4_000_000;
@@ -42,7 +42,7 @@ pub(super) fn catch_stop() {
 }
 
 /// x̃ as written: NaN outside the domain (see `Snapshot::filtered`).
-pub(super) fn filtered_out(p: &Problem, xtilde: impl Iterator<Item = f32>) -> Vec<f32> {
+pub(super) fn filtered_out(p: &super::Problem, xtilde: impl Iterator<Item = f32>) -> Vec<f32> {
     xtilde
         .zip(&p.domain)
         .map(|(v, &d)| if d { v } else { f32::NAN })
@@ -61,6 +61,10 @@ struct Grid {
     h: f64,
     /// displacement array names, per load case
     names: Vec<String>,
+    /// a reduced (symmetric) model: its fields are mirrored onto this grid, and each case's
+    /// displacement is combined from its parts in the groups (`Snapshot::disps` is per group, per
+    /// case)
+    sym: Option<Sym>,
 }
 
 /// One iteration's output fields (`filtered`, `energy` and `disps` empty for a density-only
@@ -72,15 +76,22 @@ pub(super) struct Snapshot {
     /// NaN outside the design domain, which tells the mesher where the domain ends.
     pub filtered: Vec<f32>,
     pub energy: Vec<f32>,
+    /// per load case (with symmetry: per group, per case)
     pub disps: Vec<Vec<f32>>,
 }
 
 impl Grid {
-    fn of(p: &Problem) -> Grid {
+    fn of(m: &Model) -> Grid {
+        let p = m.p();
+        let (n, origin) = match &m.sym {
+            Some(s) => (s.full_n, s.full_origin),
+            None => (p.n, p.origin),
+        };
         Grid {
-            n: p.n,
-            origin: p.origin,
+            n,
+            origin,
             h: p.h,
+            sym: m.sym.clone(),
             names: p
                 .cases
                 .iter()
@@ -96,19 +107,40 @@ impl Grid {
         }
     }
 
+    /// A cell array on this grid (mirrored from the reduced one).
+    fn cells<'a>(&self, v: &'a [f32]) -> std::borrow::Cow<'a, [f32]> {
+        match &self.sym {
+            Some(sym) if !v.is_empty() => sym.expand_cells(v).into(),
+            _ => v.into(),
+        }
+    }
+
     fn write(&self, s: &Snapshot, out: &Path) -> Result<u64> {
+        let (density, filtered, energy) = (self.cells(&s.density), self.cells(&s.filtered), self.cells(&s.energy));
+        let disps: Vec<std::borrow::Cow<[f32]>> = match &self.sym {
+            Some(sym) if !s.disps.is_empty() => {
+                let cases = self.names.len();
+                (0..cases)
+                    .map(|c| {
+                        let parts: Vec<&[f32]> = (0..sym.patterns.len()).map(|g| &s.disps[g * cases + c][..]).collect();
+                        sym.expand_disp(&parts).into()
+                    })
+                    .collect()
+            }
+            _ => s.disps.iter().map(|d| d[..].into()).collect(),
+        };
         let mut arrays = vec![crate::vti::GridArray {
             name: "density",
             cell: true,
             comps: 1,
-            data: &s.density,
+            data: &density,
         }];
         if !s.filtered.is_empty() {
             arrays.push(crate::vti::GridArray {
                 name: crate::volume::FILTERED,
                 cell: true,
                 comps: 1,
-                data: &s.filtered,
+                data: &filtered,
             });
         }
         if !s.energy.is_empty() {
@@ -116,10 +148,10 @@ impl Grid {
                 name: "energy",
                 cell: true,
                 comps: 1,
-                data: &s.energy,
+                data: &energy,
             });
         }
-        for (name, data) in self.names.iter().zip(&s.disps) {
+        for (name, data) in self.names.iter().zip(&disps) {
             arrays.push(crate::vti::GridArray {
                 name,
                 cell: false,
@@ -155,6 +187,7 @@ impl Grid {
             origin: self.origin,
             h: self.h * k as f64,
             names: vec![],
+            sym: None,
         };
         (g, out)
     }
@@ -172,8 +205,9 @@ pub(super) struct Output {
 }
 
 impl Output {
-    pub(super) fn new(p: &Problem, path: &Path) -> Output {
-        let ne: usize = p.n.iter().product();
+    pub(super) fn new(m: &Model, path: &Path) -> Output {
+        let grid = Grid::of(m);
+        let ne: usize = grid.n.iter().product();
         let k = if ne > PREVIEW_CELLS {
             (ne as f64 / PREVIEW_CELLS as f64).cbrt().ceil() as usize
         } else {
@@ -185,7 +219,7 @@ impl Output {
             );
         }
         Output {
-            grid: Grid::of(p),
+            grid,
             path: path.to_path_buf(),
             k,
             last: None,
@@ -234,7 +268,7 @@ impl Output {
         self.writer = Some(std::thread::spawn(move || {
             let t = Instant::now();
             let bytes = if k > 1 {
-                let (g, d) = grid.decimate(&s.density, k);
+                let (g, d) = grid.decimate(&grid.cells(&s.density), k);
                 g.write(
                     &Snapshot {
                         density: d,
@@ -279,6 +313,7 @@ mod tests {
             origin: [1.0, 2.0, 3.0],
             h: 0.5,
             names: vec![],
+            sym: None,
         };
         let d: Vec<f32> = (0..30).map(|i| i as f32).collect();
         let (c, v) = g.decimate(&d, 2);

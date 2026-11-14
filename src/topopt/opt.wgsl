@@ -42,14 +42,18 @@ fn weight_sum(e: u32) -> f32 {
     let rmin = P.g.z;
     let r = i32(ceil(rmin));
     var s = 0.0;
+    let mir = P.m.z;
     for (var dk = -r; dk <= r; dk++) {
-        let k = p.z + dk;
+        var k = p.z + dk;
+        if k < 0 && (mir & 4u) != 0u { k = -k - 1; }
         if k < 0 || k >= n.z { continue; }
         for (var dj = -r; dj <= r; dj++) {
-            let j = p.y + dj;
+            var j = p.y + dj;
+            if j < 0 && (mir & 2u) != 0u { j = -j - 1; }
             if j < 0 || j >= n.y { continue; }
             for (var di = -r; di <= r; di++) {
-                let i = p.x + di;
+                var i = p.x + di;
+                if i < 0 && (mir & 1u) != 0u { i = -i - 1; }
                 if i < 0 || i >= n.x { continue; }
                 let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
                 if w <= 0.0 { continue; }
@@ -88,6 +92,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 //// kernel filter
 // Cone filter over domain elements within P.f.x voxels (weights rmin - distance). P.m.y: 0 the raw
 // weighted sum on domain elements; 1 densities: kept-solid 1, domain the weighted mean, else 0.
+// P.m.z: axes (bits x, y, z) whose low face is a mirror plane: neighbours past it are the mirror
+// images (index -i - 1). The same in `sens`'s weight sums.
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
 @group(0) @binding(2) var<storage, read> inp: array<f32>;
 @group(0) @binding(3) var<storage, read_write> outp: array<f32>;
@@ -113,14 +119,18 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let r = i32(ceil(rmin));
     var s = 0.0;
     var ws = 0.0;
+    let mir = P.m.z;
     for (var dk = -r; dk <= r; dk++) {
-        let k = p.z + dk;
+        var k = p.z + dk;
+        if k < 0 && (mir & 4u) != 0u { k = -k - 1; }
         if k < 0 || k >= n.z { continue; }
         for (var dj = -r; dj <= r; dj++) {
-            let j = p.y + dj;
+            var j = p.y + dj;
+            if j < 0 && (mir & 2u) != 0u { j = -j - 1; }
             if j < 0 || j >= n.y { continue; }
             for (var di = -r; di <= r; di++) {
-                let i = p.x + di;
+                var i = p.x + di;
+                if i < 0 && (mir & 1u) != 0u { i = -i - 1; }
                 if i < 0 || i >= n.x { continue; }
                 let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
                 if w <= 0.0 { continue; }
@@ -138,7 +148,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 
 //// kernel oc
 // Optimality-criteria update of the design elements for multiplier λ = S[P.m.y], with the compliance
-// sensitivity scaled by 1 / |S[P.m.z]| and move limit P.f.x; other elements keep x.
+// sensitivity scaled by 1 / (|S[P.m.z]| P.f.y) (P.f.y: the whole part's compliance per the reduced
+// model's, see symmetry.rs) and move limit P.f.x; other elements keep x.
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
 @group(0) @binding(2) var<storage, read> x: array<f32>;
 @group(0) @binding(3) var<storage, read> dc: array<f32>;
@@ -157,7 +168,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         return;
     }
     let lam = S[P.m.y];
-    let cscale = 1.0 / max(abs(S[P.m.z]), 1e-30);
+    let cscale = 1.0 / max(abs(S[P.m.z]) * P.f.y, 1e-30);
     let be = max(-dc[e] * cscale, 0.0) / max(dv[e] * lam, 1e-30);
     let mv = P.f.x;
     xnew[e] = clamp(xe * sqrt(be), max(xe - mv, 0.0), min(xe + mv, 1.0));

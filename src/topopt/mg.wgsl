@@ -162,15 +162,31 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(2) var<storage, read> free: array<u32>;
 @group(0) @binding(3) var<storage, read> T: array<f32>;
 @group(0) @binding(4) var<storage, read_write> d: array<f32>;
+@group(0) @binding(5) var<storage, read> ke: array<f32>;
 
 // clamped-node mask of fine element (i, j, k): bit b set when its local node b is not free on all
-// axes (the table has no per-axis masks: a roller counts as clamped, so level 2 only approximates
-// the Galerkin product of level 1 there)
+// axes (the table's index; elements with partly free nodes don't use the table, see `fine_free`)
 fn fine_mask(i: u32, j: u32, k: u32, nf: vec3<u32>) -> u32 {
     var m = 0u;
     for (var b = 0u; b < 8u; b++) {
         if free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)] != 7u { m |= 1u << b; }
     }
+    return m;
+}
+
+// the free axes of fine element (i, j, k)'s 8 nodes, 3 bits each (node b at bits 3b..3b+2), with
+// bit 31 set when one of them is partly free (a roller, or a symmetry plane): the table of masked
+// element products only knows fully clamped nodes, so such an element's level-1 matrix is computed
+// directly with per-axis masks (`partial_entry`)
+fn fine_free(i: u32, j: u32, k: u32, nf: vec3<u32>) -> u32 {
+    var m = 0u;
+    var partial = false;
+    for (var b = 0u; b < 8u; b++) {
+        let f = free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)];
+        m |= f << (3u * b);
+        if f != 0u && f != 7u { partial = true; }
+    }
+    if partial { m |= 1u << 31u; }
     return m;
 }
 
@@ -202,8 +218,27 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             let fk = 2u * ek + ((c >> 2u) & 1u);
             if fi >= nf.x || fj >= nf.y || fk >= nf.z { continue; }
             let e = (fk * nf.y + fj) * nf.x + fi;
-            let base = (fine_mask(fi, fj, fk, nf) * 8u + c) * 576u + (3u * a) * 25u;
-            acc += ee[e] * vec3<f32>(T[base], T[base + 25u], T[base + 50u]);
+            let fm = fine_free(fi, fj, fk, nf);
+            if (fm >> 31u) != 0u {
+                // per-axis masks: Σ P[n, a] ke[(n, x), (n', x)] P[n', a] over free (n, x), (n', x)
+                var v = vec3<f32>(0.0);
+                for (var n = 0u; n < 8u; n++) {
+                    let pa = wgt(c, n, a);
+                    if pa == 0.0 { continue; }
+                    for (var n2 = 0u; n2 < 8u; n2++) {
+                        let pb = wgt(c, n2, a);
+                        if pb == 0.0 { continue; }
+                        for (var x = 0u; x < 3u; x++) {
+                            let free_both = ((fm >> (3u * n + x)) & (fm >> (3u * n2 + x)) & 1u) == 1u;
+                            if free_both { v[x] += pa * ke[(3u * n + x) * 24u + 3u * n2 + x] * pb; }
+                        }
+                    }
+                }
+                acc += ee[e] * v;
+            } else {
+                let base = (fine_mask(fi, fj, fk, nf) * 8u + c) * 576u + (3u * a) * 25u;
+                acc += ee[e] * vec3<f32>(T[base], T[base + 25u], T[base + 50u]);
+            }
         }
     }
     d[3u * node] = acc.x;
@@ -312,15 +347,31 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(3) var<storage, read> T: array<f32>;
 @group(0) @binding(4) var<storage, read> child: array<f32>;
 @group(0) @binding(5) var<storage, read_write> out: array<f32>;
+@group(0) @binding(6) var<storage, read> ke: array<f32>;
 
 // clamped-node mask of fine element (i, j, k): bit b set when its local node b is not free on all
-// axes (the table has no per-axis masks: a roller counts as clamped, so level 2 only approximates
-// the Galerkin product of level 1 there)
+// axes (the table's index; elements with partly free nodes don't use the table, see `fine_free`)
 fn fine_mask(i: u32, j: u32, k: u32, nf: vec3<u32>) -> u32 {
     var m = 0u;
     for (var b = 0u; b < 8u; b++) {
         if free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)] != 7u { m |= 1u << b; }
     }
+    return m;
+}
+
+// the free axes of fine element (i, j, k)'s 8 nodes, 3 bits each (node b at bits 3b..3b+2), with
+// bit 31 set when one of them is partly free (a roller, or a symmetry plane): the table of masked
+// element products only knows fully clamped nodes, so such an element's level-1 matrix is computed
+// directly with per-axis masks (`partial_entry`)
+fn fine_free(i: u32, j: u32, k: u32, nf: vec3<u32>) -> u32 {
+    var m = 0u;
+    var partial = false;
+    for (var b = 0u; b < 8u; b++) {
+        let f = free[elem_node(i, j, k, b, nf.x + 1u, nf.y + 1u)];
+        m |= f << (3u * b);
+        if f != 0u && f != 7u { partial = true; }
+    }
+    if partial { m |= 1u << 31u; }
     return m;
 }
 
@@ -331,6 +382,31 @@ var<workgroup> KP: array<f32, 576>;
 // rather than once per matrix entry
 var<workgroup> FW: array<f32, 64>;
 var<workgroup> FT: array<u32, 64>;
+// per fine element: its nodes' free axes when one is partly free (`fine_free`), else 0
+var<workgroup> FM: array<u32, 64>;
+// ke, for those elements' per-axis masked products
+var<workgroup> KE: array<f32, 576>;
+
+// entry idx of the level-1 matrix of fine element child c1 with node free axes fm (per-axis masks)
+fn partial_entry(c1: u32, fm: u32, idx: u32) -> f32 {
+    let r = idx / 24u;
+    let col = idx % 24u;
+    let a = r / 3u;
+    let x = r % 3u;
+    let b = col / 3u;
+    let y = col % 3u;
+    var v = 0.0;
+    for (var n = 0u; n < 8u; n++) {
+        if ((fm >> (3u * n + x)) & 1u) == 0u { continue; }
+        let pa = PW[(c1 * 8u + n) * 8u + a];
+        if pa == 0.0 { continue; }
+        for (var n2 = 0u; n2 < 8u; n2++) {
+            if ((fm >> (3u * n2 + y)) & 1u) == 0u { continue; }
+            v += pa * KE[(3u * n + x) * 24u + 3u * n2 + y] * PW[(c1 * 8u + n2) * 8u + b];
+        }
+    }
+    return v;
+}
 // wgt(c, a, b) at (c · 8 + a) · 8 + b, so the products below don't recompute it
 var<workgroup> PW: array<f32, 512>;
 
@@ -354,6 +430,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         PW[i] = wgt(i / 64u, (i / 8u) % 8u, i % 8u);
     }
     if virt {
+        for (var t = 0u; t < 9u; t++) {
+            KE[li + 64u * t] = ke[li + 64u * t];
+        }
         // thread li loads fine element c1 = li % 8 of level-1 child c2 = li / 8
         let c2 = li / 8u;
         let c1 = li % 8u;
@@ -362,14 +441,20 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         let fk = 2u * (2u * ck + ((c2 >> 2u) & 1u)) + ((c1 >> 2u) & 1u);
         var w = 0.0;
         var off = 0u;
+        var fm = 0u;
         if fi < nf.x && fj < nf.y && fk < nf.z {
             w = ee[(fk * nf.y + fj) * nf.x + fi];
             if w != 0.0 {
-                off = (fine_mask(fi, fj, fk, nf) * 8u + c1) * 576u;
+                fm = fine_free(fi, fj, fk, nf);
+                if (fm >> 31u) == 0u {
+                    fm = 0u;
+                    off = (fine_mask(fi, fj, fk, nf) * 8u + c1) * 576u;
+                }
             }
         }
         FW[li] = w;
         FT[li] = off;
+        FM[li] = fm;
     }
     workgroupBarrier();
     var acc: array<f32, 9>;
@@ -388,7 +473,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                     for (var c1 = 0u; c1 < 8u; c1++) {
                         let w = FW[c2 * 8u + c1];
                         if w != 0.0 {
-                            s += w * T[FT[c2 * 8u + c1] + idx];
+                            let fm = FM[c2 * 8u + c1];
+                            if fm != 0u {
+                                s += w * partial_entry(c1, fm, idx);
+                            } else {
+                                s += w * T[FT[c2 * 8u + c1] + idx];
+                            }
                         }
                     }
                 } else {

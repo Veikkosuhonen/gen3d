@@ -9,16 +9,17 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 
 use super::gpu_engine::{Engine, NONE, Params, Reduce, Step, dims4, threads};
-use super::gpu_mg::{GpuMg, MAXD};
+use super::gpu_mg::GpuMg;
 use super::mg::MgSettings;
 use super::output::{self, Output, Snapshot};
-use super::{CG_MAXIT, IterStats, LoadBasis, LoopState, Next, Outcome, Problem, Settings, Stage};
+use super::symmetry::Model;
+use super::{CG_MAXIT, IterStats, LoadBasis, LoopState, Next, Outcome, Settings, Stage};
 use crate::gpu::Gpu;
 
 /// Re-estimate the smoothers' λmax at least every this many optimizer iterations.
 const REESTIMATE_EVERY: usize = 5;
-/// CG iterations above which a solve with an old λmax estimate refreshes it (MGCG usually needs
-/// 4–16).
+/// CG iterations after which an unconverged solve refreshes the smoothers' λmax estimate (a long
+/// re-estimate if it was fresh) and carries on (MGCG usually needs 4–16).
 const STALE_CG_ITS: usize = 32;
 
 // scalar slots (gpu_mg uses those below 80)
@@ -28,7 +29,9 @@ const VOL: u32 = 98;
 const CHANGE: u32 = 99;
 const GREY: u32 = 100;
 const BETA: u32 = 101;
-/// max displacement of load case c at MAXD + c
+/// max displacement of load case c on mirror side r (index into `Model::regions`) at
+/// MAXD + c · regions + r
+const MAXD: u32 = 104;
 const MAX_CASES: usize = 24;
 
 /// Element arrays on the GPU.
@@ -47,32 +50,46 @@ struct Fields {
 }
 
 pub(super) fn optimize_gpu(
-    p: &Problem,
-    basis: &LoadBasis,
+    m: &Model,
+    bases: &[LoadBasis],
     s: &Settings,
     ms: &MgSettings,
     out: &Path,
     gpu: &Gpu,
     stage: &Stage,
 ) -> Result<Outcome> {
+    let p = m.p();
     let ke = super::hex_ke(s.nu);
     let ne = p.domain.len();
     let ndesign = (0..ne).filter(|&e| p.domain[e] && !p.passive[e]).count();
     if ndesign == 0 {
         bail!("no design elements: the domain is empty or entirely kept solid");
     }
-    if p.loads.len() > MAX_CASES {
+    let ncases = m.cases();
+    let regions = m.regions();
+    if ncases > MAX_CASES {
         bail!("at most {MAX_CASES} load cases on the GPU");
     }
-    let free = p.free_mask();
+    assert!(m.groups.len() <= super::gpu_mg::MAX_GROUPS);
     let e = Engine::new(gpu)?;
     let elements = ne as f64 / 1e6;
     let oom = |err: anyhow::Error| {
         anyhow::anyhow!("{err}: {elements:.1}M elements don't fit on this GPU; use a larger --voxel")
     };
-    let mg = gpu
-        .alloc_scoped(|| GpuMg::new(&e, p, basis, &ke, &free, ms))
+    // one hierarchy per group (its own supports); the others share the first one's element and
+    // scratch buffers
+    let mgs = gpu
+        .alloc_scoped(|| -> Result<Vec<GpuMg>> {
+            let mut out: Vec<GpuMg> = vec![];
+            for (g, group) in m.groups.iter().enumerate() {
+                let free = group.free_mask();
+                let made = GpuMg::new(&e, group, &bases[g], &ke, &free, ms, out.first().map(|o| (o, g)))?;
+                out.push(made);
+            }
+            Ok(out)
+        })
         .map_err(oom)??;
+    let mg = &mgs[0];
     let c = mg.coarsest();
     println!(
         "GPU multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
@@ -140,8 +157,10 @@ pub(super) fn optimize_gpu(
     let material = [emin as f32, s.e0 as f32, s.penal as f32, p.h as f32];
     let rmin = [s.rmin as f32, 0.0, 0.0, 0.0];
     // filter: mode 0 raw sums, 1 densities
+    // the mirror planes (at the grid's low faces) reflect the filter
+    let mirror = (0..3).filter(|&a| m.mirror_axes()[a]).fold(0u32, |b, a| b | 1 << a);
     let filter = |out: &mut Vec<Step>, mode: u32, inp: &wgpu::Buffer, outp: &wgpu::Buffer| {
-        elem(out, "filter", rmin, [0, mode, 0, 0], &[&f.flags, inp, outp])
+        elem(out, "filter", rmin, [0, mode, mirror, 0], &[&f.flags, inp, outp])
     };
     // xin -> xtilde -> xphys
     let densities = |out: &mut Vec<Step>, xin: &wgpu::Buffer| {
@@ -180,7 +199,7 @@ pub(super) fn optimize_gpu(
         &mut prog_sens,
         "sens",
         material,
-        [0, BETA, 0, 0],
+        [0, BETA, mirror, 0],
         &[&f.flags, &f.xphys, &f.xtilde, &mg.ce, &e.scalars, &f.xnew, &f.dvs],
     );
     filter(&mut prog_sens, 0, &f.xnew, &f.dc);
@@ -190,7 +209,9 @@ pub(super) fn optimize_gpu(
     elem(
         &mut prog_oc,
         "oc",
-        [0.2, 0.0, 0.0, 0.0], // move limit
+        // move limit; the whole part's compliance per the model's (OC divides by the former, so
+        // λ is the same with or without symmetry)
+        [0.2, m.scale() as f32, 0.0, 0.0],
         [0, LAMBDA, COMPL, 0],
         &[&f.flags, &f.x, &f.dc, &f.dv, &e.scalars, &f.xnew],
     );
@@ -199,6 +220,38 @@ pub(super) fn optimize_gpu(
     let mut prog_accept = vec![];
     e.reduce_design(&mut prog_accept, Reduce::MaxDiff, &f.xnew, &f.x, &f.flags, ne, CHANGE);
     e.lin(&mut prog_accept, &f.x, &f.xnew, None, (0.0, NONE), (1.0, NONE), ne);
+    // energies of every group's part of every case (summed into `ce`), and each case's largest
+    // displacement on every mirror side (the groups' parts with their signs there)
+    let nn: usize = p.n.iter().map(|v| v + 1).product();
+    let ur = (mgs.len() > 1).then(|| e.buf("u, one mirror side", 3 * nn));
+    let mut prog_energy = vec![];
+    for c in 0..ncases {
+        for (g, mg) in mgs.iter().enumerate() {
+            mg.record_case(&mut prog_energy, c, g > 0 || c > 0);
+        }
+        for (ri, &r) in regions.iter().enumerate() {
+            let slot = MAXD + (c * regions.len() + ri) as u32;
+            let u = match &ur {
+                None => mgs[0].case_u(c),
+                Some(ur) => {
+                    for (g, (mg, sign)) in mgs.iter().zip(m.signs(r)).enumerate() {
+                        let a = if g == 0 { 0.0 } else { 1.0 };
+                        e.lin(
+                            &mut prog_energy,
+                            ur,
+                            mg.case_u(c),
+                            None,
+                            (a, NONE),
+                            (sign as f32, NONE),
+                            3 * nn,
+                        );
+                    }
+                    ur
+                }
+            };
+            e.reduce(&mut prog_energy, Reduce::MaxNorm, u, u, u, nn, slot);
+        }
+    }
     let mut prog_project = vec![];
     elem(
         &mut prog_project,
@@ -223,12 +276,8 @@ pub(super) fn optimize_gpu(
         s.rmin,
         s.e0,
         s.nu,
-        p.loads.len(),
-        if p.loads.len() == 1 {
-            ""
-        } else {
-            "s (summed compliance)"
-        },
+        ncases,
+        if ncases == 1 { "" } else { "s (summed compliance)" },
         if s.beta_max > 0.0 {
             format!("Heaviside projection up to beta {}", s.beta_max)
         } else {
@@ -237,7 +286,7 @@ pub(super) fn optimize_gpu(
     );
     let t_start = Instant::now();
     let mut control = stage.state.control.clone();
-    let mut output = Output::new(p, out);
+    let mut output = Output::new(m, out);
     let mut result = Outcome {
         iterations: 0,
         compliance: 0.0,
@@ -253,8 +302,9 @@ pub(super) fn optimize_gpu(
     let mut lambda = stage.state.lambda;
     let mut last_change = stage.state.last_change;
     let target = s.volfrac * ndesign as f64;
-    // optimizer iterations since the smoothers' λmax was estimated (None: estimate next time)
-    let mut estimate_age: Option<usize> = None;
+    // per group: optimizer iterations since the smoothers' λmax was estimated (None: estimate next
+    // time)
+    let mut estimate_age: Vec<Option<usize>> = vec![None; mgs.len()];
     let snapshot = || -> Result<Snapshot> {
         let ee = e.read_f32(&mg.ee, ne)?;
         let ce = e.read_f32(&mg.ce, ne)?;
@@ -265,16 +315,22 @@ pub(super) fn optimize_gpu(
             // the loop it is one OC update newer than `xused`, a small difference
             filtered: output::filtered_out(p, e.read_f32(&f.xtilde, ne)?.into_iter()),
             energy: ee.iter().zip(&ce).map(|(a, b)| 0.5 * a * b / h3).collect(),
-            disps: (0..p.loads.len()).map(|c| mg.displacement(c)).collect::<Result<_>>()?,
+            // per group, per case (the output combines them)
+            disps: mgs
+                .iter()
+                .flat_map(|mg| (0..ncases).map(move |c| mg.displacement(c)))
+                .collect::<Result<_>>()?,
         })
     };
     for it in 1..=s.iters {
         let t0 = Instant::now();
         let mut st = IterStats::default();
         e.run(&[&prog_stiffness])?;
-        let estimate = estimate_age.is_none_or(|a| a >= REESTIMATE_EVERY);
-        mg.build(estimate)?;
-        estimate_age = Some(if estimate { 0 } else { estimate_age.unwrap() + 1 });
+        for (mg, age) in mgs.iter().zip(&mut estimate_age) {
+            let estimate = age.is_none_or(|a| a >= REESTIMATE_EVERY);
+            mg.build(estimate)?;
+            *age = Some(if estimate { 0 } else { age.unwrap() + 1 });
+        }
         st.setup = t0.elapsed().as_secs_f64();
 
         let t1 = Instant::now();
@@ -285,32 +341,42 @@ pub(super) fn optimize_gpu(
             (0.05 * last_change).clamp(s.cg_tol, 1e-2)
         };
         st.cg_tol = tol;
-        for c in 0..mg.us.len() {
-            let mut n = mg.solve(c, tol, CG_MAXIT)?;
-            if n > STALE_CG_ITS && estimate_age != Some(0) {
-                // an old λmax estimate may have weakened the smoother: refresh it and carry on
-                // from where CG got to
-                let t = Instant::now();
-                mg.build(true)?;
-                estimate_age = Some(0);
-                st.setup += t.elapsed().as_secs_f64();
-                n += mg.solve(c, tol, CG_MAXIT)?;
+        let mut rebuilt = 0.0;
+        for (mg, age) in mgs.iter().zip(&mut estimate_age) {
+            for c in 0..mg.us.len() {
+                let mut n = mg.solve(c, tol, STALE_CG_ITS)?;
+                if n >= STALE_CG_ITS {
+                    // not converged yet: an old λmax estimate may have weakened the smoother, or a
+                    // fresh one come out too low; refresh it (carefully if it was fresh) and carry
+                    // on from where CG got to
+                    let t = Instant::now();
+                    if *age == Some(0) {
+                        mg.reestimate_long()?;
+                    } else {
+                        mg.build(true)?;
+                    }
+                    *age = Some(0);
+                    rebuilt += t.elapsed().as_secs_f64();
+                    n += mg.solve(c, tol, CG_MAXIT)?;
+                }
+                if n >= CG_MAXIT {
+                    println!("warning: CG did not converge in {CG_MAXIT} iterations");
+                }
+                st.cg.push(n);
             }
-            if n >= CG_MAXIT {
-                println!("warning: CG did not converge in {CG_MAXIT} iterations");
-            }
-            st.cg.push(n);
         }
-        mg.compute_energies()?;
-        st.solve = t1.elapsed().as_secs_f64();
+        e.run(&[&prog_energy])?;
+        st.setup += rebuilt;
+        st.solve = t1.elapsed().as_secs_f64() - rebuilt;
 
         let t2 = Instant::now();
         e.run(&[&prog_sens])?;
         let sc = e.read_scalars()?;
-        let compliance = sc[COMPL as usize] as f64;
+        // for the whole part (the reduced model's is 1/2^planes of it)
+        let compliance = sc[COMPL as usize] as f64 * m.scale();
         let grey = sc[GREY as usize] as f64 / ndesign as f64;
-        let max_disp = (0..p.loads.len())
-            .map(|c| sc[MAXD as usize + c] as f64)
+        let max_disp = (0..ncases * regions.len())
+            .map(|i| sc[MAXD as usize + i] as f64)
             .fold(0.0, f64::max);
         st.compliance = compliance;
         st.update = t2.elapsed().as_secs_f64();
@@ -384,7 +450,7 @@ pub(super) fn optimize_gpu(
             Next::Beta(b) => {
                 beta = b;
                 // a sharper projection changes the densities at once
-                estimate_age = None;
+                estimate_age.fill(None);
                 e.set_scalar(BETA, beta as f32);
                 e.run(&[&prog_project])?;
             }
@@ -417,7 +483,7 @@ pub(super) fn optimize_gpu(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Ground, Settings, Solver, optimize};
+    use super::super::{Ground, Problem, Settings, Solver, optimize};
     use super::*;
 
     /// A cantilever: clamped at x = 0, a spread load down at the far top edge, a kept-solid strip.
@@ -456,6 +522,36 @@ mod tests {
         p
     }
 
+    /// On the GPU too, a quarter of the symmetric beam (four load patterns, so four hierarchies
+    /// sharing their buffers) gives the same run as the whole beam.
+    #[test]
+    fn symmetric_quarter_matches_the_whole_gpu() {
+        use super::super::symmetry::{self, Model};
+        use super::super::tests::{beam_settings, compare_runs, symmetric_beam};
+        use super::super::{Stage, optimize_stage};
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        if gpu.is_software() {
+            eprintln!("software GPU; skipped");
+            return;
+        }
+        let full = symmetric_beam();
+        let m = symmetry::reduce(&full, [true, true, false]).unwrap();
+        let dir = std::env::temp_dir().join(format!("gen3d-symgpu-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Settings {
+            cg_tol: 1e-6,
+            ..beam_settings(Solver::Gpu(MgSettings::default()))
+        };
+        let st = Stage::default();
+        let whole = optimize_stage(&Model::single(full), &s, &dir.join("whole.vti"), Some(&gpu), &st).unwrap();
+        let quarter = optimize_stage(&m, &s, &dir.join("quarter.vti"), Some(&gpu), &st).unwrap();
+        compare_runs(&whole, &quarter, &dir, 2e-3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The GPU loop follows the CPU loop: same compliance, iteration by iteration.
     #[test]
     fn gpu_loop_matches_cpu_loop() {
@@ -488,6 +584,7 @@ mod tests {
                 adaptive_tol: false,
                 ground: Ground::None,
                 coarse_start: false,
+                symmetry: true,
             };
             let ms = MgSettings::default();
             let cpu = optimize(&p, &settings(Solver::Multigrid(ms)), &dir.join("cpu.vti"), None).unwrap();

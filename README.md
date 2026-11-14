@@ -213,7 +213,7 @@ gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
 gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
-gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--modulus MPA] [--nu V] [-o out.vti] [--resume]
+gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--no-symmetry] [--modulus MPA] [--nu V] [-o out.vti] [--resume]
 
 .vti options (render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
@@ -411,6 +411,17 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
     at β = 2. This is 15–30% faster on most problems, with compliance within about 1% (sometimes
     better). It applies from 80k domain elements; `--no-coarse-start` turns it off. The output file
     shows the coarse design first.
+  - **Symmetry:** with [mirror planes](#primitives-from-the-app-nameprimsjson) the grid is aligned so
+    each plane is a node layer. When the domain, kept regions and supports are symmetric about them,
+    only one side is solved (1/2, 1/4 or 1/8 of the elements) and the design is symmetric. The loads
+    may be asymmetric (rocking, a sideways push): each case is split into parts that are symmetric
+    or antisymmetric about each plane, and each part pattern is solved on the reduced grid with its
+    own plane condition (the displacement across the plane held, or along it). The full fields are
+    written as usual; the energy is averaged over mirror images. Same compliance per iteration as
+    solving the whole part; bracket (1/2) 9.1 → 7.4 s, table (1/4) 15.9 → 12.2 s. It applies from
+    100k domain elements (below that each pattern's fixed costs outweigh the smaller grid);
+    `--no-symmetry` solves the whole part (on the same aligned grid). A problem that isn't symmetric
+    after all (a script's own supports, `--ground` with a Z plane) is solved whole, with a note.
 - **Projection or not:** with projection the result is crisp (0% grey on the bracket against 24%
   without) and stiffer for the same material (compliance 8.96 against 10.36 N·mm). Thresholding at
   0.5 then matches `--volfrac` closely. The cost is about 1.7× the iterations. Because each voxel is now
@@ -487,4 +498,6 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/topopt/gpu_opt.rs`, `opt.wgsl` | the optimizer loop on the GPU: stiffness, sensitivities, filter, projection, OC |
 | `src/topopt/gpu_engine.rs` | GPU kernels as recorded dispatch programs, reductions, scalars, readback |
 | `src/topopt/output.rs` | writing the result as it runs: background writes, decimated previews, full result on Stop |
+| `src/topopt/symmetry.rs` | mirror symmetry: the reduced model (one side), load parts per symmetric/antisymmetric pattern, expanding the fields back |
+| `src/topopt/checkpoint.rs` | stop and resume: the `.resume` checkpoint next to the result |
 | `src/wgsl/sdf.wgsl` | the SDF library |

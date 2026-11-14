@@ -33,6 +33,7 @@ use crate::gpu::Gpu;
 use crate::mesher::{Grid, sample_field};
 use crate::shape::Shape;
 use output::Snapshot;
+use symmetry::Model;
 
 mod checkpoint;
 mod gpu_engine;
@@ -40,6 +41,7 @@ mod gpu_mg;
 mod gpu_opt;
 pub mod mg;
 mod output;
+mod symmetry;
 
 /// Linear solver for K u = f.
 #[derive(Clone, Copy, Debug)]
@@ -85,6 +87,8 @@ pub struct Settings {
     pub ground: Ground,
     /// `run`: do the β = 1 stage on a grid of twice the element size first
     pub coarse_start: bool,
+    /// use the shape's mirror planes: solve one side of a symmetric problem (see `symmetry.rs`)
+    pub symmetry: bool,
 }
 
 /// How the bottom of the design domain is supported (`--ground`). The optimizer decides where the
@@ -122,6 +126,7 @@ impl Settings {
 }
 
 /// A discretized problem. Elements and nodes are indexed x-fastest.
+#[derive(Clone)]
 pub struct Problem {
     /// elements per axis
     pub n: [usize; 3],
@@ -255,14 +260,12 @@ pub(super) enum CaseSolve {
 }
 
 impl LoadBasis {
-    fn describe(&self) -> Option<String> {
-        let n = self.cases.len();
-        (self.solved.len() < n).then(|| {
-            format!(
-                "{} of {n} load cases solved, the others are linear combinations of them",
-                self.solved.len()
-            )
-        })
+    /// A line when some cases (over all groups) are combinations of others.
+    fn describe_all(bases: &[LoadBasis]) -> Option<String> {
+        let n: usize = bases.iter().map(|b| b.cases.len()).sum();
+        let solved: usize = bases.iter().map(|b| b.solved.len()).sum();
+        let what = if bases.len() > 1 { "load parts" } else { "load cases" };
+        (solved < n).then(|| format!("{solved} of {n} {what} solved, the others are linear combinations of them"))
     }
 }
 
@@ -504,8 +507,21 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         );
     }
     let (lo, hi) = shape.bounds;
-    let n = [0, 1, 2].map(|k| ((hi[k] - lo[k]) as f64 / h).ceil().max(1.0) as usize);
-    let origin = lo.map(|v| v as f64);
+    let mut n = [0, 1, 2].map(|k| ((hi[k] - lo[k]) as f64 / h).ceil().max(1.0) as usize);
+    let mut origin = lo.map(|v| v as f64);
+    // a mirror plane becomes the node layer in the middle of the grid (also with --no-symmetry,
+    // so that only changes how it is solved, not the discretization)
+    let mirror = if shape.editor {
+        shape.mirror.map(|m| m.is_some())
+    } else {
+        [false; 3]
+    };
+    for a in (0..3).filter(|&a| mirror[a]) {
+        let c = shape.mirror[a].unwrap() as f64;
+        let half = ((c - lo[a] as f64).max(hi[a] as f64 - c) / h).ceil().max(1.0) as usize;
+        n[a] = 2 * half;
+        origin[a] = c - half as f64 * h;
+    }
     let ne: usize = n.iter().product();
     // the CPU multigrid needs ~1.2 kB per element (mostly the level-1 element matrices)
     let max = match s.solver {
@@ -578,7 +594,20 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         }
         println!("ground ({}): {} nodes on the bottom layer", s.ground.name(), n.len());
     }
-    for (i, axes) in stabilize(&p) {
+    let mut pins = stabilize(&p);
+    // with mirror planes, the pins' mirror images too (so the supports stay symmetric)
+    for (a, _) in mirror.iter().enumerate().filter(|(_, m)| **m) {
+        for k in 0..pins.len() {
+            let (i, axes) = pins[k];
+            let mut ijk = [i % pts[0], (i / pts[0]) % pts[1], i / (pts[0] * pts[1])];
+            ijk[a] = pts[a] - 1 - ijk[a];
+            let m = (ijk[2] * pts[1] + ijk[1]) * pts[0] + ijk[0];
+            if m != i {
+                pins.push((m, axes));
+            }
+        }
+    }
+    for (i, axes) in pins {
         p.fixed[i] |= axes;
         let q = p.node_pos(i);
         let names: String = (0..3)
@@ -884,10 +913,12 @@ impl Fem<'_> {
 struct Filter {
     offsets: Vec<([isize; 3], f64)>,
     hs: Vec<f64>,
+    /// axes whose low face is a mirror plane: neighbours past it are the mirror images
+    mirror: [bool; 3],
 }
 
 impl Filter {
-    fn new(p: &Problem, rmin: f64) -> Filter {
+    fn new(p: &Problem, rmin: f64, mirror: [bool; 3]) -> Filter {
         let r = rmin.ceil() as isize;
         let mut offsets = vec![];
         for dk in -r..=r {
@@ -900,7 +931,11 @@ impl Filter {
                 }
             }
         }
-        let mut f = Filter { offsets, hs: vec![] };
+        let mut f = Filter {
+            offsets,
+            hs: vec![],
+            mirror,
+        };
         let ones = vec![1.0; p.domain.len()];
         f.hs = f.apply_raw(p, &ones);
         f
@@ -916,8 +951,9 @@ impl Filter {
                 }
                 let (i, j, k) = ((e % ex) as isize, ((e / ex) % ey) as isize, (e / (ex * ey)) as isize);
                 let mut s = 0.0;
+                let fold = |v: isize, ax: usize| if v < 0 && self.mirror[ax] { -v - 1 } else { v };
                 for ([di, dj, dk], w) in &self.offsets {
-                    let (a, b, c) = (i + di, j + dj, k + dk);
+                    let (a, b, c) = (fold(i + di, 0), fold(j + dj, 1), fold(k + dk, 2));
                     if a < 0 || b < 0 || c < 0 || a >= ex as isize || b >= ey as isize || c >= ez as isize {
                         continue;
                     }
@@ -1082,7 +1118,44 @@ type Precond<'a> = dyn FnMut(&[f64], &mut [f64]) + 'a;
 /// what gets meshed), cell `energy` in MPa, point `displacement` in mm). The file is rewritten as often as keeps writing under ~10% of the run
 /// time (every iteration on small grids), and always after the last iteration.
 pub fn optimize(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>) -> Result<Outcome> {
-    optimize_stage(p, s, out, gpu, &Stage::default())
+    optimize_stage(&Model::single(p.clone()), s, out, gpu, &Stage::default())
+}
+
+/// The mirror planes the run uses: the shape's (editor) planes, unless `--no-symmetry`.
+fn mirror_axes(shape: &Shape, s: &Settings) -> [bool; 3] {
+    if !s.symmetry || !shape.editor {
+        return [false; 3];
+    }
+    shape.mirror.map(|m| m.is_some())
+}
+
+/// Fewest domain elements (of the whole part) for solving one side of the mirror planes. Below
+/// this each hierarchy's fixed costs (dispatches, the coarsest level's readback) outweigh the
+/// smaller grid: the table's 26k-element coarse stage took 5.8 s as a quarter, 3.6 s whole.
+const SYMMETRY_MIN_ELEMENTS: usize = 100_000;
+
+/// The model of a set-up problem: reduced to one side of its mirror planes when it is symmetric
+/// about them (see `symmetry.rs`) and large enough, else the problem itself.
+fn model(full: Problem, shape: &Shape, s: &Settings) -> Model {
+    let axes = mirror_axes(shape, s);
+    if !axes.iter().any(|a| *a) {
+        return Model::single(full);
+    }
+    if full.domain.iter().filter(|d| **d).count() < SYMMETRY_MIN_ELEMENTS {
+        return Model::single(full);
+    }
+    match symmetry::reduce(&full, axes) {
+        Ok(m) => {
+            if let Some(d) = m.describe() {
+                println!("{d}");
+            }
+            m
+        }
+        Err(why) => {
+            println!("symmetry not used: {why}; solving the whole part");
+            Model::single(full)
+        }
+    }
 }
 
 /// The checkpoint a stopped run writing `out` leaves (it exists while there is a run to resume).
@@ -1108,10 +1181,11 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
         checkpoint::remove(out);
         None
     };
-    let fine = setup(shape, s, gpu)?;
-    let ndomain = fine.domain.iter().filter(|d| **d).count();
+    let fine = model(setup(shape, s, gpu)?, shape, s);
+    // the whole part's elements (the coarse grid's resolution is what matters, not the model's size)
+    let ndomain = (fine.p().domain.iter().filter(|d| **d).count() as f64 * fine.scale()) as usize;
     let coarse_start = s.coarse_start && s.beta_max > 1.0 && ndomain / 8 >= COARSE_MIN_ELEMENTS;
-    let resumed = |c: &checkpoint::Checkpoint, p: &Problem, grid: &str| -> Result<Stage> {
+    let resumed = |c: &checkpoint::Checkpoint, p: &Model, grid: &str| -> Result<Stage> {
         c.check(p)?;
         let h = &c.header;
         println!(
@@ -1140,7 +1214,7 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
                 ..s.clone()
             };
             println!("coarse start: the beta 1 stage at {:.3} mm", cs.voxel);
-            let coarse = setup(shape, &cs, gpu)?;
+            let coarse = model(setup(shape, &cs, gpu)?, shape, &cs);
             let stage = match &ck {
                 Some(c) => resumed(c, &coarse, "coarse")?,
                 None => Stage {
@@ -1160,7 +1234,7 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
                 print_done(&rc, t_start, out);
                 return Ok(rc);
             }
-            let x = prolong_design(&coarse, &rc.design, &fine, s.volfrac);
+            let x = prolong_design(coarse.p(), &rc.design, fine.p(), s.volfrac);
             println!("fine grid: continuing from the coarse design");
             earlier = rc.stats;
             Stage {
@@ -1233,17 +1307,18 @@ fn prolong_design(coarse: &Problem, xc: &[f64], fine: &Problem, volfrac: f64) ->
         .collect()
 }
 
-fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage: &Stage) -> Result<Outcome> {
+fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage: &Stage) -> Result<Outcome> {
     output::catch_stop();
-    let basis = p.load_basis();
-    if let Some(d) = basis.describe() {
+    let p = m.p();
+    let bases: Vec<LoadBasis> = m.groups.iter().map(|g| g.load_basis()).collect();
+    if let Some(d) = LoadBasis::describe_all(&bases) {
         println!("{d}");
     }
     if let Solver::Gpu(ms) = &s.solver {
         let Some(gpu) = gpu else {
             bail!("the GPU solver needs a GPU");
         };
-        return gpu_opt::optimize_gpu(p, &basis, s, ms, out, gpu, stage);
+        return gpu_opt::optimize_gpu(m, &bases, s, ms, out, gpu, stage);
     }
     let ke = hex_ke(s.nu);
     let ne = p.domain.len();
@@ -1251,10 +1326,15 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
     if design.is_empty() {
         bail!("no design elements: the domain is empty or entirely kept solid");
     }
-    let free = p.free_mask();
-    let fs: Vec<Vec<f64>> = p.loads.iter().map(|l| l.iter().flatten().copied().collect()).collect();
+    // per group (one without symmetry): free DOFs, loads per case
+    let frees: Vec<Vec<u8>> = m.groups.iter().map(|g| g.free_mask()).collect();
+    let fs: Vec<Vec<Vec<f64>>> = m
+        .groups
+        .iter()
+        .map(|g| g.loads.iter().map(|l| l.iter().flatten().copied().collect()).collect())
+        .collect();
     let emin = s.e0 * s.emin;
-    let filter = Filter::new(p, s.rmin);
+    let filter = Filter::new(p, s.rmin, m.mirror_axes());
     let mut proj = Projection {
         beta: if s.beta_max > 0.0 { 1.0 } else { 0.0 },
         eta: 0.5,
@@ -1277,7 +1357,10 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
     }
     let mut xtilde = filter.densities(p, &x);
     let mut xphys = proj.densities(p, &xtilde);
-    let mut us: Vec<Vec<f64>> = fs.iter().map(|f| vec![0.0; f.len()]).collect();
+    let mut us: Vec<Vec<Vec<f64>>> = fs
+        .iter()
+        .map(|g| g.iter().map(|f| vec![0.0; f.len()]).collect())
+        .collect();
     let t_start = Instant::now();
     let mut control = stage.state.control.clone();
     let mut result = Outcome {
@@ -1312,27 +1395,22 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
     // the last iteration's output, until it is written
     // the last iteration's full fields, until written
     let mut pending: Option<Snapshot> = None;
-    let mut output = output::Output::new(p, out);
+    let mut output = output::Output::new(m, out);
     // OC's Lagrange multiplier, for the next iteration's bracket
     let mut lambda = stage.state.lambda;
     let mut last_change = stage.state.last_change;
     for it in 1..=s.iters {
         let t0 = Instant::now();
         let mut st = IterStats::default();
-        let fem = Fem {
-            p,
-            ke: &ke,
-            ee: (0..ne)
-                .map(|e| {
-                    if p.domain[e] {
-                        (emin + xphys[e].powf(s.penal) * (s.e0 - emin)) * p.h
-                    } else {
-                        0.0
-                    }
-                })
-                .collect(),
-            free: free.clone(),
-        };
+        let ee: Vec<f64> = (0..ne)
+            .map(|e| {
+                if p.domain[e] {
+                    (emin + xphys[e].powf(s.penal) * (s.e0 - emin)) * p.h
+                } else {
+                    0.0
+                }
+            })
+            .collect();
         let final_stage = proj.beta > 0.0 && proj.beta >= s.beta_max;
         let tol = if !s.adaptive_tol || final_stage {
             s.cg_tol
@@ -1341,13 +1419,21 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
         };
         st.cg_tol = tol;
         let mut ce = vec![0.0; ne];
-        let t1;
-        {
-            // one preconditioner, shared by the load cases
+        let t1 = Instant::now();
+        // per group (its own supports): one preconditioner, shared by its load cases
+        for (g, group) in m.groups.iter().enumerate() {
+            let t0 = Instant::now();
+            let fem = Fem {
+                p: group,
+                ke: &ke,
+                ee: ee.clone(),
+                free: frees[g].clone(),
+            };
+            let (basis, fs, us) = (&bases[g], &fs[g], &mut us[g]);
             let mut precond: Box<Precond> = match &s.solver {
                 Solver::Multigrid(ms) => {
                     let mut m = mg::Multigrid::new(&fem, ms);
-                    if it == 1 {
+                    if it == 1 && g == 0 {
                         let c = m.coarsest();
                         println!(
                             "multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
@@ -1367,9 +1453,8 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
                     })
                 }
             };
-            st.setup = t0.elapsed().as_secs_f64();
+            st.setup += t0.elapsed().as_secs_f64();
             // each load case separately; the objective is their summed compliance
-            t1 = Instant::now();
             for &c in &basis.solved {
                 let n = fem.solve(&fs[c], &mut us[c], tol, CG_MAXIT, &mut *precond);
                 if n >= CG_MAXIT {
@@ -1391,10 +1476,12 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
                 }
             }
         }
-        st.solve = t1.elapsed().as_secs_f64();
+        st.solve = t1.elapsed().as_secs_f64() - st.setup;
         let t2 = Instant::now();
-        let compliance: f64 = (0..ne).map(|e| fem.ee[e] * ce[e]).sum();
-        st.compliance = compliance;
+        let compliance: f64 = (0..ne).map(|e| ee[e] * ce[e]).sum();
+        // reported for the whole part (the reduced model's is 1/2^planes of it)
+        let full_compliance = compliance * m.scale();
+        st.compliance = full_compliance;
         let dc: Vec<f64> = (0..ne)
             .map(|e| {
                 if p.domain[e] && !p.passive[e] {
@@ -1418,7 +1505,8 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
         let target = s.volfrac * design.len() as f64;
         let mv = 0.2;
         let mut xnew = x.clone();
-        let cscale = 1.0 / compliance.abs().max(1e-300);
+        // by the whole part's compliance, so λ is the same with or without symmetry
+        let cscale = 1.0 / full_compliance.abs().max(1e-300);
         let mut volume_at = |lam: f64, xnew: &mut Vec<f64>| {
             st.oc_steps += 1;
             for &e in &design {
@@ -1460,11 +1548,27 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
         xphys = proj.densities(p, &xtilde);
         x = xnew;
 
-        let max_disp = us
-            .iter()
-            .flat_map(|u| u.as_chunks::<3>().0.iter())
-            .map(|v| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt())
-            .fold(0.0, f64::max);
+        // per case and mirror side: the groups' parts with their signs there
+        let mut max_disp = 0.0f64;
+        for c in 0..m.cases() {
+            for r in m.regions() {
+                let signs = m.signs(r);
+                let u0 = &us[0][c];
+                let mx = (0..u0.len() / 3)
+                    .into_par_iter()
+                    .map(|i| {
+                        let mut v = [0.0; 3];
+                        for (g, sg) in signs.iter().enumerate() {
+                            for (k, vk) in v.iter_mut().enumerate() {
+                                *vk += sg * us[g][c][3 * i + k];
+                            }
+                        }
+                        (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
+                    })
+                    .reduce(|| 0.0, f64::max);
+                max_disp = max_disp.max(mx);
+            }
+        }
         let grey = design
             .iter()
             .filter(|&&e| used_xphys[e] > 0.1 && used_xphys[e] < 0.9)
@@ -1477,10 +1581,12 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
         let snap = Snapshot {
             density: used_xphys.iter().map(|&v| v as f32).collect(),
             filtered: output::filtered_out(p, used_xtilde.iter().map(|&v| v as f32)),
-            energy: (0..ne)
-                .map(|e| (0.5 * fem.ee[e] * ce[e] / p.h.powi(3)) as f32)
+            energy: (0..ne).map(|e| (0.5 * ee[e] * ce[e] / p.h.powi(3)) as f32).collect(),
+            // per group, per case (the output combines them)
+            disps: us
+                .iter()
+                .flat_map(|g| g.iter().map(|u| u.iter().map(|&v| v as f32).collect()))
                 .collect(),
-            disps: us.iter().map(|u| u.iter().map(|&v| v as f32).collect()).collect(),
         };
         if output.due()? {
             if output.live_is_full() {
@@ -1500,9 +1606,18 @@ fn optimize_stage(p: &Problem, s: &Settings, out: &Path, gpu: Option<&Gpu>, stag
         }
         st.io = t3.elapsed().as_secs_f64();
 
-        print_iteration(stage.it0 + it, compliance, max_disp, change, grey, proj.beta, &st, t0);
+        print_iteration(
+            stage.it0 + it,
+            full_compliance,
+            max_disp,
+            change,
+            grey,
+            proj.beta,
+            &st,
+            t0,
+        );
         result.iterations = it;
-        result.compliance = compliance;
+        result.compliance = full_compliance;
         result.max_disp = max_disp;
         result.stats.push(st);
         match control.next(s, proj.beta, compliance, change) {
@@ -1690,6 +1805,148 @@ pub(super) mod tests {
         assert_eq!(prolong_design(&coarse, &xc, &fine, 0.3)[0], 0.3);
     }
 
+    /// A beam on supports at both ends of its bottom, symmetric about the middle planes x and y
+    /// (an even number of elements on both). Its load cases are a down load at the top middle
+    /// (symmetric), a sideways push in y there (antisymmetric about the y plane) and a push in x
+    /// and y on one end's top (no symmetry), each with its mirror images as further cases, so the
+    /// problem as a whole (and so the optimized design) is symmetric while each single case isn't:
+    /// the reduced model splits them into parts of all four patterns.
+    pub(in crate::topopt) fn symmetric_beam() -> Problem {
+        let n = [16, 6, 6];
+        let mut p = grid(n, 1.0);
+        let [nx, ny, nz] = n.map(|v| v + 1);
+        let node = |i: usize, j: usize, k: usize| (k * ny + j) * nx + i;
+        let mut base = vec![vec![[0.0; 3]; nx * ny * nz]; 3];
+        for j in 0..ny {
+            for i in [0, 1, nx - 2, nx - 1] {
+                p.fixed[node(i, j, 0)] = 7;
+            }
+            for i in nx / 2 - 1..=nx / 2 + 1 {
+                base[0][node(i, j, nz - 1)] = [0.0, 0.0, -1.0];
+                base[1][node(i, j, nz - 1)] = [0.0, 0.5, 0.0];
+            }
+            base[2][node(nx - 3, j, nz - 1)] = [0.3, 0.2 * (j + 1) as f64 / ny as f64, -0.2];
+        }
+        // each case and its distinct mirror images about x = 8 and y = 3
+        let image = |f: &Vec<[f64; 3]>, g: usize| -> Vec<[f64; 3]> {
+            let mut out = vec![[0.0; 3]; f.len()];
+            for k in 0..nz {
+                for j in 0..ny {
+                    for i in 0..nx {
+                        let (si, sj) = (
+                            if g & 1 == 1 { nx - 1 - i } else { i },
+                            if g & 2 == 2 { ny - 1 - j } else { j },
+                        );
+                        let v = f[node(si, sj, k)];
+                        out[node(i, j, k)] = [
+                            if g & 1 == 1 { -v[0] } else { v[0] },
+                            if g & 2 == 2 { -v[1] } else { v[1] },
+                            v[2],
+                        ];
+                    }
+                }
+            }
+            out
+        };
+        for f in &base {
+            for g in 0..4 {
+                let im = image(f, g);
+                if !p.loads.contains(&im) {
+                    p.loads.push(im);
+                }
+            }
+        }
+        p.cases = (1..=p.loads.len() as u32).collect();
+        p
+    }
+
+    pub(in crate::topopt) fn beam_settings(solver: Solver) -> Settings {
+        Settings {
+            voxel: 1.0,
+            volfrac: 0.3,
+            penal: 3.0,
+            rmin: 1.5,
+            iters: 10,
+            tol: 0.0,
+            e0: 3500.0,
+            nu: 0.35,
+            force: 0.0,
+            beta_max: 8.0,
+            solver,
+            emin: 1e-9,
+            cg_tol: 1e-9,
+            adaptive_tol: false,
+            ground: Ground::None,
+            coarse_start: false,
+            symmetry: true,
+        }
+    }
+
+    /// Solving a quarter of the symmetric beam (mirrored in x and y; the loads split into
+    /// symmetric and antisymmetric parts) gives the same run as solving all of it: compliance and
+    /// maximum displacement per iteration, the written density and displacements.
+    #[test]
+    fn symmetric_quarter_matches_the_whole_cpu() {
+        let full = symmetric_beam();
+        let m = symmetry::reduce(&full, [true, true, false]).unwrap();
+        let sym = m.sym.as_ref().unwrap();
+        assert_eq!(
+            (sym.n, m.groups.len(), m.cases()),
+            ([8, 3, 6], 4, 7),
+            "all four patterns have a part"
+        );
+        let dir = std::env::temp_dir().join(format!("gen3d-sym-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = beam_settings(Solver::Multigrid(mg::MgSettings::default()));
+        let whole = optimize_stage(
+            &Model::single(full),
+            &s,
+            &dir.join("whole.vti"),
+            None,
+            &Stage::default(),
+        )
+        .unwrap();
+        let quarter = optimize_stage(&m, &s, &dir.join("quarter.vti"), None, &Stage::default()).unwrap();
+        compare_runs(&whole, &quarter, &dir, 1e-6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two runs of the same problem agree per iteration, and in the written fields.
+    pub(in crate::topopt) fn compare_runs(a: &Outcome, b: &Outcome, dir: &Path, tol: f64) {
+        assert_eq!(a.iterations, b.iterations);
+        for (it, (x, y)) in a.stats.iter().zip(&b.stats).enumerate() {
+            let rel = (x.compliance - y.compliance).abs() / x.compliance;
+            assert!(
+                rel < tol,
+                "iteration {}: compliance {} vs {}",
+                it + 1,
+                x.compliance,
+                y.compliance
+            );
+        }
+        let rel = (a.max_disp - b.max_disp).abs() / a.max_disp;
+        assert!(rel < tol.max(1e-5), "max displacement {} vs {}", a.max_disp, b.max_disp);
+        let read = |f: &str| crate::vti::read(&dir.join(f)).unwrap();
+        let (va, vb) = (read("whole.vti"), read("quarter.vti"));
+        for name in [
+            "density",
+            "displacement",
+            "displacement_2",
+            "displacement_3",
+            "displacement_7",
+        ] {
+            let get = |v: &crate::vti::VtiFile| v.arrays.iter().find(|a| a.name == name).unwrap().data.clone();
+            let (da, db) = (get(&va), get(&vb));
+            assert_eq!(da.len(), db.len(), "{name}");
+            let scale = da.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let diff = da.iter().zip(&db).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            assert!(
+                diff <= (tol as f32).max(1e-5) * 10.0 * scale,
+                "{name} differs by {diff} (of {scale})"
+            );
+        }
+    }
+
     /// Rocked variants (f ± r·g) are formed from the upright case and the sideways push; loads on
     /// clamped DOFs don't count.
     #[test]
@@ -1758,6 +2015,7 @@ pub(super) mod tests {
             adaptive_tol: false,
             ground: Ground::None,
             coarse_start: false,
+            symmetry: true,
         };
         // iterations until `next` says Stop at β, for a compliance sequence
         let run = |beta: f64, seq: &dyn Fn(usize) -> f64| {
@@ -1876,6 +2134,7 @@ pub(super) mod tests {
             adaptive_tol: false,
             ground: Ground::None,
             coarse_start: false,
+            symmetry: true,
         };
         let p = setup(&shape, &s, &gpu).unwrap();
         assert_eq!(p.cases, [1, 2]);
@@ -1949,6 +2208,7 @@ pub(super) mod tests {
             adaptive_tol: false,
             ground: Ground::None,
             coarse_start: false,
+            symmetry: true,
         };
         let err = setup(&shape, &s, &gpu).err().unwrap().to_string();
         assert!(err.contains("needs supports"), "{err}");

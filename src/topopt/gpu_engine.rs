@@ -16,7 +16,7 @@ pub const WG: usize = 128;
 /// Workgroups of the first reduction pass.
 const PARTIALS: usize = 1024;
 /// Scalar slots.
-pub const SLOTS: usize = 128;
+pub const SLOTS: usize = 544;
 /// "no scalar slot" in `lin`
 pub const NONE: u32 = u32::MAX;
 
@@ -356,5 +356,10 @@ impl<'g> Engine<'g> {
 
     pub fn read_scalars(&self) -> Result<Vec<f32>> {
         self.read_f32(&self.scalars, SLOTS)
+    }
+
+    /// Scalar slot `slot` alone (CG's convergence checks read only the residual).
+    pub fn read_scalar(&self, slot: u32) -> Result<f32> {
+        Ok(self.read_f32(&self.scalars, slot as usize + 1)?[slot as usize])
     }
 }

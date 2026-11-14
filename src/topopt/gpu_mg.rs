@@ -20,9 +20,14 @@
 
 use anyhow::{Result, bail};
 
-use super::gpu_engine::{Engine, NONE, Params, Reduce, Step, dims4, groups, threads};
+use super::gpu_engine::{Engine, NONE, Params, Step, dims4, groups, threads};
 use super::mg::{self, MgSettings, Smoother};
 use super::{CaseSolve, LoadBasis, Problem};
+
+/// Power iteration steps for the smoothers' λmax estimates, and for a careful re-estimate when a
+/// solve stalls right after one (`reestimate_long`).
+const POWER_STEPS: usize = 12;
+const POWER_STEPS_LONG: usize = 40;
 
 /// Entries of a symmetric 24×24 element matrix's upper triangle (how coarse levels are stored).
 const SYM: usize = 300;
@@ -41,11 +46,25 @@ const NUM: u32 = 7;
 const DEN: u32 = 8;
 const NRM: u32 = 9;
 const SC: u32 = 10;
-/// per load case: the maximum displacement magnitude (set by `compute_energies`)
-pub(super) const MAXD: u32 = 104;
-/// λmax of level l at LAM + l, its inverse at INVL + l
+/// λmax of level l at LAM + l, its inverse at INVL + l (the first hierarchy; the others of a
+/// symmetric model keep theirs at `lam_slots`)
 const LAM: u32 = 16;
 const INVL: u32 = 48;
+
+/// The scalar slots of hierarchy `group`'s λmax estimates and their inverses (each hierarchy has
+/// its own: a group's smoothers mustn't use another's estimates).
+fn lam_slots(group: usize) -> (u32, u32) {
+    match group {
+        0 => (LAM, INVL),
+        g => {
+            let base = 320 + 32 * (g as u32 - 1);
+            (base, base + 16)
+        }
+    }
+}
+
+/// Most hierarchies (groups of a symmetric model: 2^planes).
+pub(super) const MAX_GROUPS: usize = 8;
 
 // scalar kernel ops
 const OP_DIV: u32 = 0;
@@ -63,6 +82,9 @@ fn coarse(n: [usize; 3]) -> [usize; 3] {
 
 pub(super) struct GpuMg<'a> {
     e: &'a Engine<'a>,
+    /// this hierarchy's λmax slots (level l at + l) and their inverses
+    lam: u32,
+    invl: u32,
     /// elements per axis, per level (0 = fine)
     dims: Vec<[usize; 3]>,
     smoother: Smoother,
@@ -90,8 +112,8 @@ pub(super) struct GpuMg<'a> {
     slot: Vec<Option<usize>>,
     /// a combined case's displacement, formed when needed (None if every case is solved)
     uc: Option<wgpu::Buffer>,
-    /// per load case: forms a combined case's displacement in `uc` (empty for solved cases)
-    form: Vec<Vec<Step>>,
+    /// per load case: a combined case's coefficients over the solved slots (empty when solved)
+    combos: Vec<Vec<(usize, f64)>>,
     /// per solved load case: DOF indices, values, count
     fs: Vec<(wgpu::Buffer, wgpu::Buffer, usize)>,
     /// per solved load case: |f|²
@@ -99,11 +121,11 @@ pub(super) struct GpuMg<'a> {
     bottom: wgpu::Buffer,
     /// diagonals and Galerkin coarse levels
     setup: Vec<Step>,
-    /// the smoothers' λmax(D⁻¹K) estimates (power iteration)
+    /// the smoothers' λmax(D⁻¹K) estimates (power iteration), and a longer one
     estimate: Vec<Step>,
+    estimate_long: Vec<Step>,
     init: Vec<Vec<Step>>,
     iter: Vec<Vec<Step>>,
-    energy: Vec<Step>,
 }
 
 impl<'a> GpuMg<'a> {
@@ -115,7 +137,10 @@ impl<'a> GpuMg<'a> {
         ke: &[[f64; 24]; 24],
         free: &[u8],
         s: &MgSettings,
+        shared: Option<(&GpuMg<'a>, usize)>,
     ) -> Result<Self> {
+        let (lam, invl) = lam_slots(shared.map_or(0, |(_, g)| g));
+        let shared = shared.map(|(o, _)| o);
         // levels: at least fine, level 1 (virtual) and one stored level
         let mut dims = vec![p.n, coarse(p.n), coarse(coarse(p.n))];
         loop {
@@ -167,15 +192,24 @@ impl<'a> GpuMg<'a> {
             ff.push(sq);
         }
         let bdofs = len(last);
-        let q = buf("cg q", nf);
+        // another group's hierarchy on the same grid (symmetry): its element stiffnesses and
+        // energies, element tables and CG scratch vectors are used here too (the groups are solved
+        // one after another)
+        let share = |f: for<'b> fn(&'b GpuMg<'a>) -> &'b wgpu::Buffer, make: &dyn Fn() -> wgpu::Buffer| match shared {
+            Some(o) => f(o).clone(),
+            None => make(),
+        };
+        let q = share(|o| &o.q, &|| buf("cg q", nf));
         let mut g = GpuMg {
             e,
+            lam,
+            invl,
             smoother: s.smoother,
-            ee: buf("ee", ne),
+            ee: share(|o| &o.ee, &|| buf("ee", ne)),
             free: init("free", bytemuck::cast_slice(&free32)),
-            ke: init("ke", bytemuck::cast_slice(&ke32)),
-            table: init("ptkp table", bytemuck::cast_slice(&table)),
-            ce: buf("ce", ne),
+            ke: share(|o| &o.ke, &|| init("ke", bytemuck::cast_slice(&ke32))),
+            table: share(|o| &o.table, &|| init("ptkp table", bytemuck::cast_slice(&table))),
+            ce: share(|o| &o.ce, &|| buf("ce", ne)),
             diag: (0..=last).map(|l| buf("diag", len(l))).collect(),
             mats: (0..=last)
                 .map(|l| (l >= 2).then(|| buf("mats", SYM * dims[l].iter().product::<usize>())))
@@ -187,9 +221,9 @@ impl<'a> GpuMg<'a> {
                 .map(|l| if l == 0 { q.clone() } else { buf("r", len(l)) })
                 .collect(),
             ld: (0..last).map(|l| buf("d", len(l))).collect(),
-            r: buf("cg r", nf),
-            z: buf("cg z", nf),
-            p: buf("cg p", nf),
+            r: share(|o| &o.r, &|| buf("cg r", nf)),
+            z: share(|o| &o.z, &|| buf("cg z", nf)),
+            p: share(|o| &o.p, &|| buf("cg p", nf)),
             q,
             us: basis.solved.iter().map(|_| buf("u", nf)).collect(),
             slot: basis
@@ -201,63 +235,72 @@ impl<'a> GpuMg<'a> {
                 })
                 .collect(),
             uc: (basis.solved.len() < basis.cases.len()).then(|| buf("u combined", nf)),
-            form: vec![],
+            combos: basis
+                .cases
+                .iter()
+                .map(|c| match c {
+                    CaseSolve::Combined(a) => a.clone(),
+                    CaseSolve::Solved(_) => vec![],
+                })
+                .collect(),
             fs,
             ff,
             bottom: buf("bottom inverse", bdofs * bdofs),
             dims,
             setup: vec![],
             estimate: vec![],
+            estimate_long: vec![],
             init: vec![],
             iter: vec![],
-            energy: vec![],
         };
         g.setup = g.record_setup();
-        g.estimate = g.record_estimate();
+        g.estimate = g.record_estimate(POWER_STEPS);
+        g.estimate_long = g.record_estimate(POWER_STEPS_LONG);
         for c in 0..g.us.len() {
             let i = g.record_init(c);
             g.init.push(i);
             let i = g.record_iter(c);
             g.iter.push(i);
         }
-        // uc = Σ a u_slot (the first term overwrites uc; no terms: a zero load)
-        let record_form = |g: &GpuMg, out: &mut Vec<Step>, how: &CaseSolve| {
-            if let (CaseSolve::Combined(a), Some(uc)) = (how, &g.uc) {
-                g.e.lin(out, uc, &g.r, None, (0.0, NONE), (0.0, NONE), nf);
-                for &(s, w) in a {
-                    g.e.lin(out, uc, &g.us[s], None, (1.0, NONE), (w as f32, NONE), nf);
-                }
-            }
-        };
-        for how in &basis.cases {
-            let mut out = vec![];
-            record_form(&g, &mut out, how);
-            g.form.push(out);
-        }
-        let nn = nodes(g.dims[0]);
-        for (c, how) in basis.cases.iter().enumerate() {
-            let mut out = vec![];
-            record_form(&g, &mut out, how);
-            let u = g.case_u(c);
-            g.e.step(
-                &mut out,
-                "energy",
-                Params {
-                    n: dims4(g.dims[0]),
-                    m: [(c > 0) as u32, 0, 0, 0],
-                    ..Default::default()
-                },
-                &[&g.ee, &g.ke, u, &g.ce],
-                threads(ne),
-            );
-            g.e.reduce(&mut out, Reduce::MaxNorm, u, u, u, nn, MAXD + c as u32);
-            g.energy.extend(out);
-        }
         Ok(g)
     }
 
-    /// Load case `c`'s displacement buffer (for a combined case, valid after `form[c]` ran).
-    fn case_u(&self, c: usize) -> &wgpu::Buffer {
+    /// Record: form load case `c`'s displacement (if it is a combination) and add its element
+    /// energies u_eᵀ ke u_e to `ce` (overwriting it when not `accumulate`). `case_u(c)` holds the
+    /// displacement afterwards, until another case is formed.
+    pub(super) fn record_case(&self, out: &mut Vec<Step>, c: usize, accumulate: bool) {
+        let ne: usize = self.dims[0].iter().product();
+        out.extend(self.form_steps(c));
+        self.e.step(
+            out,
+            "energy",
+            Params {
+                n: dims4(self.dims[0]),
+                m: [accumulate as u32, 0, 0, 0],
+                ..Default::default()
+            },
+            &[&self.ee, &self.ke, self.case_u(c), &self.ce],
+            threads(ne),
+        );
+    }
+
+    /// The steps that form combined case `c` in `uc`: Σ a u_slot, the first term overwriting it
+    /// (no terms: a zero load). None for a solved case.
+    fn form_steps(&self, c: usize) -> Vec<Step> {
+        let mut out = vec![];
+        let nf = self.len(0);
+        if let (Some(uc), None) = (&self.uc, self.slot[c]) {
+            self.e.lin(&mut out, uc, &self.r, None, (0.0, NONE), (0.0, NONE), nf);
+            for &(s, w) in &self.combos[c] {
+                self.e
+                    .lin(&mut out, uc, &self.us[s], None, (1.0, NONE), (w as f32, NONE), nf);
+            }
+        }
+        out
+    }
+
+    /// Load case `c`'s displacement buffer (for a combined case, valid after its form steps ran).
+    pub(super) fn case_u(&self, c: usize) -> &wgpu::Buffer {
         match self.slot[c] {
             Some(s) => &self.us[s],
             None => self.uc.as_ref().unwrap(),
@@ -364,7 +407,7 @@ impl<'a> GpuMg<'a> {
                 n: dims4(self.dims[0]),
                 ..Default::default()
             },
-            &[&self.ee, &self.free, &self.table, &self.diag[1]],
+            &[&self.ee, &self.free, &self.table, &self.diag[1], &self.ke],
             threads(nodes(self.dims[1])),
         );
         for l in 2..=last {
@@ -382,7 +425,7 @@ impl<'a> GpuMg<'a> {
                     m: [virt, 0, 0, 0],
                     ..Default::default()
                 },
-                &[&self.ee, &self.free, &self.table, child, mats],
+                &[&self.ee, &self.free, &self.table, child, mats, &self.ke],
                 groups(self.dims[l].iter().product()),
             );
             self.e.step(
@@ -402,7 +445,7 @@ impl<'a> GpuMg<'a> {
     /// λmax(D⁻¹K) per smoothed level, by power iteration from a random start. This is most of the
     /// setup's cost (12 mat-vecs on levels 0 and 1), and λmax drifts only a few % per optimizer
     /// iteration, so the optimizer re-runs it only now and then (`build(estimate)`).
-    fn record_estimate(&self) -> Vec<Step> {
+    fn record_estimate(&self, steps: usize) -> Vec<Step> {
         let mut out = vec![];
         for l in 0..self.last() {
             let (v, kv, d, n) = (&self.lr[l], &self.ld[l], &self.diag[l], self.len(l));
@@ -416,24 +459,25 @@ impl<'a> GpuMg<'a> {
                 &[d, v],
                 threads(n),
             );
-            for _ in 0..12 {
+            for _ in 0..steps {
                 self.apply(&mut out, l, v, kv);
                 self.e.dot(&mut out, v, kv, None, n, NUM);
                 self.e.dot(&mut out, v, v, Some(d), n, DEN);
-                self.e.scalar(&mut out, OP_DIV, NUM, DEN, LAM + l as u32);
+                self.e.scalar(&mut out, OP_DIV, NUM, DEN, self.lam + l as u32);
                 self.e.lin(&mut out, v, kv, Some(d), (0.0, NONE), (1.0, NONE), n);
                 self.e.dot(&mut out, v, v, Some(d), n, NRM);
                 self.e.scalar(&mut out, OP_RSQRT, NRM, NRM, SC);
                 self.e.lin(&mut out, v, kv, None, (1.0, SC), (0.0, NONE), n);
             }
-            self.e.scalar(&mut out, OP_RECIP, LAM + l as u32, 0, INVL + l as u32);
+            self.e
+                .scalar(&mut out, OP_RECIP, self.lam + l as u32, 0, self.invl + l as u32);
         }
         out
     }
 
     fn smooth(&self, out: &mut Vec<Step>, l: usize, b: &wgpu::Buffer, x: &wgpu::Buffer, zero_start: bool) {
         let (r, d, diag, n) = (&self.lr[l], &self.ld[l], &self.diag[l], self.len(l));
-        let invl = INVL + l as u32;
+        let invl = self.invl + l as u32;
         // r = b - K x
         let residual = |out: &mut Vec<Step>, zero: bool| {
             if zero {
@@ -614,13 +658,21 @@ impl<'a> GpuMg<'a> {
         Ok(())
     }
 
+    /// Re-estimate the smoothers' λmax with more power steps. 12 steps can underestimate it by
+    /// over 10% (seen on the 1.2M bracket's first fine-grid iteration after a coarse start, a
+    /// high-contrast design): the Chebyshev smoother then amplifies the top of the spectrum, the
+    /// preconditioner is indefinite, and CG stalls at a few times its tolerance.
+    pub(super) fn reestimate_long(&self) -> Result<()> {
+        self.e.run(&[&self.estimate_long])
+    }
+
     /// Solve solved-case slot `c` (`LoadBasis::solved`) from its previous solution to relative residual `tol`. Returns the CG
     /// iterations (a multiple of the check interval).
     pub(super) fn solve(&self, c: usize, tol: f64, maxit: usize) -> Result<usize> {
         self.e.run(&[&self.init[c]])?;
-        let s = self.e.read_scalars()?;
+        let rr0 = self.e.read_scalar(RR)?;
         let target = (tol * tol * self.ff[c]) as f32;
-        if s[RR as usize] <= target {
+        if rr0 <= target {
             return Ok(0);
         }
         let mut its = 0;
@@ -628,7 +680,7 @@ impl<'a> GpuMg<'a> {
         while its < maxit {
             self.e.run(&batch)?;
             its += CHECK_EVERY;
-            let rr = self.e.read_scalars()?[RR as usize];
+            let rr = self.e.read_scalar(RR)?;
             if !rr.is_finite() {
                 bail!("GPU CG diverged (residual {rr})");
             }
@@ -639,16 +691,11 @@ impl<'a> GpuMg<'a> {
         Ok(its)
     }
 
-    /// `ce` = per fine element, Σ over load cases of u_eᵀ ke u_e (stays on the GPU), and each
-    /// case's maximum displacement in scalar slot `MAXD + c`.
-    pub(super) fn compute_energies(&self) -> Result<()> {
-        self.e.run(&[&self.energy])
-    }
-
     /// Load case `c`'s displacement (all cases, solved or combined).
     pub(super) fn displacement(&self, c: usize) -> Result<Vec<f32>> {
-        if !self.form[c].is_empty() {
-            self.e.run(&[&self.form[c]])?;
+        let form = self.form_steps(c);
+        if !form.is_empty() {
+            self.e.run(&[&form])?;
         }
         self.e.read_f32(self.case_u(c), self.len(0))
     }
@@ -656,7 +703,7 @@ impl<'a> GpuMg<'a> {
     /// Scalar slot (tests): λmax estimate of level l.
     #[cfg(test)]
     fn lambda(&self, l: usize) -> Result<f32> {
-        Ok(self.e.read_scalars()?[(LAM + l as u32) as usize])
+        Ok(self.e.read_scalars()?[(self.lam + l as u32) as usize])
     }
 }
 
@@ -732,7 +779,7 @@ mod tests {
             free: free.clone(),
         };
         let eng = Engine::new(&gpu).unwrap();
-        let g = GpuMg::new(&eng, &p, &p.load_basis(), &ke, &free, &MgSettings::default()).unwrap();
+        let g = GpuMg::new(&eng, &p, &p.load_basis(), &ke, &free, &MgSettings::default(), None).unwrap();
         g.set_stiffness(&fem.ee).unwrap();
         let write = |b: &wgpu::Buffer, v: &[f64]| {
             let v32: Vec<f32> = v.iter().map(|&x| x as f32).collect();
@@ -876,7 +923,7 @@ mod tests {
         let mut u = vec![0.0; f.len()];
         fem.solve(&f, &mut u, 1e-10, 1000, &mut |r, z| m.precondition(r, z));
         let eng = Engine::new(&gpu).unwrap();
-        let g = GpuMg::new(&eng, &p, &p.load_basis(), &ke, &free, &MgSettings::default()).unwrap();
+        let g = GpuMg::new(&eng, &p, &p.load_basis(), &ke, &free, &MgSettings::default(), None).unwrap();
         g.set_stiffness(&fem.ee).unwrap();
         let its = g.solve(0, 1e-5, 1000).unwrap();
         let ug = g.displacement(0).unwrap();
@@ -898,7 +945,7 @@ mod tests {
         let ke = super::super::hex_ke(nu);
         let free = p.free_mask();
         let eng = Engine::new(&gpu).unwrap();
-        let g = GpuMg::new(&eng, &p, &p.load_basis(), &ke, &free, &MgSettings::default()).unwrap();
+        let g = GpuMg::new(&eng, &p, &p.load_basis(), &ke, &free, &MgSettings::default(), None).unwrap();
         g.set_stiffness(&vec![e0 * p.h; p.domain.len()]).unwrap();
         let its = g.solve(0, 1e-6, 1000).unwrap();
         let u: Vec<f64> = g.displacement(0).unwrap().iter().map(|&v| v as f64).collect();
@@ -920,7 +967,7 @@ mod tests {
             .map(|e| if e % 3 == 0 { 1e-6 } else { 1.0 })
             .collect();
         let eng = Engine::new(&gpu).unwrap();
-        let g = GpuMg::new(&eng, &p, &p.load_basis(), &ke, &free, &MgSettings::default()).unwrap();
+        let g = GpuMg::new(&eng, &p, &p.load_basis(), &ke, &free, &MgSettings::default(), None).unwrap();
         let t = std::time::Instant::now();
         g.set_stiffness(&ee).unwrap();
         eprintln!("levels {:?}", g.dims);

@@ -28,6 +28,7 @@ Measured on `bracket_domain` at 1.3 mm (62×19×31, 34k domain elements): **~100
 - Still open:
   - the step 5 items: the Helmholtz filter, block CG for load cases (cases that are linear
     combinations of others are no longer solved, since 2026-11-14), decimated output for the mesher.
+    Mirror symmetry is used since 2026-11-14 (one side solved; a hierarchy per load pattern).
     Coarse-to-fine continuation is done (the β = 1 stage on a 2× coarser grid);
   - getting memory down to ~100 B per element (f16 vectors, or fewer CG vectors);
   - fewer, fused passes in the smoother.

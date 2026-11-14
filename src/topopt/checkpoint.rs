@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use super::symmetry::Model;
 use super::{LoopState, Problem, Settings};
 
 const VERSION: u32 = 1;
@@ -49,7 +50,7 @@ pub(super) fn path(out: &Path) -> PathBuf {
 /// tolerance and the solver may change.
 fn settings_key(s: &Settings) -> String {
     format!(
-        "voxel {} volfrac {} penal {} rmin {} E {} nu {} force {} beta_max {} emin {} ground {} coarse_start {}",
+        "voxel {} volfrac {} penal {} rmin {} E {} nu {} force {} beta_max {} emin {} ground {} coarse_start {} symmetry {}",
         s.voxel,
         s.volfrac,
         s.penal,
@@ -60,17 +61,25 @@ fn settings_key(s: &Settings) -> String {
         s.beta_max,
         s.emin,
         s.ground.name(),
-        s.coarse_start
+        s.coarse_start,
+        s.symmetry
     )
 }
 
-/// FNV-1a over the problem's grid, domain, supports and loads (stable across builds).
-fn fingerprint(p: &Problem) -> String {
+/// FNV-1a over the model's grid, domain, supports and loads, every group's (stable across builds).
+fn fingerprint(m: &Model) -> String {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in &m.groups {
+        hash_problem(&mut h, p);
+    }
+    format!("{h:016x}")
+}
+
+fn hash_problem(h: &mut u64, p: &Problem) {
     let mut eat = |bytes: &[u8]| {
         for &b in bytes {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x0100_0000_01b3);
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x0100_0000_01b3);
         }
     };
     for v in p.n {
@@ -89,14 +98,13 @@ fn fingerprint(p: &Problem) -> String {
             eat(&v.to_le_bytes());
         }
     }
-    format!("{h:016x}")
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn write(
     out: &Path,
     s: &Settings,
-    p: &Problem,
+    m: &Model,
     coarse: bool,
     iterations: usize,
     beta: f64,
@@ -107,8 +115,8 @@ pub(super) fn write(
         version: VERSION,
         coarse,
         settings: settings_key(s),
-        n: p.n,
-        problem: fingerprint(p),
+        n: m.p().n,
+        problem: fingerprint(m),
         iterations,
         beta,
         state: state.clone(),
@@ -173,9 +181,9 @@ pub(super) fn read(out: &Path, s: &Settings) -> Result<Checkpoint> {
 
 impl Checkpoint {
     /// Check that the checkpoint belongs to problem `p` (the grid it was stopped on).
-    pub(super) fn check(&self, p: &Problem) -> Result<()> {
-        let n = self.header.n;
-        if n != p.n || self.x.len() != p.domain.len() || self.header.problem != fingerprint(p) {
+    pub(super) fn check(&self, m: &Model) -> Result<()> {
+        let (n, p) = (self.header.n, m.p());
+        if n != p.n || self.x.len() != p.domain.len() || self.header.problem != fingerprint(m) {
             bail!(
                 "the shape, its supports or its loads changed since the run was stopped (grid {}x{}x{}, now \
                  {}x{}x{}); run without --resume to start over",
@@ -219,6 +227,7 @@ mod tests {
             adaptive_tol: true,
             ground: Ground::None,
             coarse_start: true,
+            symmetry: true,
         }
     }
 
@@ -237,21 +246,21 @@ mod tests {
             ..Default::default()
         };
         let s = settings(0.3);
-        write(&out, &s, &p, true, 17, 4.0, &state, &x).unwrap();
+        write(&out, &s, &Model::single(p.clone()), true, 17, 4.0, &state, &x).unwrap();
         assert_eq!(path(&out), dir.join("r.vti.resume"));
         let c = read(&out, &s).unwrap();
         assert!(c.header.coarse);
         assert_eq!((c.header.iterations, c.header.beta), (17, 4.0));
         assert_eq!((c.header.state.lambda, c.header.state.last_change), (0.25, 0.125));
         assert_eq!(c.x, x);
-        c.check(&p).unwrap();
+        c.check(&Model::single(p.clone())).unwrap();
         // the iteration limit may change, the volume fraction not
         read(&out, &Settings { iters: 80, ..s.clone() }).unwrap();
         assert!(read(&out, &settings(0.25)).is_err());
         // another load
         let mut q = grid([4, 2, 2], 1.0);
         q.loads = vec![vec![[0.0, 0.0, -1.0]; q.fixed.len()]];
-        assert!(c.check(&q).is_err());
+        assert!(c.check(&Model::single(q)).is_err());
         remove(&out);
         assert!(read(&out, &s).is_err());
         std::fs::remove_dir_all(&dir).ok();

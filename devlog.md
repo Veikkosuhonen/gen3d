@@ -3,6 +3,72 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Solve one side of mirror-symmetric problems
+
+**Why:** with mirror planes declared (previous entry), a symmetric part needs only one side solved:
+2^planes fewer elements, less memory, and a symmetric design by construction.
+
+**What** (`topopt/symmetry.rs`, the module docs have the derivation):
+- Setup aligns the grid so each plane is the middle node layer (also with `--no-symmetry`, so that
+  flag changes only the solve), and mirrors the stabilizing pins so the supports stay symmetric.
+- `symmetry::reduce` checks domain, kept regions and supports for symmetry and keeps the upper side.
+  Each load case is split into 2^planes parts, symmetric or antisymmetric about each plane; each
+  pattern with any load is a group with its own plane condition (S: the normal displacement held on
+  the plane, A: the tangential ones) and its own multigrid hierarchy. Plane nodes carry half their
+  load. Full compliance = 2^planes × the sum over groups; per element, the groups' energies sum to
+  the full energy averaged over mirror images, which is the symmetric design's sensitivity.
+- `Model { groups, sym }` replaces the single `Problem` in the CPU and GPU loops. GPU hierarchies after
+  the first share its element stiffness/energy buffers, element tables and CG scratch vectors (solves
+  are sequential); each has its own λmax scalar slots.
+- The density filter (CPU, GPU `filter` and `sens` weight sums) reflects at the planes.
+- OC divides the sensitivities by the full compliance, so λ (and the bisection's path) is the same
+  with or without symmetry.
+- Output: cell fields are mirrored, each case's displacement is combined from its parts with the
+  signs of each mirror side; the max displacement is taken over every case and side.
+- Used from 100k domain elements (the table's 26k-element coarse stage was slower as 3 quarter
+  hierarchies: 5.8 s against 3.6 s whole). `--no-symmetry` turns it off.
+
+**Result** (same aligned grid; time, iterations, compliance):
+
+| | whole | reduced |
+|---|---|---|
+| bracket_editor mirrored in Y (2 patterns) | 9.1 s, 58, 16.802 | 7.4 s, 58, 16.801 |
+| table mirrored in X, Y (3 patterns, 3 of 15 parts solved) | 15.9 s, 63, 0.029068 | 12.2 s, 63, 0.029069 |
+| bracket_editor at 0.4 mm (1.2M) | 49.6 s, 53, 17.864 | 29.6 s, 53, 17.862 |
+
+GPU memory: the bracket 59 → 46 MB.
+
+**Verified:** `symmetric_quarter_matches_the_whole_cpu` / `_gpu`: a beam mirrored in X and Y whose cases
+come with their mirror images (so the whole problem's design is symmetric too) while each case has
+parts of all four patterns: compliance per iteration within 1e-6 (CPU) / 2e-3 (GPU), and the written
+density and displacements of the asymmetric cases match. CPU and GPU CG counts match the whole
+part's on the mirrored bracket.
+
+**Still open:** each pattern builds its own hierarchy every iteration (setup × patterns); a block
+solve over the patterns' cases; the script's own map isn't mirrored.
+
+## 2026-11-14: GPU multigrid: per-axis masks for rollers, a careful λmax re-estimate
+
+Two GPU solver problems found while testing symmetry, both older than it:
+
+**Rollers on coarse levels.** The table of Pᵀ(D ke D)P that builds level 1's diagonal and level 2 is
+indexed by which of an element's nodes are clamped; a partly held node (a roller, `--ground slide`,
+a symmetry plane) counted as clamped on all axes, so the coarse levels didn't match the fine one along
+such faces. A whole face of rollers (the symmetry plane) took CG from 8 to 28 iterations per solve.
+Now an element with a partly free node gets its level-1 matrix computed in the kernel with per-axis
+masks (`fine_free`, `partial_entry`; ke is bound to `diag_l1` and `assemble`); the others still use
+the table. Result: the same CG counts as the CPU multigrid (8 against 8 on the bracket's symmetric
+half, where it was 28).
+
+**λmax underestimates.** On the 1.2M bracket's first fine-grid iteration after a coarse start, the
+12-step power iteration came out low enough that Chebyshev amplified the top of the spectrum: CG
+stalled at 3.5× its tolerance and ran to its 20,000-iteration limit (the run looked hung). 40 steps fix
+it but cost ~20% on every run. Instead, each solve now first runs to `STALE_CG_ITS` (32) iterations;
+if it hasn't converged it refreshes the estimate (a 40-step one when the estimate was fresh) and
+carries on. That run: 49.6 s, as expected; bracket_editor and table unchanged (9.9–10.2 s,
+16.7–17.2 s). CG's convergence checks now read back only the residual slot (the scalar buffer grew
+to 544 slots for the per-group λ and per-side maximum displacements).
+
 ## 2026-11-14: Mirror planes in the editor
 
 **Why:** symmetric parts are common (brackets, stands, tables), and the optimizer can solve only one
