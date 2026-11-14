@@ -2022,7 +2022,7 @@ impl App {
                 ui.horizontal_wrapped(|ui| {
                     for r in Role::ALL {
                         if ui.selectable_label(p.role == r, r.name()).clicked() && p.role != r {
-                            p.role = r;
+                            p.set_role(r);
                             new_step = true;
                         }
                     }
@@ -2034,6 +2034,11 @@ impl App {
                         "acts on the surface this primitive cuts ({} there)",
                         p.role.name()
                     ));
+                    ui.end_row();
+                }
+                if p.op == Op::Union && p.role.is_bc() {
+                    ui.label("");
+                    ui.weak("adds its own volume to the part, kept solid (\"region\" only marks the spot)");
                     ui.end_row();
                 }
                 if p.role == Role::Fixed {

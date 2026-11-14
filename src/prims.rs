@@ -256,6 +256,18 @@ impl Prim {
         }
     }
 
+    /// Set the role from the editor. A primitive that adds material and becomes a support or load
+    /// switches to `Op::Region`, so marking where a load goes doesn't add a block to the part (and
+    /// back to `Op::Union` when it stops being one). Subtracting and intersecting ones keep their op.
+    pub fn set_role(&mut self, role: Role) {
+        match (self.op, self.role.is_bc(), role.is_bc()) {
+            (Op::Union, false, true) => self.op = Op::Region,
+            (Op::Region, true, false) => self.op = Op::Union,
+            _ => {}
+        }
+        self.role = role;
+    }
+
     /// The fixed axes as bits (bit c for axis c).
     pub fn fix_mask(&self) -> u8 {
         (0..3).filter(|&c| self.fix[c]).fold(0, |m, c| m | 1 << c)
@@ -1308,6 +1320,25 @@ mod tests {
         let at = |q: V3| prims.iter().fold(1e10, |d, p| p.op.apply(d, p.sdf(q), p.blend));
         assert!(at([5.0, 0.0, 3.0]) > 0.0 && at([-4.0, -4.0, -4.0]) < 0.0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bc_roles_mark_a_region() {
+        let mut p = Prim::new(Kind::Box, "b".into(), [0.0; 3], 10.0);
+        p.set_role(Role::Load);
+        assert_eq!(p.op, Op::Region);
+        p.set_role(Role::Fixed);
+        assert_eq!(p.op, Op::Region);
+        p.set_role(Role::Design);
+        assert_eq!(p.op, Op::Union);
+        // a subtracted one keeps cutting (it loads the face it cuts)
+        p.op = Op::Subtract;
+        p.set_role(Role::Load);
+        assert_eq!(p.op, Op::Subtract);
+        // an added support the user chose to keep stays added
+        p.op = Op::Union;
+        p.set_role(Role::Fixed);
+        assert_eq!((p.op, p.role), (Op::Union, Role::Fixed));
     }
 
     #[test]

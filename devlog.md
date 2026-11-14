@@ -3,6 +3,26 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-14: Supports and loads mark a region by default
+
+**Why:** a primitive's role (design, keep solid, fixed, load) and its operation (add, subtract,
+intersect, region) are separate. A new primitive is *add*, so a box made into a load to mark where an
+object rests also added its own volume to the part, kept solid, and grew the bounds. The user's table
+had a solid 10 mm block at each corner sticking 4.5 mm out of the design.
+
+**What:** `Prim::set_role`, used by the editor's role buttons. An *add* primitive that becomes
+*fixed* or *load* switches to *region*, and a *region* one switches back to *add* when its role
+goes back to *design* or *keep solid*. Subtracting and intersecting primitives keep their operation:
+a subtracted bolt hole set to *fixed* clamps its wall. A fixed or load primitive the user sets to
+*add* on purpose stays *add*, and the editor notes that it adds its own volume, kept solid.
+Existing `.prims.json` files are unchanged.
+
+**Result:** marking a load or support no longer changes the part or its bounds unless asked to.
+
+**Verified:** `bc_roles_mark_a_region`. The editor UI change hasn't been checked by hand.
+
+**Still open:** —
+
 ## 2026-11-14: Crop the optimizer grid to the design domain
 
 **Why:** the optimizer's grid spanned the shape's bounds, which can be much larger than the part: a

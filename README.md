@@ -367,7 +367,10 @@ The shell is 1.5 elements thick (`g3d_reach`, set from the optimizer's element s
 natural thing work: a **subtracted** cylinder (a bolt hole) marked *fixed* clamps the hole's wall, and a
 subtracted pin hole marked *load* loads its wall. Fixed and loaded regions are also kept solid, since a
 bolt or pin needs material around it. A primitive whose operation is **region** marks a spot without
-changing the shape, e.g. a box over the face that rests against a wall.
+changing the shape, e.g. a box over the face that rests against a wall. Giving an *add* primitive the
+*fixed* or *load* role switches it to *region* (and back to *add* when the role goes back to *design*
+or *keep solid*). Set it to *add* again on purpose to make the region part of the shape too: its
+whole volume is then kept solid, even where it sticks out of the design.
 
 **Load cases:** loads with the same case number act together. Different cases are separate situations
 (a bracket pulled down *or* pushed sideways), and the part is optimized for all of them: the objective
