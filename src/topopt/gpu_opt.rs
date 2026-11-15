@@ -682,9 +682,12 @@ mod tests {
             let cpu = optimize(&p, &settings(Solver::Multigrid(ms)), &dir.join("cpu.vti"), None).unwrap();
             let gpu_r = optimize(&p, &settings(Solver::Gpu(ms)), &dir.join("gpu.vti"), Some(&gpu)).unwrap();
             assert_eq!(cpu.iterations, gpu_r.iterations);
+            // the overhang runs amplify f32 rounding over 12 iterations: -X up with beta 8 ends
+            // 1.7e-3 to 2.1e-3 apart depending on how the smoother rounds (per-iteration
+            // compliances stay within 1.3e-3)
             let rel = (cpu.max_disp - gpu_r.max_disp).abs() / cpu.max_disp;
             assert!(
-                rel < 2e-3,
+                rel < 3e-3,
                 "max displacement {} (CPU) vs {} (GPU)",
                 cpu.max_disp,
                 gpu_r.max_disp

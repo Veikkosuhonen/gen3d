@@ -43,6 +43,12 @@ fn sym(r: u32, c: u32) -> u32 {
     return a * (49u - a) / 2u + (b - a);
 }
 
+// a node's free axes (bits) as a 0/1 mask per DOF
+fn free3(f: u32) -> vec3<f32> {
+    return vec3<f32>(f32(f & 1u), f32((f >> 1u) & 1u), f32((f >> 2u) & 1u));
+}
+
+
 // trilinear weight of coarse local node b at fine local node a of child c
 fn wgt(c: u32, a: u32, b: u32) -> f32 {
     var w = 1.0;
@@ -153,6 +159,192 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     d[3u * node] = acc.x;
     d[3u * node + 1u] = acc.y;
     d[3u * node + 2u] = acc.z;
+}
+
+//// kernel cheb_fine
+// One smoother step on the fine grid with neither its diagonal nor its residual stored (each would
+// be a fine vector): d = α d + γ D⁻¹ (b − K x) on free DOFs (0 elsewhere), D = diag(K) worked out
+// here from `ee`, in the loop that forms K x. Recomputing b − K x from x costs the same mat-vec as
+// updating a stored residual. α = P.f.x (0: d isn't read), γ = P.f.y (× S[P.m.z] unless NONE).
+// P.m.x == 1: x is zero (not read). P.m.y == 1: without D⁻¹ (d = α d + γ (b − K x)).
+@group(0) @binding(1) var<storage, read> S: array<f32>;
+@group(0) @binding(2) var<storage, read> ee: array<f32>;
+@group(0) @binding(3) var<storage, read> free: array<u32>;
+@group(0) @binding(4) var<storage, read> ke: array<f32>;
+@group(0) @binding(5) var<storage, read> x: array<f32>;
+@group(0) @binding(6) var<storage, read> b: array<f32>;
+@group(0) @binding(7) var<storage, read_write> d: array<f32>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let node = flat(wg, nwg, li);
+    let n = P.n.xyz;
+    if node >= node_count(n) { return; }
+    let nx = n.x + 1u;
+    let ny = n.y + 1u;
+    let fm = free[node];
+    if fm == 0u {
+        d[3u * node] = 0.0;
+        d[3u * node + 1u] = 0.0;
+        d[3u * node + 2u] = 0.0;
+        return;
+    }
+    let zero_x = P.m.x == 1u;
+    let i = node % nx;
+    let j = (node / nx) % ny;
+    let k = node / (nx * ny);
+    var acc = vec3<f32>(0.0);
+    var dg = vec3<f32>(0.0);
+    for (var a = 0u; a < 8u; a++) {
+        let di = a & 1u;
+        let dj = (a >> 1u) & 1u;
+        let dk = (a >> 2u) & 1u;
+        if i < di || j < dj || k < dk { continue; }
+        let ei = i - di;
+        let ej = j - dj;
+        let ek = k - dk;
+        if ei >= n.x || ej >= n.y || ek >= n.z { continue; }
+        let s = ee[(ek * n.y + ej) * n.x + ei];
+        if s == 0.0 { continue; }
+        let rd = (3u * a) * 25u;
+        dg += s * vec3<f32>(ke[rd], ke[rd + 25u], ke[rd + 50u]);
+        if zero_x { continue; }
+        // relative to the element's first node, as in `apply_fine`
+        let m0 = elem_node(ei, ej, ek, 0u, nx, ny);
+        let u0 = vec3<f32>(x[3u * m0], x[3u * m0 + 1u], x[3u * m0 + 2u]);
+        for (var c = 1u; c < 8u; c++) {
+            let m = elem_node(ei, ej, ek, c, nx, ny);
+            let um = vec3<f32>(x[3u * m], x[3u * m + 1u], x[3u * m + 2u]) - u0;
+            let r = (3u * a) * 24u + 3u * c;
+            acc.x += s * dot(vec3<f32>(ke[r], ke[r + 1u], ke[r + 2u]), um);
+            acc.y += s * dot(vec3<f32>(ke[r + 24u], ke[r + 25u], ke[r + 26u]), um);
+            acc.z += s * dot(vec3<f32>(ke[r + 48u], ke[r + 49u], ke[r + 50u]), um);
+        }
+    }
+    var res = vec3<f32>(b[3u * node], b[3u * node + 1u], b[3u * node + 2u]) - acc;
+    if P.m.y == 0u {
+        res = select(vec3<f32>(0.0), res / dg, dg > vec3<f32>(0.0));
+    }
+    res *= free3(fm);
+    var g = P.f.y;
+    if P.m.z != NONE { g *= S[P.m.z]; }
+    let al = P.f.x;
+    for (var c = 0u; c < 3u; c++) {
+        if al == 0.0 {
+            d[3u * node + c] = g * res[c];
+        } else {
+            d[3u * node + c] = al * d[3u * node + c] + g * res[c];
+        }
+    }
+}
+
+//// kernel apply_p
+// y = D K D P uc on the fine grid P.n, uc on its coarse grid: with `restrict` after it, level 1's
+// mat-vec Pᵀ D K D P without storing P uc (a fine vector). One workgroup per 8×4×4 tile of nodes:
+// it loads the coarse nodes under the tile (6×4×4), interpolates D P uc on the tile and a one-node
+// halo from them (360 nodes, ~3 per thread), all in workgroup memory, then each thread applies K at
+// its node as `apply_fine`. D keeps the free DOFs.
+@group(0) @binding(1) var<storage, read> ee: array<f32>;
+@group(0) @binding(2) var<storage, read> free: array<u32>;
+@group(0) @binding(3) var<storage, read> ke: array<f32>;
+@group(0) @binding(4) var<storage, read> uc: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+
+// the tile with its halo: 10×6×6 nodes, x fastest; the coarse nodes under it: 6×4×4
+var<workgroup> sp: array<vec3<f32>, 360>;
+var<workgroup> sc: array<vec3<f32>, 96>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let n = P.n.xyz;
+    let nn = n + vec3<u32>(1u);
+    let tiles = (nn + vec3<u32>(7u, 3u, 3u)) / vec3<u32>(8u, 4u, 4u);
+    let tile = wg_flat(wg, nwg);
+    if tile >= tiles.x * tiles.y * tiles.z { return; }
+    let t0 = vec3<u32>(tile % tiles.x, (tile / tiles.x) % tiles.y, tile / (tiles.x * tiles.y)) * vec3<u32>(8u, 4u, 4u);
+    let nc = (n + vec3<u32>(1u)) / 2u;
+    let cx = nc.x + 1u;
+    let cy = nc.y + 1u;
+    // coarse nodes t0 / 2 - 1 .. + (6, 4, 4): the fine halo t0 - 1 .. t0 + (8, 4, 4) lies over them
+    let c0 = vec3<i32>(t0 / 2u) - vec3<i32>(1);
+    if li < 96u {
+        let q = c0 + vec3<i32>(i32(li % 6u), i32((li / 6u) % 4u), i32(li / 24u));
+        var v = vec3<f32>(0.0);
+        if all(q >= vec3<i32>(0)) && q.x <= i32(nc.x) && q.y <= i32(nc.y) && q.z <= i32(nc.z) {
+            let o = 3u * ((u32(q.z) * cy + u32(q.y)) * cx + u32(q.x));
+            v = vec3<f32>(uc[o], uc[o + 1u], uc[o + 2u]);
+        }
+        sc[li] = v;
+    }
+    workgroupBarrier();
+    for (var s = li; s < 360u; s += WG) {
+        let q = vec3<i32>(t0) + vec3<i32>(i32(s % 10u), i32((s / 10u) % 6u), i32(s / 60u)) - vec3<i32>(1);
+        var v = vec3<f32>(0.0);
+        if all(q >= vec3<i32>(0)) && all(vec3<u32>(q) < nn) {
+            let qu = vec3<u32>(q);
+            let fq = free[(qu.z * nn.y + qu.y) * nn.x + qu.x];
+            if fq != 0u {
+                // per axis: the coarse nodes (relative to c0) and weights; an even fine node sits
+                // on one coarse node, an odd one halfway between two
+                let lo = vec3<i32>(qu / 2u) - c0;
+                let odd = (qu % 2u) == vec3<u32>(1u);
+                let hi = lo + select(vec3<i32>(0), vec3<i32>(1), odd);
+                let w = select(vec3<f32>(1.0), vec3<f32>(0.5), odd);
+                let wz = vec2<f32>(w.z, select(0.0, w.z, odd.z));
+                let wy = vec2<f32>(w.y, select(0.0, w.y, odd.y));
+                let wx = vec2<f32>(w.x, select(0.0, w.x, odd.x));
+                let zs = vec2<i32>(lo.z, hi.z) * 24;
+                let ys = vec2<i32>(lo.y, hi.y) * 6;
+                let xs = vec2<i32>(lo.x, hi.x);
+                for (var cz = 0u; cz < 2u; cz++) {
+                    for (var cy2 = 0u; cy2 < 2u; cy2++) {
+                        let wzy = wz[cz] * wy[cy2];
+                        let row = zs[cz] + ys[cy2];
+                        v += wzy * (wx.x * sc[row + xs.x] + wx.y * sc[row + xs.y]);
+                    }
+                }
+                v *= free3(fq);
+            }
+        }
+        sp[s] = v;
+    }
+    workgroupBarrier();
+    let l = vec3<u32>(li % 8u, (li / 8u) % 4u, li / 32u);
+    let p = t0 + l;
+    if any(p >= nn) { return; }
+    let node = (p.z * nn.y + p.y) * nn.x + p.x;
+    let fm = free[node];
+    var acc = vec3<f32>(0.0);
+    if fm != 0u {
+        // this node in the halo tile
+        let h = (l.x + 1u) + 10u * ((l.y + 1u) + 6u * (l.z + 1u));
+        for (var a = 0u; a < 8u; a++) {
+            let di = a & 1u;
+            let dj = (a >> 1u) & 1u;
+            let dk = (a >> 2u) & 1u;
+            if p.x < di || p.y < dj || p.z < dk { continue; }
+            let e = p - vec3<u32>(di, dj, dk);
+            if any(e >= n) { continue; }
+            let s = ee[(e.z * n.y + e.y) * n.x + e.x];
+            if s == 0.0 { continue; }
+            // the element's local node c is at halo index h - (a bits) + (c bits)
+            let base = h - di - 10u * dj - 60u * dk;
+            let u0 = sp[base];
+            for (var c = 1u; c < 8u; c++) {
+                let um = sp[base + (c & 1u) + 10u * ((c >> 1u) & 1u) + 60u * ((c >> 2u) & 1u)] - u0;
+                let r = (3u * a) * 24u + 3u * c;
+                acc.x += s * dot(vec3<f32>(ke[r], ke[r + 1u], ke[r + 2u]), um);
+                acc.y += s * dot(vec3<f32>(ke[r + 24u], ke[r + 25u], ke[r + 26u]), um);
+                acc.z += s * dot(vec3<f32>(ke[r + 48u], ke[r + 49u], ke[r + 50u]), um);
+            }
+        }
+        acc *= free3(fm);
+    }
+    y[3u * node] = acc.x;
+    y[3u * node + 1u] = acc.y;
+    y[3u * node + 2u] = acc.z;
 }
 
 //// kernel diag_l1
@@ -531,10 +723,18 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 
 //// kernel restrict
 // rc = Pᵀ D r from the grid P.n to its coarse grid, D keeping the DOFs with a positive diagonal (as
-// `prolong`).
+// `prolong`). `mask` is the grid's diagonal (f32), or on the fine grid (P.m.y == 1, its diagonal
+// isn't stored) its per-node free axes: with E_min > 0 a free DOF has a positive diagonal.
 @group(0) @binding(1) var<storage, read> r: array<f32>;
-@group(0) @binding(2) var<storage, read> diag: array<f32>;
+@group(0) @binding(2) var<storage, read> mask: array<u32>;
 @group(0) @binding(3) var<storage, read_write> rc: array<f32>;
+
+fn keep(node: u32) -> vec3<f32> {
+    if P.m.y == 1u { return free3(mask[node]); }
+    let q = 3u * node;
+    return vec3<f32>(f32(bitcast<f32>(mask[q]) > 0.0), f32(bitcast<f32>(mask[q + 1u]) > 0.0),
+                     f32(bitcast<f32>(mask[q + 2u]) > 0.0));
+}
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -560,9 +760,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                 let i = 2 * ci + di;
                 if i < 0 || i >= f.x { continue; }
                 let w = select(0.5, 1.0, di == 0) * select(0.5, 1.0, dj == 0) * select(0.5, 1.0, dk == 0);
-                let q = 3u * u32((k * f.y + j) * f.x + i);
-                let keep = vec3<f32>(f32(diag[q] > 0.0), f32(diag[q + 1u] > 0.0), f32(diag[q + 2u] > 0.0));
-                acc += w * keep * vec3<f32>(r[q], r[q + 1u], r[q + 2u]);
+                let node = u32((k * f.y + j) * f.x + i);
+                let q = 3u * node;
+                acc += w * keep(node) * vec3<f32>(r[q], r[q + 1u], r[q + 2u]);
             }
         }
     }
@@ -580,11 +780,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 
 //// kernel prolong
 // x += D P xc on the grid P.n (x = D P xc when P.m.x == 1), D keeping the DOFs with a positive
-// diagonal. (Level 1, applied as Pᵀ D K D P through the fine grid, is then exact for rollers too; its
-// diagonal and level 2 come from the per-node table, which sees a roller node as clamped.)
+// diagonal (`mask` as in `restrict`, free axes when P.m.y == 1). (Level 1, applied as Pᵀ D K D P
+// through the fine grid, is then exact for rollers too; its diagonal and level 2 come from the
+// per-node table, which sees a roller node as clamped.)
 @group(0) @binding(1) var<storage, read> xc: array<f32>;
-@group(0) @binding(2) var<storage, read> diag: array<f32>;
+@group(0) @binding(2) var<storage, read> mask: array<u32>;
 @group(0) @binding(3) var<storage, read_write> x: array<f32>;
+
+fn keep(node: u32) -> vec3<f32> {
+    if P.m.y == 1u { return free3(mask[node]); }
+    let q = 3u * node;
+    return vec3<f32>(f32(bitcast<f32>(mask[q]) > 0.0), f32(bitcast<f32>(mask[q + 1u]) > 0.0),
+                     f32(bitcast<f32>(mask[q + 2u]) > 0.0));
+}
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -617,11 +825,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         let o = 3u * ((q.z * cy + q.y) * cx + q.x);
         acc += w * vec3<f32>(xc[o], xc[o + 1u], xc[o + 2u]);
     }
+    let k = keep(m);
     for (var d = 0u; d < 3u; d++) {
-        let keep = diag[3u * m + d] > 0.0;
         if P.m.x == 1u {
-            x[3u * m + d] = select(0.0, acc[d], keep);
-        } else if keep {
+            x[3u * m + d] = select(0.0, acc[d], k[d] > 0.0);
+        } else if k[d] > 0.0 {
             x[3u * m + d] += acc[d];
         }
     }

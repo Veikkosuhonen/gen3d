@@ -214,6 +214,8 @@ impl<'a> GpuMg<'a> {
             None => make(),
         };
         let q = share(|o| &o.q, &|| buf("cg q", nf));
+        let z = share(|o| &o.z, &|| buf("cg z", nf));
+        let p_ = share(|o| &o.p, &|| buf("cg p", nf));
         let mut g = GpuMg {
             e,
             lam,
@@ -224,7 +226,11 @@ impl<'a> GpuMg<'a> {
             ke: share(|o| &o.ke, &|| init("ke", bytemuck::cast_slice(&ke32))),
             table: share(|o| &o.table, &|| init("ptkp table", bytemuck::cast_slice(&table))),
             ce: share(|o| &o.ce, &|| buf("ce", ne)),
-            diag: (0..=last).map(|l| buf("diag", len(l))).collect(),
+            // level 0's diagonal isn't kept (the smoother works it out, `cheb_fine`): only the λmax
+            // estimate needs it, between solves, in CG's p
+            diag: (0..=last)
+                .map(|l| if l == 0 { p_.clone() } else { buf("diag", len(l)) })
+                .collect(),
             mats: (0..=last)
                 .map(|l| (l >= 2).then(|| buf("mats", SYM * dims[l].iter().product::<usize>())))
                 .collect(),
@@ -234,10 +240,14 @@ impl<'a> GpuMg<'a> {
             lr: (0..last)
                 .map(|l| if l == 0 { q.clone() } else { buf("r", len(l)) })
                 .collect(),
-            ld: (0..last).map(|l| buf("d", len(l))).collect(),
+            // level 0's smoother direction is CG's q too (`smooth`); this one is only the λmax
+            // estimate's, between solves, in CG's z
+            ld: (0..last)
+                .map(|l| if l == 0 { z.clone() } else { buf("d", len(l)) })
+                .collect(),
             r: share(|o| &o.r, &|| buf("cg r", nf)),
-            z: share(|o| &o.z, &|| buf("cg z", nf)),
-            p: share(|o| &o.p, &|| buf("cg p", nf)),
+            z,
+            p: p_,
             q,
             us: basis.solved.iter().map(|_| buf("u", nf)).collect(),
             slot: basis
@@ -359,31 +369,36 @@ impl<'a> GpuMg<'a> {
                 t,
             ),
             1 => {
-                // Pᵀ (D K D) P u through the fine grid, using two fine vectors that are free
-                // whenever level 1 is worked on (level 0's residual, already restricted, and its
-                // smoother direction). Cheaper than stored or on-the-fly element matrices.
-                let (pu, kpu) = (&self.lr[0], &self.ld[0]);
+                // Pᵀ (D K D) P u through the fine grid (`apply_p` prolongs on the fly), in a fine
+                // vector that is free whenever level 1 is worked on: level 0's residual, already
+                // restricted. Cheaper than stored or on-the-fly element matrices.
+                let kpu = &self.lr[0];
                 self.e.step(
                     out,
-                    "prolong",
+                    "apply_p",
                     Params {
                         n: dims4(self.dims[0]),
-                        m: [1, 0, 0, 0],
                         ..Default::default()
                     },
-                    &[u, &self.diag[0], pu],
-                    threads(nodes(self.dims[0])),
+                    &[&self.ee, &self.free, &self.ke, u, kpu],
+                    groups(
+                        self.dims[0]
+                            .map(|v| v + 1)
+                            .iter()
+                            .zip([8, 4, 4])
+                            .map(|(v, t)| v.div_ceil(t))
+                            .product(),
+                    ),
                 );
-                self.apply(out, 0, pu, kpu);
                 self.e.step(
                     out,
                     "restrict",
                     Params {
                         n: dims4(self.dims[0]),
-                        m,
+                        m: [sub as u32, 1, 0, 0],
                         ..Default::default()
                     },
-                    &[kpu, &self.diag[0], y],
+                    &[kpu, &self.free, y],
                     t,
                 );
             }
@@ -404,16 +419,6 @@ impl<'a> GpuMg<'a> {
     fn record_setup(&self) -> Vec<Step> {
         let mut out = vec![];
         let last = self.last();
-        self.e.step(
-            &mut out,
-            "diag_fine",
-            Params {
-                n: dims4(self.dims[0]),
-                ..Default::default()
-            },
-            &[&self.ee, &self.free, &self.ke, &self.diag[0]],
-            threads(nodes(self.dims[0])),
-        );
         self.e.step(
             &mut out,
             "diag_l1",
@@ -461,6 +466,17 @@ impl<'a> GpuMg<'a> {
     /// iteration, so the optimizer re-runs it only now and then (`build(estimate)`).
     fn record_estimate(&self, steps: usize) -> Vec<Step> {
         let mut out = vec![];
+        // level 0's diagonal, in CG's p (see `new`)
+        self.e.step(
+            &mut out,
+            "diag_fine",
+            Params {
+                n: dims4(self.dims[0]),
+                ..Default::default()
+            },
+            &[&self.ee, &self.free, &self.ke, &self.diag[0]],
+            threads(nodes(self.dims[0])),
+        );
         for l in 0..self.last() {
             let (v, kv, d, n) = (&self.lr[l], &self.ld[l], &self.diag[l], self.len(l));
             self.e.step(
@@ -490,6 +506,9 @@ impl<'a> GpuMg<'a> {
     }
 
     fn smooth(&self, out: &mut Vec<Step>, l: usize, b: &wgpu::Buffer, x: &wgpu::Buffer, zero_start: bool) {
+        if l == 0 {
+            return self.smooth_fine(out, b, x, zero_start);
+        }
         let (r, d, diag, n) = (&self.lr[l], &self.ld[l], &self.diag[l], self.len(l));
         let invl = self.invl + l as u32;
         // r = b - K x
@@ -541,6 +560,77 @@ impl<'a> GpuMg<'a> {
         }
     }
 
+    /// d = α d + γ D⁻¹ (b − K x) on the fine grid (`cheb_fine`; the plain residual when `scaled` is
+    /// false), γ = c.0 × S[c.1].
+    #[allow(clippy::too_many_arguments)]
+    fn cheb_fine(
+        &self,
+        out: &mut Vec<Step>,
+        b: &wgpu::Buffer,
+        x: &wgpu::Buffer,
+        d: &wgpu::Buffer,
+        alpha: f32,
+        c: (f32, u32),
+        zero_x: bool,
+        scaled: bool,
+    ) {
+        self.e.step(
+            out,
+            "cheb_fine",
+            Params {
+                n: dims4(self.dims[0]),
+                m: [zero_x as u32, !scaled as u32, c.1, 0],
+                f: [alpha, c.0, 0.0, 0.0],
+                ..Default::default()
+            },
+            &[&self.e.scalars, &self.ee, &self.free, &self.ke, x, b, d],
+            threads(nodes(self.dims[0])),
+        );
+    }
+
+    /// `smooth` on the fine grid, the same iteration with neither the diagonal nor a residual
+    /// stored: each step recomputes D⁻¹ (b − K x) from x (`cheb_fine`, one mat-vec as before), and
+    /// the direction lives in CG's q, which is free during the V-cycle.
+    fn smooth_fine(&self, out: &mut Vec<Step>, b: &wgpu::Buffer, x: &wgpu::Buffer, zero_start: bool) {
+        let (d, n) = (&self.q, self.len(0));
+        let invl = self.invl;
+        match self.smoother {
+            Smoother::Jacobi { sweeps, omega } => {
+                for k in 0..sweeps {
+                    let zero = zero_start && k == 0;
+                    self.cheb_fine(out, b, x, d, 0.0, (omega as f32, invl), zero, true);
+                    let a = if zero { 0.0 } else { 1.0 };
+                    self.e.lin(out, x, d, None, (a, NONE), (1.0, NONE), n);
+                }
+            }
+            Smoother::Chebyshev { degree } => {
+                // as `smooth`
+                let sigma = 1.2f64;
+                let mut rho = 1.0 / sigma;
+                self.cheb_fine(out, b, x, d, 0.0, ((1.0 / 0.6) as f32, invl), zero_start, true);
+                for k in 1..=degree {
+                    let a = if zero_start && k == 1 { 0.0 } else { 1.0 };
+                    self.e.lin(out, x, d, None, (a, NONE), (1.0, NONE), n);
+                    if k == degree {
+                        break;
+                    }
+                    let rho_new = 1.0 / (2.0 * sigma - rho);
+                    self.cheb_fine(
+                        out,
+                        b,
+                        x,
+                        d,
+                        (rho_new * rho) as f32,
+                        ((2.0 * rho_new / 0.5) as f32, invl),
+                        false,
+                        true,
+                    );
+                    rho = rho_new;
+                }
+            }
+        }
+    }
+
     fn vcycle(&self, out: &mut Vec<Step>, l: usize, b: &wgpu::Buffer, x: &wgpu::Buffer) {
         if l == self.last() {
             let n = self.len(l);
@@ -559,17 +649,24 @@ impl<'a> GpuMg<'a> {
         let n = self.len(l);
         self.smooth(out, l, b, x, true);
         let r = &self.lr[l];
-        self.apply(out, l, x, r);
-        self.e.lin(out, r, b, None, (-1.0, NONE), (1.0, NONE), n);
+        if l == 0 {
+            self.cheb_fine(out, b, x, r, 0.0, (1.0, NONE), false, false);
+        } else {
+            self.apply(out, l, x, r);
+            self.e.lin(out, r, b, None, (-1.0, NONE), (1.0, NONE), n);
+        }
+        // the fine grid's transfer mask is its free axes (its diagonal isn't stored)
+        let (mask, bits) = if l == 0 { (&self.free, 1) } else { (&self.diag[l], 0) };
         let (cb, cx) = (self.lb[l + 1].as_ref().unwrap(), self.lx[l + 1].as_ref().unwrap());
         self.e.step(
             out,
             "restrict",
             Params {
                 n: dims4(self.dims[l]),
+                m: [0, bits, 0, 0],
                 ..Default::default()
             },
-            &[r, &self.diag[l], cb],
+            &[r, mask, cb],
             threads(nodes(self.dims[l + 1])),
         );
         self.vcycle(out, l + 1, cb, cx);
@@ -578,9 +675,10 @@ impl<'a> GpuMg<'a> {
             "prolong",
             Params {
                 n: dims4(self.dims[l]),
+                m: [0, bits, 0, 0],
                 ..Default::default()
             },
-            &[cx, &self.diag[l], x],
+            &[cx, mask, x],
             threads(nodes(self.dims[l])),
         );
         self.smooth(out, l, b, x, false);
@@ -811,7 +909,10 @@ mod tests {
         let n0 = g.len(0);
         let u = masked(pseudo(n0, 1));
 
-        // fine mat-vec and diagonal
+        // fine diagonal (left in CG's p by the λmax estimate), then the mat-vec
+        let inv = fem.inv_diag();
+        let d: Vec<f64> = inv.iter().map(|&v| if v > 0.0 { 1.0 / v } else { 0.0 }).collect();
+        close(&g.e.read_f32(&g.diag[0], n0).unwrap(), &d, "fine diagonal");
         write(&g.p, &u);
         let mut prog = vec![];
         g.apply(&mut prog, 0, &g.p, &g.q);
@@ -819,9 +920,25 @@ mod tests {
         let mut want = vec![0.0; n0];
         fem.matvec(&u, &mut want);
         close(&g.e.read_f32(&g.q, n0).unwrap(), &want, "fine K u");
-        let inv = fem.inv_diag();
-        let d: Vec<f64> = inv.iter().map(|&v| if v > 0.0 { 1.0 / v } else { 0.0 }).collect();
-        close(&g.e.read_f32(&g.diag[0], n0).unwrap(), &d, "fine diagonal");
+
+        // the fused smoother step: d = 0.5 d + 2 D⁻¹ (b − K u), and the plain residual
+        let b = masked(pseudo(n0, 5));
+        let d0 = masked(pseudo(n0, 6));
+        write(&g.r, &b);
+        write(&g.z, &u);
+        write(&g.q, &d0);
+        let mut prog = vec![];
+        g.cheb_fine(&mut prog, &g.r, &g.z, &g.q, 0.5, (2.0, NONE), false, true);
+        g.e.run(&[&prog]).unwrap();
+        let mut ku = vec![0.0; n0];
+        fem.matvec(&u, &mut ku);
+        let want: Vec<f64> = (0..n0).map(|i| 0.5 * d0[i] + 2.0 * (b[i] - ku[i]) * inv[i]).collect();
+        close(&g.e.read_f32(&g.q, n0).unwrap(), &want, "fused smoother step");
+        let mut prog = vec![];
+        g.cheb_fine(&mut prog, &g.r, &g.z, &g.q, 0.0, (1.0, NONE), false, false);
+        g.e.run(&[&prog]).unwrap();
+        let want: Vec<f64> = (0..n0).map(|i| b[i] - ku[i]).collect();
+        close(&g.e.read_f32(&g.q, n0).unwrap(), &want, "fused residual");
 
         // level 1: Pᵀ K P against the CPU's assembled level
         let c1 = mg::tests_api::level1(&fem);
@@ -860,9 +977,10 @@ mod tests {
             "restrict",
             Params {
                 n: dims4(g.dims[0]),
+                m: [0, 1, 0, 0],
                 ..Default::default()
             },
-            &[&g.lr[0], &g.diag[0], g.lb[1].as_ref().unwrap()],
+            &[&g.lr[0], &g.free, g.lb[1].as_ref().unwrap()],
             threads(nodes(g.dims[1])),
         );
         g.e.run(&[&prog]).unwrap();
@@ -878,9 +996,10 @@ mod tests {
             "prolong",
             Params {
                 n: dims4(g.dims[0]),
+                m: [0, 1, 0, 0],
                 ..Default::default()
             },
-            &[g.lx[1].as_ref().unwrap(), &g.diag[0], &g.z],
+            &[g.lx[1].as_ref().unwrap(), &g.free, &g.z],
             threads(nodes(g.dims[0])),
         );
         g.e.run(&[&prog]).unwrap();
@@ -1024,7 +1143,7 @@ mod tests {
             g.smooth(
                 &mut prog,
                 l,
-                g.lb[l.max(1)].as_ref().unwrap_or(&g.r),
+                if l == 0 { &g.r } else { g.lb[l].as_ref().unwrap() },
                 if l == 0 { &g.z } else { g.lx[l].as_ref().unwrap() },
                 false,
             );

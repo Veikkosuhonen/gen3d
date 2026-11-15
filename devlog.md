@@ -3,6 +3,50 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-15: Fine smoother without a stored diagonal or direction (−25 B per element)
+
+**Why:** GPU memory per element limits the grid size. Measured per buffer at 2.8M elements
+(`bracket_domain` at 0.3 mm, one load case, overhang on): 188 B, of which level 0's diagonal and its
+Chebyshev direction were 12.3 B each. Neither needs to be stored.
+
+**What:**
+- `cheb_fine` (mg.wgsl): one smoother step d = α d + γ D⁻¹ (b − K x) on the fine grid. It works the
+  diagonal out from `ee` inside the loop that forms K x, and recomputes the residual from x instead
+  of updating a stored one (the same one mat-vec per step). The direction lives in CG's q, free
+  during the V-cycle. `smooth_fine` is the Chebyshev/Jacobi iteration on it; the V-cycle's level-0
+  residual uses it too (one pass instead of apply + lin).
+- Level 1's mat-vec Pᵀ D K D P used two fine scratch vectors (P u and K P u); the direction was one
+  of them. `apply_p` prolongs on the fly: one workgroup per 8×4×4 tile loads the 6×4×4 coarse nodes
+  under it, interpolates the tile and its halo into workgroup memory, then applies K. A first
+  version that interpolated 27 neighbours per thread in a private array was 7× slower (222 ms vs
+  34 ms at 9.6M elements); without the coarse staging, 45 ms.
+- `restrict`/`prolong` on the fine grid take their mask from the free axes (`P.m.y`), not
+  `diag > 0`: with E_min > 0 these agree.
+- The λmax estimate still needs the fine diagonal: `diag_fine` writes it into CG's p, and its power
+  iteration uses q and z, all free between solves.
+
+**Result** (`bench-topopt --voxels 0.8,0.5,0.3 --iters 5`, before → after):
+
+| voxel | grid | B/element | iteration | CG/solve | compliance |
+|---|---|---|---|---|---|
+| 0.8 | 100×30×50 | 207 → 181 | 0.112 → 0.110 s | 10.4 = | 2.7036e1 = |
+| 0.5 | 160×48×80 | 178 → 153 | 0.344 → 0.327 s | 8.8 = | 2.6574e1 = |
+| 0.3 | 267×80×134 | 168 → 143 | 1.791 → 1.646 s | 12.0 = | 2.6103e1 = |
+
+Kernels at 9.6M elements (`profile_kernels`): level-1 apply 33.5 → 31.3 ms, level-0 smoothing 56.1
+→ 55.4 ms, V-cycle 276 → 266 ms, CG iteration 312 → 300 ms.
+
+**Verified:** `kernels_match_cpu` checks the fused step and residual against the CPU, and the
+transfers with the free-axis mask. All tests pass. `gpu_loop_matches_cpu_loop`'s max-displacement
+check is widened from 2e-3 to 3e-3. Its overhang run with −X up and β 8 was already 1.66e-3 from the
+CPU, and is now 2.09e-3. The other runs moved by similar amounts in both directions (3 closer, 4
+further), and every per-iteration compliance stays within 1.3e-3. `wide_stand_leg` (grip, mirrored
+in X and Y) and `table` (slide): compliance within 0.15% and 0.01% of before.
+
+**Still open:** the editor shapes run at 400–670 B per element: five load cases (three solved) and
+mirror symmetry (up to four hierarchies) multiply per-case and per-hierarchy buffers. That, not the
+fine smoother, is where their memory goes.
+
 ## 2026-11-15: Smoother than the design: `--grow` and `--min-body`
 
 **Why:** faired meshes of optimized parts still had steps that slicers turn into ragged perimeters:

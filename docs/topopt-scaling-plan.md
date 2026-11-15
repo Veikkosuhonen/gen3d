@@ -22,7 +22,8 @@ Measured on `bracket_domain` at 1.3 mm (62×19×31, 34k domain elements): **~100
   elements, against ~1000–1300 for Jacobi, and gives the same designs.
 - Step 4 is done: the whole iteration runs on the GPU (`--solver gpu`, the default). Per iteration:
   0.14 s at 1.2M elements, 1.0 s at 9.5M, 2.7 s at 22M, 5.6 s at 44M.
-- Memory is 164 B per element, against the ~100 B budget, so a 10 GB card holds ~45M elements.
+- Memory was 164 B per element, against the ~100 B budget (a 10 GB card: ~45M elements); 143 B since
+  2026-11-15: ~52M elements (163 B and ~45M with overhang control, whose filter adds 20 B).
 - From the Output section: live writes go through a background thread; on grids over 4M elements they
   are decimated density-only previews; the full fields are written at the end and on Stop.
 - Still open:
@@ -30,7 +31,9 @@ Measured on `bracket_domain` at 1.3 mm (62×19×31, 34k domain elements): **~100
     combinations of others are no longer solved, since 2026-11-14), decimated output for the mesher.
     Mirror symmetry is used since 2026-11-14 (one side solved; a hierarchy per load pattern).
     Coarse-to-fine continuation is done (the β = 1 stage on a 2× coarser grid);
-  - getting memory down to ~100 B per element (f16 vectors, or fewer CG vectors);
+  - getting memory down to ~100 B per element (f16 vectors, or fewer CG vectors). 168 → 143 B
+    (2026-11-15: the fine smoother keeps no diagonal or direction); 188 → 163 B with overhang
+    control, whose filter adds 20 B;
   - memory and time that scale with the domain, not its bounding box: `sparse-grid-plan.md`;
   - fewer, fused passes in the smoother.
   - a smaller OC move limit at high β (now 0.2 throughout). At β = 32 compliance oscillates by about
