@@ -3,6 +3,42 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-15: Slide-ground pins inside the footprint
+
+**Why:** `wide_stand_leg` with `--ground slide` was a mechanism. Its max displacement was 36 m at the
+first iteration and 5 km at the end, one iteration needed 20k CG iterations (64 s), and the run took
+535 s; with `--ground grip` it was fine. On a slide ground, the bottom is held only vertically, and
+`stabilize` adds the fewest X/Y pins against sliding and spinning. Those pins carry a rocked load
+case's whole sideways force. They went on the supported node nearest the supports' centre, then the
+farthest from it, then the farthest from that line. On a stand with an empty middle that is the
+inner corner of a leg, at (±21.6, ±21.6): a node in a single sliver element at the slot's edge. The
+overhang filter (printed upside down, so the leg bottoms are its last layers) leaves that element
+at density 0.004 at the first iteration, so the X-rocked cases reached 7.2e6 mm.
+
+**What:** `stabilize` picks its pins among the supported nodes in the most domain elements
+(`node_elements`: 4 inside a ground footprint, 1 on its corners), with the same geometric rules
+among them. If those nodes can't block every motion (all on one line), it falls back to all
+supported nodes.
+
+**Result** (`--ground slide`, default settings; `wide_stand_leg` was run with grip before):
+
+| shape | before | after |
+|---|---|---|
+| `wide_stand_leg` | 535 s, compliance 3.5e8, max displacement 5.4e6 mm | 14.5 s, 2.444 (grip: 2.033) |
+| `table` | 6.209 | 5.949 (−4.2%) |
+| `stand_leg` | 6.911 | 5.767 (−16.5%) |
+| `book_stand1` | 3.199 | 3.196 |
+| `monitor_table` (2D, pins unchanged) | 1.722 | 1.722 |
+
+The table's and stand leg's pins also moved off footprint edges, and their designs got stiffer.
+
+**Verified:** `pins_go_inside_the_footprint` (a ring on rollers: every pin is in 4 elements, rigid
+rank 6); it fails with the old choice (a pin on the hole's edge). All tests pass.
+
+**Still open:** a slide ground still puts a rocked case's whole sideways force through a few pins,
+so the optimizer has to grow material to them. Friction (a sideways hold on every ground node, up to
+μ times its share of the weight) would be the physical model, but it isn't linear.
+
 ## 2026-11-15: Fine smoother without a stored diagonal or direction (−25 B per element)
 
 **Why:** GPU memory per element limits the grid size. Measured per buffer at 2.8M elements

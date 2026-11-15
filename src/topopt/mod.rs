@@ -396,18 +396,55 @@ fn rigid_rank(p: &Problem) -> usize {
     rigid_basis(p, c, scale).0.len()
 }
 
+/// How many domain elements node `i` belongs to (0 to 8).
+fn node_elements(p: &Problem, i: usize) -> usize {
+    let [nx, ny, _] = p.nodes();
+    let ijk = [i % nx, (i / nx) % ny, i / (nx * ny)];
+    let mut count = 0;
+    for b in 0..8 {
+        let e: [Option<usize>; 3] = std::array::from_fn(|c| (ijk[c] + (b >> c & 1)).checked_sub(1));
+        if let [Some(ei), Some(ej), Some(ek)] = e
+            && ei < p.n[0]
+            && ej < p.n[1]
+            && ek < p.n[2]
+            && p.domain[(ek * p.n[1] + ej) * p.n[0] + ei]
+        {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// The fewest extra pins (node, axes) that stop the part sliding or spinning on its supports (e.g.
 /// on rollers): the supported node nearest their centre, then the one farthest from it, then the
 /// one farthest from the line through both, each held only along the axes still needed.
+///
+/// Pins are chosen among the supported nodes in the most domain elements (inside a footprint, not
+/// on its edge). On a slide ground they carry a rocked load case's whole sideways force: a node at
+/// the corner of a footprint belongs to a single sliver element, which the optimizer or the
+/// overhang filter can leave near void, and the part then slides (a stand with an empty middle had
+/// its pins on its legs' inner corners: 7e6 mm displacements).
 fn stabilize(p: &Problem) -> Vec<(usize, u8)> {
     let (c, scale) = support_frame(p);
-    let mut basis = rigid_basis(p, c, scale);
+    let basis = rigid_basis(p, c, scale);
     if basis.0.len() == 6 {
         return vec![];
     }
     let held: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i] != 0).collect();
+    let best = held.iter().map(|&i| node_elements(p, i)).max().unwrap_or(0);
+    let inner: Vec<usize> = held.iter().copied().filter(|&i| node_elements(p, i) == best).collect();
+    // the best-connected nodes can lie on a line (a footprint two elements wide): then all of them
+    let (pins, full) = pick_pins(p, &inner, c, scale, RigidBasis(basis.0.clone()));
+    if full || inner.len() == held.len() {
+        return pins;
+    }
+    pick_pins(p, &held, c, scale, basis).0
+}
+
+/// `stabilize`'s pins among the nodes `held`, added to `basis`; whether they block every motion.
+fn pick_pins(p: &Problem, held: &[usize], c: [f64; 3], scale: f64, mut basis: RigidBasis) -> (Vec<(usize, u8)>, bool) {
     if held.is_empty() {
-        return vec![];
+        return (vec![], false);
     }
     let pos = |i: usize| p.node_pos(i);
     let dist2 = |a: [f64; 3], b: [f64; 3]| (0..3).map(|k| (a[k] - b[k]).powi(2)).sum::<f64>();
@@ -450,7 +487,7 @@ fn stabilize(p: &Problem) -> Vec<(usize, u8)> {
             break;
         }
     }
-    out
+    (out, basis.0.len() == 6)
 }
 
 /// Whether DOF `i` (3 per node) is free in a per-node axis mask.
@@ -2499,6 +2536,45 @@ pub(super) mod tests {
         assert_eq!(pinned, 3, "X/Y pins");
         assert_eq!(rigid_rank(&p), 6);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A ring standing on rollers (a footprint with an empty middle, like a stand's legs): the pins
+    /// against sliding go on nodes inside the footprint, not on the corners of the hole, where a
+    /// node belongs to a single element (which can go void and leave the part free to slide).
+    #[test]
+    fn pins_go_inside_the_footprint() {
+        let n = [8, 8, 2];
+        let ne: usize = n.iter().product();
+        let nn: usize = n.iter().map(|v| v + 1).product();
+        let mut p = Problem {
+            n,
+            h: 1.0,
+            origin: [0.0; 3],
+            domain: (0..ne)
+                .map(|e| {
+                    let (i, j) = (e % n[0], (e / n[0]) % n[1]);
+                    !((2..6).contains(&i) && (2..6).contains(&j))
+                })
+                .collect(),
+            passive: vec![false; ne],
+            fixed: vec![0; nn],
+            loads: vec![vec![[0.0; 3]; nn]],
+            cases: vec![1],
+            extrude: None,
+        };
+        let active = p.active_nodes();
+        for i in ground_nodes(&p, &active) {
+            p.fixed[i] = 4;
+        }
+        let pins = stabilize(&p);
+        assert!(!pins.is_empty());
+        for &(i, _) in &pins {
+            assert_eq!(node_elements(&p, i), 4, "pin at {:?}", p.node_pos(i));
+        }
+        for (i, axes) in pins {
+            p.fixed[i] |= axes;
+        }
+        assert_eq!(rigid_rank(&p), 6);
     }
 
     /// A block standing on rollers (bottom held in Z only, plus the least X/Y pins against sliding
