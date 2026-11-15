@@ -2,7 +2,9 @@
 // Uses the prelude of mg.wgsl. Element flags: bit 0 domain, bit 1 kept solid (passive), bit 2 design
 // (domain and not passive). Elements are in the fine grid's brick layout (P.m.x of them stored);
 // kernels that look at neighbours get its page table and slot coordinates. Elements of absent bricks
-// read as outside the domain.
+// are either outside the domain or dropped (fixed at x = 0, see gpu_opt.rs): both read as 0. The
+// filter's weight sums (`wsum`, Σ rmin - distance over domain elements within rmin) are worked out
+// on the host, so they count dropped elements.
 
 //// lib elem_grid
 #include lookup NAME=fat PAGE=page
@@ -12,14 +14,6 @@ fn elem_point(e: u32) -> vec3<i32> {
     return vec3<i32>(coords[e / BV].xyz * bshape() + unflat(e % BV, bshape()));
 }
 
-// the domain flag of the element at p (with the mirror planes P.m.z reflecting it), or false
-// outside the grid
-fn in_domain(p: vec3<i32>) -> bool {
-    if any(p >= vec3<i32>(P.n.xyz)) { return false; }
-    let g = fat(p, nbricks(P.n.xyz));
-    return g != NONE && (flags[g] & 1u) != 0u;
-}
-
 // the mirror image of p in the planes P.m.z (bits x, y, z) at the grid's low faces
 fn mirror(p: vec3<i32>) -> vec3<i32> {
     var q = p;
@@ -27,25 +21,6 @@ fn mirror(p: vec3<i32>) -> vec3<i32> {
         if q[a] < 0 && ((P.m.z >> a) & 1u) != 0u { q[a] = -q[a] - 1; }
     }
     return q;
-}
-
-// the filter's weight sum at stored element e (Σ rmin - distance over domain elements within rmin
-// = P.g.z)
-fn weight_sum(e: u32) -> f32 {
-    let p = elem_point(e);
-    let rmin = P.g.z;
-    let r = i32(ceil(rmin));
-    var s = 0.0;
-    for (var dk = -r; dk <= r; dk++) {
-        for (var dj = -r; dj <= r; dj++) {
-            for (var di = -r; di <= r; di++) {
-                let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
-                if w <= 0.0 { continue; }
-                if in_domain(mirror(p + vec3<i32>(di, dj, dk))) { s += w; }
-            }
-        }
-    }
-    return s;
 }
 
 //// kernel stiffness
@@ -68,12 +43,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     ee[e] = v;
 }
 
-//// kernel sens bricks
+//// kernel sens
 // Compliance and volume sensitivities of the design elements through the projection, divided by
 // the filter weight sums (ready for the filter's transpose); 0 elsewhere. With the AM filter
 // (P.m.w = 1) not divided: `am_adj` continues the chain rule and divides. `xtilde` is the
 // projection's input (x̂ with the AM filter).
-// P.f = (E_min, E0, p, h), P.g.y = η, P.g.z = rmin, β = S[P.m.y], mirror planes P.m.z
+// P.f = (E_min, E0, p, h), P.g.y = η, β = S[P.m.y]
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
 @group(0) @binding(2) var<storage, read> xphys: array<f32>;
 @group(0) @binding(3) var<storage, read> xtilde: array<f32>;
@@ -81,10 +56,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(5) var<storage, read> S: array<f32>;
 @group(0) @binding(6) var<storage, read_write> dcs: array<f32>;
 @group(0) @binding(7) var<storage, read_write> dvs: array<f32>;
-@group(0) @binding(8) var<storage, read> page: array<u32>;
-@group(0) @binding(9) var<storage, read> coords: array<vec4<u32>>;
-
-#include elem_grid
+@group(0) @binding(8) var<storage, read> wsum: array<f32>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -104,7 +76,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         let x = xphys[e];
         let xp = select(0.0, pow(x, P.f.z - 1.0), x > 0.0);
         var hs = 1.0;
-        if P.m.w == 0u { hs = weight_sum(e); }
+        if P.m.w == 0u { hs = wsum[e]; }
         dc = -P.f.z * xp * (P.f.y - P.f.x) * P.f.w * ce[e] * dproj / hs;
         dv = dproj / hs;
     }
@@ -116,12 +88,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 // Cone filter over domain elements within P.f.x voxels (weights rmin - distance). P.m.y: 0 the raw
 // weighted sum on domain elements; 1 densities: kept-solid 1, domain the weighted mean, else 0.
 // P.m.z: axes (bits x, y, z) whose low face is a mirror plane: neighbours past it are the mirror
-// images (index -i - 1). The same in `sens`'s weight sums.
+// images (index -i - 1). Densities divide by the weight sums `wsum`.
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
 @group(0) @binding(2) var<storage, read> inp: array<f32>;
 @group(0) @binding(3) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(4) var<storage, read> page: array<u32>;
 @group(0) @binding(5) var<storage, read> coords: array<vec4<u32>>;
+@group(0) @binding(6) var<storage, read> wsum: array<f32>;
 
 #include elem_grid
 
@@ -145,7 +118,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let rmin = P.f.x;
     let r = i32(ceil(rmin));
     var s = 0.0;
-    var ws = 0.0;
     for (var dk = -r; dk <= r; dk++) {
         for (var dj = -r; dj <= r; dj++) {
             for (var di = -r; di <= r; di++) {
@@ -155,14 +127,11 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                 if any(q >= n) { continue; }
                 let m = fat(q, nb);
                 if m == NONE { continue; }
-                if (flags[m] & 1u) != 0u {
-                    s += w * inp[m];
-                    ws += w;
-                }
+                if (flags[m] & 1u) != 0u { s += w * inp[m]; }
             }
         }
     }
-    if P.m.y == 1u { s /= ws; }
+    if P.m.y == 1u { s /= wsum[e]; }
     outp[e] = s;
 }
 
@@ -348,9 +317,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(7) var<storage, read_write> cc: array<f32>;
 @group(0) @binding(8) var<storage, read_write> cv: array<f32>;
 @group(0) @binding(9) var<storage, read> page: array<u32>;
-@group(0) @binding(10) var<storage, read> coords: array<vec4<u32>>;
+@group(0) @binding(10) var<storage, read> wsum: array<f32>;
 
-#include elem_grid
+#include lookup NAME=fat PAGE=page
 
 // The build axis b = P.n.w & 3, built towards -b when P.n.w & 4. Layers l in build order, each
 // element in a layer at lateral (u, v) along the two other axes (in order).
@@ -478,7 +447,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             ocv = lv * g;
         }
     }
-    let hs = weight_sum(e);
+    let hs = wsum[e];
     dc[e] = lc * da / hs;
     dv[e] = lv * da / hs;
     cc[e] = occ;

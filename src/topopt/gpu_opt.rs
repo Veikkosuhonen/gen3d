@@ -4,7 +4,9 @@
 //! displacement), plus the fields when the .vti is written. Mirrors `optimize` in mod.rs.
 //!
 //! Element arrays and vectors are block-sparse (bricks.rs): only the bricks around the domain are
-//! stored, and readback is scattered to the dense grid.
+//! stored, and readback is scattered to the dense grid. A stage that continues a design (the fine
+//! stage after a coarse start, a resumed run) stores only the bricks near it (`live_elements`): the
+//! rest of the domain stays at x = 0.
 
 use std::path::Path;
 use std::time::Instant;
@@ -51,8 +53,106 @@ struct Fields {
     dvs: wgpu::Buffer,
     dc: wgpu::Buffer,
     dv: wgpu::Buffer,
+    /// the density filter's weight sums (over the whole domain, dropped elements included)
+    wsum: wgpu::Buffer,
     /// the AM filter's (overhang control)
     am: Option<AmFields>,
+}
+
+/// Densities at or below this are void (for `live_elements`).
+const LIVE_X: f64 = 1e-3;
+
+/// The domain elements a stage continuing design `x` keeps live (dense, over `m`'s grid): kept
+/// solid, touching a support or a load, or within max(2, ⌈rmin⌉) voxels of a density above
+/// `LIVE_X`. The others are fixed at x = 0. Measured on the shapes in `shapes/`, a design never
+/// grows past 2 voxels from where the fine stage started (`docs/sparse-grid-plan.md`).
+pub(super) fn live_elements(m: &Model, x: &[f64], rmin: f64) -> Vec<bool> {
+    let p = m.p();
+    let n = p.n;
+    let nn = n.map(|v| v + 1);
+    let ne = p.domain.len();
+    let mirror = m.mirror_axes();
+    // nodes held or loaded (in any group or case); mirror planes' rollers aren't supports, nor is a
+    // 2D slab's hold across its thin axis (on every node of its second layer, `plane2d.rs`)
+    let thin = (0..3).filter(|&a| n[a] == 1).fold(0u8, |b, a| b | 1 << a);
+    let held: Vec<bool> = (0..nn.iter().product::<usize>())
+        .map(|i| {
+            let q = [i % nn[0], i / nn[0] % nn[1], i / (nn[0] * nn[1])];
+            let on_plane = (0..3).any(|a| mirror[a] && q[a] == 0);
+            m.groups
+                .iter()
+                .any(|g| (g.fixed[i] & !thin != 0 && !on_plane) || g.loads.iter().any(|l| l[i] != [0.0; 3]))
+        })
+        .collect();
+    let mut live: Vec<bool> = (0..ne)
+        .map(|e| {
+            if !p.domain[e] {
+                return false;
+            }
+            if p.passive[e] || x[e] > LIVE_X {
+                return true;
+            }
+            let q = [e % n[0], e / n[0] % n[1], e / (n[0] * n[1])];
+            (0..8).any(|c| held[((q[2] + (c >> 2 & 1)) * nn[1] + q[1] + (c >> 1 & 1)) * nn[0] + q[0] + (c & 1)])
+        })
+        .collect();
+    // dilate by the margin, one axis at a time (a box, which holds the ball of that radius)
+    let r = (rmin.ceil() as usize).max(2);
+    let stride = [1, n[0], n[0] * n[1]];
+    for a in 0..3 {
+        let src = live.clone();
+        for (e, out) in live.iter_mut().enumerate() {
+            let i = e / stride[a] % n[a];
+            let (lo, hi) = (i.saturating_sub(r), (i + r).min(n[a] - 1));
+            *out = (lo..=hi).any(|j| src[e - i * stride[a] + j * stride[a]]);
+        }
+    }
+    for (l, &d) in live.iter_mut().zip(&p.domain) {
+        *l &= d;
+    }
+    live
+}
+
+/// The density filter's weight sums (Σ rmin - distance over the domain elements within rmin,
+/// mirrored in the planes `mirror`) of the stored elements of `b`.
+fn weight_sums(p: &super::Problem, b: &Bricks, rmin: f64, mirror: [bool; 3]) -> Vec<f32> {
+    use rayon::prelude::*;
+    let n = p.n;
+    let r = rmin.ceil() as i64;
+    let mut out = vec![0.0f32; b.len()];
+    out.par_chunks_mut(bricks::B3).enumerate().for_each(|(s, chunk)| {
+        for (l, w) in chunk.iter_mut().enumerate() {
+            let q = b.point(s, l);
+            if (0..3).any(|a| q[a] >= n[a]) || !p.domain[(q[2] * n[1] + q[1]) * n[0] + q[0]] {
+                continue;
+            }
+            let mut sum = 0.0;
+            for dk in -r..=r {
+                for dj in -r..=r {
+                    for di in -r..=r {
+                        let wt = rmin - ((di * di + dj * dj + dk * dk) as f64).sqrt();
+                        if wt <= 0.0 {
+                            continue;
+                        }
+                        let mut c = [q[0] as i64 + di, q[1] as i64 + dj, q[2] as i64 + dk];
+                        for a in 0..3 {
+                            if c[a] < 0 && mirror[a] {
+                                c[a] = -c[a] - 1;
+                            }
+                        }
+                        if (0..3).any(|a| c[a] < 0 || c[a] >= n[a] as i64) {
+                            continue;
+                        }
+                        if p.domain[((c[2] as usize * n[1]) + c[1] as usize) * n[0] + c[0] as usize] {
+                            sum += wt;
+                        }
+                    }
+                }
+            }
+            *w = sum as f32;
+        }
+    });
+    out
 }
 
 /// The AM filter's arrays (see `am_fwd`, `am_adj` in opt.wgsl).
@@ -90,8 +190,24 @@ pub(super) fn optimize_gpu(
     assert!(m.groups.len() <= super::gpu_mg::MAX_GROUPS);
     let e = Engine::new(gpu)?;
     let elements = ne as f64 / 1e6;
-    // the bricks holding the domain's elements and nodes; `nes` elements (and nodes) stored
-    let bricks = Bricks::from_elements(p.n, bricks::shape_for(p.n), &p.domain);
+    // the bricks holding the domain's elements and nodes, or the live ones' when continuing a
+    // design; `nes` elements (and nodes) stored
+    let live = match &stage.start {
+        Some((x, _)) if stage.live => Some(live_elements(m, x, s.rmin)),
+        _ => None,
+    };
+    let bricks = Bricks::from_elements(p.n, bricks::shape_for(p.n), live.as_deref().unwrap_or(&p.domain));
+    if let Some(live) = &live {
+        let all = Bricks::from_elements(p.n, bricks.shape, &p.domain);
+        let nlive = live.iter().filter(|&&l| l).count();
+        let ndom = p.domain.iter().filter(|&&d| d).count();
+        println!(
+            "continuing the design on {} of {} bricks ({:.0}% of the domain live, the rest fixed void)",
+            bricks.slots(),
+            all.slots(),
+            100.0 * nlive as f64 / ndom as f64
+        );
+    }
     let nes = bricks.len();
     let v = bricks.variant();
     let bk = |kernel: &str| format!("{kernel}{v}");
@@ -153,6 +269,7 @@ pub(super) fn optimize_gpu(
         })
         .collect();
     let x0 = bricks.gather(&x0, p.n, 1, 0.0);
+    let wsum = weight_sums(p, &bricks, s.rmin, m.mirror_axes());
     let ne = nes;
     let (page, coords) = mg.fine_tables();
     let f = gpu
@@ -166,6 +283,7 @@ pub(super) fn optimize_gpu(
             dvs: e.buf("dvs", ne),
             dc: e.buf("dc", ne),
             dv: e.buf("dv", ne),
+            wsum: e.init("filter weight sums", bytemuck::cast_slice(&wsum)),
             am: s.overhang.then(|| AmFields {
                 xhat: e.buf("xhat", ne),
                 mr: e.buf("am m, r", 2 * ne),
@@ -210,7 +328,7 @@ pub(super) fn optimize_gpu(
             &bk("filter"),
             rmin,
             [0, mode, mirror, 0],
-            &[&f.flags, inp, outp, page, coords],
+            &[&f.flags, inp, outp, page, coords, &f.wsum],
         )
     };
     // the AM filter, one layer per step: forward from the plate up, the chain rule from the top down.
@@ -286,12 +404,10 @@ pub(super) fn optimize_gpu(
     e.dot(&mut prog_sens, &mg.ee, &mg.ce, None, ne, COMPL);
     elem(
         &mut prog_sens,
-        &bk("sens"),
+        "sens",
         material,
         [0, BETA, mirror, f.am.is_some() as u32],
-        &[
-            &f.flags, &f.xphys, xhat, &mg.ce, &e.scalars, &f.xnew, &f.dvs, page, coords,
-        ],
+        &[&f.flags, &f.xphys, xhat, &mg.ce, &e.scalars, &f.xnew, &f.dvs, &f.wsum],
     );
     if let Some(a) = &f.am {
         for l in (0..layers).rev() {
@@ -300,7 +416,7 @@ pub(super) fn optimize_gpu(
                 &bk("am_adj"),
                 am_params(l),
                 &[
-                    &f.flags, &f.xtilde, &a.xhat, &a.mr, &f.xnew, &f.dvs, &a.cc, &a.cv, page, coords,
+                    &f.flags, &f.xtilde, &a.xhat, &a.mr, &f.xnew, &f.dvs, &a.cc, &a.cv, page, &f.wsum,
                 ],
                 threads(layer),
             );
@@ -638,6 +754,117 @@ mod tests {
             .map(|m| std::array::from_fn(|c| p.loads[0][m][c] - 0.5 * p.loads[1][m][c]))
             .collect();
         p
+    }
+
+    /// A stage continuing a formed design on its live bricks (the rest fixed void) follows the same
+    /// run as on the whole domain.
+    #[test]
+    fn live_bricks_match_the_whole_domain() {
+        use super::super::{Stage, optimize_stage};
+        use crate::topopt::symmetry::Model;
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        if gpu.is_software() {
+            eprintln!("software GPU; skipped");
+            return;
+        }
+        // a long cantilever, clamped at x = 0, loaded down at the far bottom edge
+        let n = [96, 8, 48];
+        let ne: usize = n.iter().product();
+        let nn: usize = n.iter().map(|v| v + 1).product();
+        let mut p = Problem {
+            n,
+            h: 1.0,
+            origin: [0.0; 3],
+            domain: vec![true; ne],
+            passive: vec![false; ne],
+            fixed: vec![0; nn],
+            loads: vec![vec![[0.0; 3]; nn]],
+            cases: vec![1],
+            extrude: None,
+        };
+        for k in 0..=n[2] {
+            for j in 0..=n[1] {
+                let m = p.node(0, j, k);
+                p.fixed[m] = 7;
+            }
+        }
+        for j in 0..=n[1] {
+            let m = p.node(n[0], j, 0);
+            p.loads[0][m] = [0.0, 0.0, -1.0];
+        }
+        let m = Model::single(p);
+        let dir = std::env::temp_dir().join(format!("gen3d-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Settings {
+            voxel: 1.0,
+            volfrac: 0.15,
+            penal: 3.0,
+            rmin: 1.5,
+            iters: 40,
+            tol: 0.0,
+            e0: 3500.0,
+            nu: 0.35,
+            force: 0.0,
+            beta_max: 1.0,
+            solver: Solver::Gpu(MgSettings::default()),
+            emin: 1e-9,
+            cg_tol: 1e-6,
+            adaptive_tol: false,
+            ground: Ground::None,
+            coarse_start: false,
+            symmetry: false,
+            overhang: false,
+            up: crate::mesh::Up::PlusZ,
+            plane2d: None,
+        };
+        let quiet = Stage {
+            quiet: true,
+            ..Default::default()
+        };
+        let formed = optimize_stage(&m, &s, &dir.join("a.vti"), Some(&gpu), &quiet).unwrap();
+        let live = live_elements(&m, &formed.design, s.rmin);
+        let nlive = live.iter().filter(|&&l| l).count();
+        let b = Bricks::from_elements(n, bricks::shape_for(n), &live);
+        let all = Bricks::from_elements(n, bricks::shape_for(n), &m.p().domain);
+        eprintln!("{nlive} of {ne} elements live, {} of {} bricks", b.slots(), all.slots());
+        assert!(
+            b.slots() < all.slots() * 3 / 4,
+            "{} of {} bricks",
+            b.slots(),
+            all.slots()
+        );
+        let s2 = Settings {
+            iters: 15,
+            beta_max: 8.0,
+            ..s
+        };
+        let run = |live: bool, f: &str| {
+            let st = Stage {
+                start: Some((formed.design.clone(), 2.0)),
+                quiet: true,
+                live,
+                ..Default::default()
+            };
+            optimize_stage(&m, &s2, &dir.join(f), Some(&gpu), &st).unwrap()
+        };
+        let (whole, sparse) = (run(false, "whole.vti"), run(true, "live.vti"));
+        assert_eq!(whole.iterations, sparse.iterations);
+        for (it, (a, b)) in whole.stats.iter().zip(&sparse.stats).enumerate() {
+            let rel = (a.compliance - b.compliance).abs() / a.compliance;
+            eprintln!("iteration {}: {} vs {} ({rel:.1e})", it + 1, a.compliance, b.compliance);
+            assert!(rel < 5e-3, "iteration {}: {} vs {}", it + 1, a.compliance, b.compliance);
+        }
+        // the design never reaches the dropped elements
+        for e in 0..ne {
+            if !live[e] {
+                assert!(whole.design[e] < 0.05, "element {e}: {}", whole.design[e]);
+                assert_eq!(sparse.design[e], 0.0);
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// On the GPU too, a quarter of the symmetric beam (four load patterns, so four hierarchies

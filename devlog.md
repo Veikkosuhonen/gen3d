@@ -3,6 +3,54 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-15: The fine stage stores only the bricks near the coarse design
+
+**Why:** plan step 6. At a 0.3 volume fraction most of the domain ends up void, and the layout
+has formed by the end of the coarse-start stage. Box sparsity alone saves memory, not time (the
+dense kernels already skipped the outside of the domain); dropping void bricks saves both.
+
+**What:**
+- `Stage::live`: the fine stage after a coarse start (and a resumed fine stage) stores only the
+  bricks of its live elements (`gpu_opt::live_elements`): kept solid, touching a support or load,
+  or within max(2, ⌈rmin⌉) voxels of a starting density above 1e-3. The rest of the domain is fixed
+  at x = 0 and isn't stored. Mirror rollers and a 2D slab's hold across its thin axis (on every
+  node) don't count as supports: the slab's made every element live at first.
+- The density filter's weight sums are computed on the host over the whole domain (`wsum`, one
+  f32 per stored element), so dropped elements count as domain elements with x = 0, as the plan
+  requires. `sens` and `am_adj` read them instead of re-summing (2r + 1)³ neighbours every
+  iteration; the filter divides by them.
+- Without a coarse start the run stays on the domain's bricks.
+
+**Result** (default voxel, `--ground slide`; `wide_stand_leg` `--ground grip`; `bracket_domain`
+its default ground, see "Still open"). Fine stage, three builds: the dense code before the brick
+layout | domain bricks (previous commit) | live bricks:
+
+| shape | live bricks / domain bricks | fine-stage memory (MB) | ms per CG iteration | compliance |
+|---|---|---|---|---|
+| `bracket_domain` 0.64 mm | 4075 / 5118 (80%) | 56 \| 65 \| 56 | 21.0 \| 26.1 \| 19.1 | 7.9051 \| 7.8804 \| 7.8866 |
+| `table` | 1082 / 1323 (82%) | 43 \| 50 \| 47 | 9.7 (batch) \| 5.0 \| 4.6 (rerun) | 5.9489 \| 5.9470 \| 5.9431 |
+| `monitor_table` (2D) | 1294 / 2840 (46%) | 42 \| 59 \| 36 | 14.7 \| 19.4 \| 5.7 | 1.7222 \| 1.7216 \| 1.7233 |
+| `book_stand1` | 2031 / 2277 (89%) | 53 \| 39 \| 37 | 7.7 \| 6.7 \| 6.3 | 3.1960 \| 3.1963 \| 3.1959 |
+| `stand_leg` | 910 / 1476 (62%) | 44 \| 57 \| 47 | 4.7 \| 4.9 \| 3.9 | 5.7674 \| 5.7672 \| 5.7670 |
+| `wide_stand_leg` | 862 / 1060 (81%) | 36 \| 40 \| 37 | 3.8 \| 3.9 \| 3.3 | 2.0363 \| 2.0335 \| 2.0362 |
+
+- Live vs domain bricks: compliance within 0.13% on every shape (target 0.5%); a CG iteration
+  1.37× faster on the bracket (the plan expected ~1.35×), 3.4× on the 2D `monitor_table`, 9–19%
+  on the small 3D shapes.
+- Timing on these small grids is noisy run to run: the batch had the table at 7.7 vs 9.4 ms per
+  CG iteration, a rerun 5.0 vs 4.6. The table row shows the rerun.
+
+**Verified:** `live_bricks_match_the_whole_domain`: a 96×8×48 cantilever, formed at β = 1, then
+15 iterations from that design on 723 of 975 bricks vs all of them: compliance within 6e-6 at every
+iteration, and no dropped element above 0.05 in the whole-domain run. All 69 tests pass.
+
+**Still open:**
+- `bracket_domain` with `--ground slide` breaks down in the original dense code too: from β = 32,
+  CG doesn't converge in 20,000 iterations (~210 s per iteration) and compliance reaches 1e12.
+- 2D slabs on domain bricks were 32% slower per CG iteration than dense (`monitor_table`, 2×8×4
+  bricks, unprofiled). Live bricks more than make up for it there.
+- Coarse-level padding (previous entry) and shrinking the set during the stage (plan "Later").
+
 ## 2026-11-15: The GPU optimizer stores only the bricks around the domain
 
 **Why:** step 1–4 of `docs/sparse-grid-plan.md`: GPU memory and work should scale with the part,

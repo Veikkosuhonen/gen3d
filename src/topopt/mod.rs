@@ -1288,6 +1288,9 @@ pub(crate) struct Stage {
     quiet: bool,
     /// the loop's state (resuming a stopped run; otherwise fresh)
     state: LoopState,
+    /// the GPU stores only the bricks near the starting design (`start`), the rest of the domain
+    /// fixed at x = 0 (see `gpu_opt::live_elements`); otherwise those around the whole domain
+    live: bool,
 }
 
 const CG_MAXIT: usize = 20_000;
@@ -1397,6 +1400,9 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
             it0: h.iterations,
             quiet: true,
             state: h.state.clone(),
+            // a fine stage resumes on the bricks near its design (on a design still uniform that
+            // is the whole domain)
+            live: !h.coarse,
         })
     };
     // --iters caps the whole run
@@ -1441,6 +1447,7 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
                 start: Some((x, 2.0)),
                 it0: done,
                 quiet: true,
+                live: true,
                 ..Default::default()
             }
         }

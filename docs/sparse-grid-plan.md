@@ -167,6 +167,12 @@ Mirror planes in `filter`/`sens` keep working: mirror the coordinate, then look 
    0.5% of the full-domain run on `bracket_domain` and the shapes from step 0, with the brick count
    and fine-stage time before/after (expect ~1.35× on the bracket). Without coarse start (`--no-coarse-start`, or
    grids too small for it) the whole run stays domain-sparse.
+   Done (2026-11-15): `Stage::live`, set for the fine stage after a coarse start and for a
+   resumed fine stage; `gpu_opt::live_elements` is the rule above (a 2D slab's hold across its
+   thin axis and mirror rollers don't count as supports). The filter's weight sums are computed on
+   the host over the whole domain (`wsum`), which also drops the kernels' per-iteration weight-sum
+   loops. Compliance within 0.13% of the domain-brick run on all six shapes; live bricks 46–89%
+   of the domain's; CG iteration 1.37× faster on the bracket, 3.4× on `monitor_table` (devlog).
 7. **Host-side sparsity, if host RAM becomes the limit**: a sparse `Problem`, `setup` sampling only
    bricks near the domain (today `MAX_SAMPLED` caps the box at 200M cells), loads as DOF lists.
 
@@ -184,6 +190,12 @@ numbers show the late fine iterations dominate.
   iteration and 5 km at the end, one iteration with 20k CG iterations (64 s), 535 s in all. Mirrored in
   X and Y (1/4 solved), with 8 pinned nodes added. With `--ground grip` it is fine (12.8 s). Not
   related to this plan.
+
+- `bracket_domain` with `--ground slide` breaks down the same way (found 2026-11-15, the original
+  dense code too): from β = 32 (iteration 35 of the run) CG doesn't converge in 20,000
+  iterations (~210 s each) and compliance reaches 1e12. Fine with its default ground.
+- 2D slabs on bricks: `monitor_table`'s CG iteration was 14.7 ms dense, 19.4 ms on domain bricks
+  (2×8×4 bricks, unprofiled); live bricks bring it to 5.7 ms.
 
 ## Risks and open questions
 

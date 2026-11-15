@@ -474,7 +474,9 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
     size first (1/8 of the elements) until it settles. The fine grid then continues from that design
     at β = 2. This is 15–30% faster on most problems, with compliance within about 1% (sometimes
     better). It applies from 80k domain elements; `--no-coarse-start` turns it off. The output file
-    shows the coarse design first.
+    shows the coarse design first. On the GPU the fine stage keeps only the part of the domain
+    within a few voxels of that design (`continuing the design on N of M bricks`); the rest stays
+    void, which saves memory and time (1.4× per iteration on the bracket, 3× on a 2D table).
   - **Symmetry:** with [mirror planes](#primitives-from-the-app-nameprimsjson) the grid is aligned so
     each plane is a node layer. When the domain, kept regions and supports are symmetric about them,
     only one side is solved (1/2, 1/4 or 1/8 of the elements) and the design is symmetric. The loads
