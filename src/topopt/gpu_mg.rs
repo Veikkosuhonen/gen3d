@@ -94,6 +94,19 @@ fn coarse(n: [usize; 3]) -> [usize; 3] {
     n.map(|v| v.div_ceil(2))
 }
 
+/// `apply_p`'s kernel and tile of nodes (one workgroup, at most 128): 8×4×4, or 2×8×8 across a slab
+/// one element thick (a 2D problem), where 8 nodes along the thin axis would leave three quarters of
+/// the threads idle (+50% solve time on `monitor_table`). The tiles must match the kernels' `override`
+/// constants (`gpu_engine::VARIANTS`); the workgroup arrays fit both (halo 400 nodes, coarse block 108).
+fn apply_p_tile(n: [usize; 3]) -> (&'static str, [usize; 3]) {
+    match n.iter().position(|&v| v == 1) {
+        Some(0) => ("apply_p_slab_x", [2, 8, 8]),
+        Some(1) => ("apply_p_slab_y", [8, 2, 8]),
+        Some(_) => ("apply_p_slab_z", [8, 8, 2]),
+        None => ("apply_p", [8, 4, 4]),
+    }
+}
+
 pub(super) struct GpuMg<'a> {
     e: &'a Engine<'a>,
     /// this hierarchy's λmax slots (level l at + l) and their inverses
@@ -373,9 +386,10 @@ impl<'a> GpuMg<'a> {
                 // vector that is free whenever level 1 is worked on: level 0's residual, already
                 // restricted. Cheaper than stored or on-the-fly element matrices.
                 let kpu = &self.lr[0];
+                let (kernel, tile) = apply_p_tile(self.dims[0]);
                 self.e.step(
                     out,
-                    "apply_p",
+                    kernel,
                     Params {
                         n: dims4(self.dims[0]),
                         ..Default::default()
@@ -383,10 +397,9 @@ impl<'a> GpuMg<'a> {
                     &[&self.ee, &self.free, &self.ke, u, kpu],
                     groups(
                         self.dims[0]
-                            .map(|v| v + 1)
                             .iter()
-                            .zip([8, 4, 4])
-                            .map(|(v, t)| v.div_ceil(t))
+                            .zip(tile)
+                            .map(|(v, t)| (v + 1).div_ceil(t))
                             .product(),
                     ),
                 );
@@ -876,7 +889,15 @@ mod tests {
             eprintln!("no GPU; skipped");
             return;
         };
-        let p = problem([7, 5, 9]);
+        // a 3D grid, and slabs one element thick along each axis (2D problems: `apply_p`'s other
+        // tile shape)
+        for n in [[7, 5, 9], [1, 9, 10], [9, 1, 10], [9, 10, 1]] {
+            kernels_match_cpu_on(&gpu, n);
+        }
+    }
+
+    fn kernels_match_cpu_on(gpu: &crate::gpu::Gpu, n: [usize; 3]) {
+        let p = problem(n);
         let ke = super::super::hex_ke(0.3);
         let free = p.free_mask();
         let fem = Fem {
@@ -893,7 +914,7 @@ mod tests {
                 .collect(),
             free: free.clone(),
         };
-        let eng = Engine::new(&gpu).unwrap();
+        let eng = Engine::new(gpu).unwrap();
         let g = GpuMg::new(&eng, &p, &p.load_basis(), &ke, &free, &MgSettings::default(), None).unwrap();
         g.set_stiffness(&fem.ee).unwrap();
         let write = |b: &wgpu::Buffer, v: &[f64]| {

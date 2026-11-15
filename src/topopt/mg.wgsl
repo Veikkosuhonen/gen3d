@@ -241,36 +241,45 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 
 //// kernel apply_p
 // y = D K D P uc on the fine grid P.n, uc on its coarse grid: with `restrict` after it, level 1's
-// mat-vec Pᵀ D K D P without storing P uc (a fine vector). One workgroup per 8×4×4 tile of nodes:
-// it loads the coarse nodes under the tile (6×4×4), interpolates D P uc on the tile and a one-node
-// halo from them (360 nodes, ~3 per thread), all in workgroup memory, then each thread applies K at
-// its node as `apply_fine`. D keeps the free DOFs.
+// mat-vec Pᵀ D K D P without storing P uc (a fine vector). One workgroup per tile of TX×TY×TZ nodes
+// (8×4×4, or 2×8×8 across a slab one element thick: the `apply_p_slab_*` variants, see
+// `gpu_engine::VARIANTS`, which sets TX, TY, TZ, and `apply_p_tile`): it loads the coarse nodes
+// under the tile (T / 2 + 2 per axis), interpolates D P uc on the tile and a one-node halo from them
+// (T + 2 per axis, ~3 nodes per thread), all in workgroup memory, then each thread applies K at its
+// node as `apply_fine`. D keeps the free DOFs.
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
 @group(0) @binding(2) var<storage, read> free: array<u32>;
 @group(0) @binding(3) var<storage, read> ke: array<f32>;
 @group(0) @binding(4) var<storage, read> uc: array<f32>;
 @group(0) @binding(5) var<storage, read_write> y: array<f32>;
 
-// the tile with its halo: 10×6×6 nodes, x fastest; the coarse nodes under it: 6×4×4
-var<workgroup> sp: array<vec3<f32>, 360>;
-var<workgroup> sc: array<vec3<f32>, 96>;
+// the tile with its halo (10×6×6 or 4×10×10 nodes, x fastest) and the coarse nodes under it (6×4×4
+// or 3×6×6)
+const TX: u32 = 8u;
+const TY: u32 = 4u;
+const TZ: u32 = 4u;
+var<workgroup> sp: array<vec3<f32>, 400>;
+var<workgroup> sc: array<vec3<f32>, 108>;
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
     let n = P.n.xyz;
     let nn = n + vec3<u32>(1u);
-    let tiles = (nn + vec3<u32>(7u, 3u, 3u)) / vec3<u32>(8u, 4u, 4u);
+    let ts = vec3<u32>(TX, TY, TZ);
+    let hs = ts + vec3<u32>(2u);
+    let cs = ts / 2u + vec3<u32>(2u);
+    let tiles = (nn + ts - vec3<u32>(1u)) / ts;
     let tile = wg_flat(wg, nwg);
     if tile >= tiles.x * tiles.y * tiles.z { return; }
-    let t0 = vec3<u32>(tile % tiles.x, (tile / tiles.x) % tiles.y, tile / (tiles.x * tiles.y)) * vec3<u32>(8u, 4u, 4u);
+    let t0 = vec3<u32>(tile % tiles.x, (tile / tiles.x) % tiles.y, tile / (tiles.x * tiles.y)) * ts;
     let nc = (n + vec3<u32>(1u)) / 2u;
     let cx = nc.x + 1u;
     let cy = nc.y + 1u;
-    // coarse nodes t0 / 2 - 1 .. + (6, 4, 4): the fine halo t0 - 1 .. t0 + (8, 4, 4) lies over them
+    // coarse nodes t0 / 2 - 1 .. + cs: the fine halo t0 - 1 .. t0 + ts lies over them
     let c0 = vec3<i32>(t0 / 2u) - vec3<i32>(1);
-    if li < 96u {
-        let q = c0 + vec3<i32>(i32(li % 6u), i32((li / 6u) % 4u), i32(li / 24u));
+    if li < cs.x * cs.y * cs.z {
+        let q = c0 + vec3<i32>(i32(li % cs.x), i32((li / cs.x) % cs.y), i32(li / (cs.x * cs.y)));
         var v = vec3<f32>(0.0);
         if all(q >= vec3<i32>(0)) && q.x <= i32(nc.x) && q.y <= i32(nc.y) && q.z <= i32(nc.z) {
             let o = 3u * ((u32(q.z) * cy + u32(q.y)) * cx + u32(q.x));
@@ -279,8 +288,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         sc[li] = v;
     }
     workgroupBarrier();
-    for (var s = li; s < 360u; s += WG) {
-        let q = vec3<i32>(t0) + vec3<i32>(i32(s % 10u), i32((s / 10u) % 6u), i32(s / 60u)) - vec3<i32>(1);
+    let hn = hs.x * hs.y * hs.z;
+    for (var s = li; s < hn; s += WG) {
+        let q = vec3<i32>(t0) + vec3<i32>(i32(s % hs.x), i32((s / hs.x) % hs.y), i32(s / (hs.x * hs.y))) - vec3<i32>(1);
         var v = vec3<f32>(0.0);
         if all(q >= vec3<i32>(0)) && all(vec3<u32>(q) < nn) {
             let qu = vec3<u32>(q);
@@ -295,8 +305,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                 let wz = vec2<f32>(w.z, select(0.0, w.z, odd.z));
                 let wy = vec2<f32>(w.y, select(0.0, w.y, odd.y));
                 let wx = vec2<f32>(w.x, select(0.0, w.x, odd.x));
-                let zs = vec2<i32>(lo.z, hi.z) * 24;
-                let ys = vec2<i32>(lo.y, hi.y) * 6;
+                let zs = vec2<i32>(lo.z, hi.z) * i32(cs.x * cs.y);
+                let ys = vec2<i32>(lo.y, hi.y) * i32(cs.x);
                 let xs = vec2<i32>(lo.x, hi.x);
                 for (var cz = 0u; cz < 2u; cz++) {
                     for (var cy2 = 0u; cy2 < 2u; cy2++) {
@@ -311,15 +321,18 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         sp[s] = v;
     }
     workgroupBarrier();
-    let l = vec3<u32>(li % 8u, (li / 8u) % 4u, li / 32u);
+    if li >= ts.x * ts.y * ts.z { return; }
+    let l = vec3<u32>(li % ts.x, (li / ts.x) % ts.y, li / (ts.x * ts.y));
     let p = t0 + l;
     if any(p >= nn) { return; }
+    let sy = hs.x;
+    let sz = hs.x * hs.y;
     let node = (p.z * nn.y + p.y) * nn.x + p.x;
     let fm = free[node];
     var acc = vec3<f32>(0.0);
     if fm != 0u {
         // this node in the halo tile
-        let h = (l.x + 1u) + 10u * ((l.y + 1u) + 6u * (l.z + 1u));
+        let h = (l.x + 1u) + sy * (l.y + 1u) + sz * (l.z + 1u);
         for (var a = 0u; a < 8u; a++) {
             let di = a & 1u;
             let dj = (a >> 1u) & 1u;
@@ -330,10 +343,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             let s = ee[(e.z * n.y + e.y) * n.x + e.x];
             if s == 0.0 { continue; }
             // the element's local node c is at halo index h - (a bits) + (c bits)
-            let base = h - di - 10u * dj - 60u * dk;
+            let base = h - di - sy * dj - sz * dk;
             let u0 = sp[base];
             for (var c = 1u; c < 8u; c++) {
-                let um = sp[base + (c & 1u) + 10u * ((c >> 1u) & 1u) + 60u * ((c >> 2u) & 1u)] - u0;
+                let um = sp[base + (c & 1u) + sy * ((c >> 1u) & 1u) + sz * ((c >> 2u) & 1u)] - u0;
                 let r = (3u * a) * 24u + 3u * c;
                 acc.x += s * dot(vec3<f32>(ke[r], ke[r + 1u], ke[r + 2u]), um);
                 acc.y += s * dot(vec3<f32>(ke[r + 24u], ke[r + 25u], ke[r + 26u]), um);

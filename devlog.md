@@ -3,6 +3,29 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-15: `apply_p` tiles for 2D slabs
+
+**Why:** the smoother change's `apply_p` (level 1's mat-vec, one workgroup per 8×4×4 tile of nodes)
+made 2D problems' solves 50% slower: `monitor_table`'s slab has 2 nodes across, so three quarters
+of each tile's threads had nothing to do (30 iterations: solve 0.10 → 0.15 s per iteration). The
+bench and the kernel tests only had 3D grids.
+
+**What:**
+- Across a slab one element thick, `apply_p` uses 2×8×8 tiles (`apply_p_slab_x|y|z`). The workgroup
+  arrays grow to fit both shapes (halo 400 nodes, coarse block 108).
+- The tile sizes are `const`s in the kernel. `gpu_engine::VARIANTS` compiles a kernel again under
+  another name with some of its constants substituted in the source. Passing the tile in `Params`
+  instead made the 3D kernel 7% slower (33.5 vs 31.3 ms at 9.6M elements). WGSL `override`
+  constants were the first try: naga 30 fails to specialize this kernel with them
+  (`ExpressionAlreadyInScope`).
+
+**Result:** `monitor_table` (`--ground slide`): 21.1 s (fine-stage solve 8.4 s), against 20.9 s
+(8.5 s) before the smoother change, and 29.8 s with it. 3D unchanged: level-1 apply 32.0 ms,
+V-cycle 268 ms, CG iteration 302 ms at 9.6M elements; `bench-topopt` 0.111 / 0.333 / 1.644 s per
+iteration at 0.8 / 0.5 / 0.3 mm.
+
+**Verified:** `kernels_match_cpu` runs on a 3D grid and on slabs along each axis. All tests pass.
+
 ## 2026-11-15: Slide-ground pins inside the footprint
 
 **Why:** `wide_stand_leg` with `--ground slide` was a mechanism. Its max displacement was 36 m at the

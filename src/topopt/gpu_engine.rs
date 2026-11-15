@@ -69,6 +69,29 @@ pub fn dims4(n: [usize; 3]) -> [u32; 4] {
     [n[0] as u32, n[1] as u32, n[2] as u32, 0]
 }
 
+/// Kernels compiled again under another name with other values of some of their `const u32`
+/// declarations (kernel, variant, constants), substituted in the source: constant strides are
+/// measurably faster than ones passed in `Params`. (Not WGSL `override` constants: naga 30 fails to
+/// specialize `apply_p` with them, `ExpressionAlreadyInScope`.)
+type Variant = (&'static str, &'static str, &'static [(&'static str, u32)]);
+const VARIANTS: &[Variant] = &[
+    ("apply_p", "apply_p_slab_x", &[("TX", 2), ("TY", 8), ("TZ", 8)]),
+    ("apply_p", "apply_p_slab_y", &[("TX", 8), ("TY", 2), ("TZ", 8)]),
+    ("apply_p", "apply_p_slab_z", &[("TX", 8), ("TY", 8), ("TZ", 2)]),
+];
+
+/// `src` with `const NAME: u32 = ...;` set to each of `constants`.
+fn with_constants(src: &str, constants: &[(&str, u32)]) -> Result<String> {
+    let mut out = src.to_string();
+    for (name, value) in constants {
+        let decl = format!("const {name}: u32 = ");
+        let at = out.find(&decl).ok_or_else(|| anyhow!("no `{decl}...;` to set"))? + decl.len();
+        let end = at + out[at..].find(';').ok_or_else(|| anyhow!("unterminated `{decl}`"))?;
+        out.replace_range(at..end, &format!("{value}u"));
+    }
+    Ok(out)
+}
+
 pub struct Engine<'g> {
     pub gpu: &'g Gpu,
     pipes: HashMap<&'static str, wgpu::ComputePipeline>,
@@ -94,23 +117,28 @@ impl<'g> Engine<'g> {
                 let (name, body) = part.split_once('\n').unwrap_or((part, ""));
                 let name: &'static str = name.trim();
                 let src = format!("{prelude}\n{body}");
-                let pipe = gpu
-                    .scoped(|| {
-                        let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-                            label: Some(name),
-                            source: wgpu::ShaderSource::Wgsl(src.into()),
-                        });
-                        dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                            label: Some(name),
-                            layout: None,
-                            module: &module,
-                            entry_point: Some("main"),
-                            compilation_options: Default::default(),
-                            cache: None,
+                // the kernel, and its variants with other values of its `override` constants
+                let variants = VARIANTS.iter().filter(|v| v.0 == name).map(|v| (v.1, v.2));
+                for (label, constants) in std::iter::once((name, &[][..])).chain(variants) {
+                    let src = with_constants(&src, constants).map_err(|e| anyhow!("kernel {label}: {e}"))?;
+                    let pipe = gpu
+                        .scoped(|| {
+                            let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+                                label: Some(label),
+                                source: wgpu::ShaderSource::Wgsl(src.into()),
+                            });
+                            dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                                label: Some(label),
+                                layout: None,
+                                module: &module,
+                                entry_point: Some("main"),
+                                compilation_options: Default::default(),
+                                cache: None,
+                            })
                         })
-                    })
-                    .map_err(|e| anyhow!("kernel {name}: {e}"))?;
-                pipes.insert(name, pipe);
+                        .map_err(|e| anyhow!("kernel {label}: {e}"))?;
+                    pipes.insert(label, pipe);
+                }
             }
         }
         let mut e = Engine {
