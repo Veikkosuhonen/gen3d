@@ -1,8 +1,13 @@
 # Plan: block-sparse optimizer grids
 
-Goal: the GPU optimizer's memory and time scale with the design domain, not with its bounding box.
-For thin, spread-out parts (table frames, stands, legs) that is several times more elements on the
-same card, at the same resolution everywhere.
+Goal: the GPU optimizer's memory and time scale with the material, not with the bounding box. Two
+kinds of empty space, and the gains multiply:
+
+- **Outside the domain** (static): the box around thin, spread-out parts (table frames, stands, legs).
+  Known at setup.
+- **Void inside the domain** (dynamic): at a 0.3 volume fraction most of the domain ends up void.
+  Known once the layout has formed, which the coarse-start stage already does before the fine
+  stage, where nearly all the time is spent (see "Void: the fine stage starts sparse").
 
 ## Where it stands
 
@@ -43,11 +48,49 @@ element thick, as a 2D slab's, gets a brick extent of 1). Only *active* bricks a
   by the part, not the box.
 
 **Why B = 4.** At the 0.5–1 mm voxels used for printing, a 2–4 mm brick is about one wall thick, so
-little of a brick is wasted; 8³ would roughly double the waste on thin walls. A 64-element brick also
-fits a 64-thread workgroup. Step 0 settles it with numbers.
+little of a brick is wasted. On the optimized bracket, 8³ bricks keep 74–84% of the domain live
+against 62–74% for 4³ (see "Void"). A 64-element brick also fits a 64-thread workgroup.
 
 **Memory.** ~164 B × (active slots · B³) plus ~2 B per element of tables. A shape filling 20% of its
 box with ~60% brick occupancy would use ~1/3 of today's memory.
+
+## Void: the fine stage starts sparse
+
+With coarse start (the default), the β = 1 stage runs on a 2× coarser grid and the layout forms
+there; the fine stage continues from it. Measured on `bracket_domain` (default settings, 0.5 mm:
+606k domain elements, 99% of its box; 0.35 mm: 1.78M):
+
+| | live elements (x > 1e-3, dilated 2 voxels) | live 4³ bricks | 8³ bricks |
+|---|---|---|---|
+| fine stage, first iteration (0.5 mm, it 67 of 126) | 65% of domain | 74% | 84% |
+| fine stage, it 80 | 62% | 71% | 81% |
+| final (0.5 mm) | 50% | 62% | 74% |
+| final (0.35 mm) | 47% | 54% | 64% |
+
+- **The fine stage never leaves its starting set.** No element of the final design with x > 1e-3 lies
+  outside the first fine iteration's live set dilated by 2 voxels (0 of 606k). So the active set can
+  be fixed once, when the fine stage starts: no reallocation during a stage.
+- **The fine stage is most of the time**: here 7 s for 66 coarse iterations, 22 s for 60 fine ones.
+- **The gain is moderate on a compact part**: ~1.35× fewer bricks for the whole fine stage, 1.6–1.9×
+  if the set were shrunk later. The floor is the solid fraction (38% here, kept-solid included) plus
+  the margin; it improves with resolution (the margin is fixed in voxels) and at lower volume
+  fractions. 8³ bricks lose most of it, which settles B = 4.
+
+**Rule.** At the fine stage's start, a brick is active when it holds a node of an element that is
+kept solid, supported, loaded, or within `margin` (2 voxels, at least the filter radius) of a
+prolonged density above 1e-3. Everything else is fixed at x = 0.
+
+**What changes in the method:**
+- Dropped elements have x = 0 exactly instead of E_min stiffness. Nodes touching only dropped
+  elements leave the system; that changes K by E_min/E0 = 1e-9 relative, below the f32 solve's
+  tolerance.
+- The filter must still **count dropped elements as domain elements with x = 0** (not exclude them),
+  or the weight sums renormalize and densities near the set's edge shift. They are in the page
+  table's "absent" bricks, so `filter`/`sens` need a per-box-brick "domain but dropped" bit, or
+  (simpler) the weight sums are precomputed once on the dense grid at the stage start.
+- The volume constraint counts them as 0, which they are.
+- Output, checkpoints and resume scatter as before, with dropped elements written as 0.
+- The coarse stage stays as it is (box-sparse only): it's the grey phase and 1/8 of the cost.
 
 ## What stays dense
 
@@ -79,8 +122,11 @@ Mirror planes in `filter`/`sens` keep working: mirror the coordinate, then look 
    - Log in `setup`: domain fill of the box, and for B = 4 and 8 the active brick count (with the
      node dilation) and brick occupancy.
    - Run it on the shapes in `shapes/` (those without supports with `--ground`).
-   - **Go/no-go:** proceed if typical target shapes would use under ~60% of the box's memory.
-     Otherwise do the scaling plan's 164 → ~100 B per element first.
+   - Also the fine-stage live bricks (as in "Void"), with `out/` results and a script, for the same
+     shapes.
+   - **Go/no-go:** proceed if box × void sparsity would leave typical target shapes under ~60% of
+     today's fine-stage memory. The bracket alone (99% box fill) gives ~74%, so that rests on the
+     spread-out shapes. Otherwise do the scaling plan's 164 → ~100 B per element first.
 1. **`src/topopt/bricks.rs`.** The brick set: build from the domain, coarsen, page and neighbour
    tables, gather/scatter dense ↔ slots, `index(i, j, k) -> Option<usize>`. Unit tests: round trip,
    an all-active set matches the dense count, the coarse set covers every fine brick's children and
@@ -94,20 +140,26 @@ Mirror planes in `filter`/`sens` keep working: mirror the coordinate, then look 
 4. **Host glue**: buffer sizes from slots in `gpu_mg.rs`/`gpu_opt.rs`, load remapping, readback
    scatter for output, checkpoints and coarse start. The dense GPU layout is removed, not kept
    beside it: an all-active brick set is the dense case.
-5. **Benchmark.**
+5. **Benchmark the box sparsity.**
    - `bench-topopt` on `bracket_domain` (96% fill) bounds the lookup overhead: target ≤ 15% slower
      per iteration than today.
    - The sparse shapes from step 0: memory per *domain* element, and iteration time, before/after.
    - The largest grid that fits on the card, against today's ~45M box elements.
-6. **Host-side sparsity, if host RAM becomes the limit**: a sparse `Problem`, `setup` sampling only
+6. **The fine stage starts sparse** (see "Void"): the active set from the prolonged coarse design,
+   the filter's dropped-element handling, dropped elements written as 0. Verify: compliance within
+   0.5% of the full-domain run on `bracket_domain` and the shapes from step 0, with the brick count
+   and fine-stage time before/after (expect ~1.35× on the bracket). Without coarse start (`--no-coarse-start`, or
+   grids too small for it) the whole run stays domain-sparse.
+7. **Host-side sparsity, if host RAM becomes the limit**: a sparse `Problem`, `setup` sampling only
    bricks near the domain (today `MAX_SAMPLED` caps the box at 200M cells), loads as DOF lists.
 
-## Later: narrow band
+## Later: shrinking during a stage
 
-Once the layout is sparse, bricks that stay fully void for many iterations (x̄ at the minimum, with a
-few voxels' margin) can be dropped from the active set, so late iterations cost what the structure
-costs, not the domain (Liu et al. 2018). Needs rebuilding the hierarchy when the set changes and a
-rule for letting bricks back in. Separate plan when step 5 is done.
+The bracket's live set keeps shrinking through the fine stage (74% → 62% of bricks). Re-cutting the
+set once or twice (say when β doubles) would take the remaining gain (Liu et al. 2018's narrow band),
+at the cost of rebuilding the hierarchy and buffers mid-run. Bricks only leave, never come back: the
+measurement above shows the design doesn't grow past a 2-voxel margin. Worth it only if step 6's
+numbers show the late fine iterations dominate.
 
 ## Risks and open questions
 
