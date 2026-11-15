@@ -430,13 +430,16 @@ impl Volume {
     }
 }
 
-/// How `Volume::mesh` makes the surface.
-#[derive(Clone, Copy, Debug)]
+/// How `Volume::mesh` makes the surface. The default is the raw interpolated surface.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct MeshOpts {
     /// fair the voxels' surface (`fairing::fair`) instead of interpolating the array
     pub fair: bool,
     /// Taubin smoothing passes (`Mesh::smooth`)
     pub smooth: u32,
+    /// with `fair`: how far (mm) the surface may move outward from the voxels' to be smoother
+    /// (`fairing::fair`); at least `fairing::DELTA` voxels whatever this says
+    pub grow: f32,
 }
 
 impl Volume {
@@ -503,7 +506,9 @@ impl Volume {
         }
         let faired = opts.fair.then(|| {
             let inside: Vec<bool> = f.iter().zip(&free).map(|(&v, &fr)| !fr && v < 0.0).collect();
-            crate::fairing::fair(&inside, Some(&free), p)
+            // in voxels of the (geometric) mean spacing; the fairing works in voxel units
+            let h = (self.spacing.iter().product::<f64>()).cbrt() as f32;
+            crate::fairing::fair(&inside, Some(&free), p, opts.grow / h)
         });
         if let Some(fv) = &faired {
             for i in 0..n {
@@ -1018,7 +1023,7 @@ mod tests {
         slope_vti(&path);
         let vol = Volume::load(&path, &VolumeOpts::default()).unwrap();
         assert!(vol.label().contains(FILTERED), "{}", vol.label());
-        let raw = MeshOpts { fair: false, smooth: 0 };
+        let raw = MeshOpts::default();
         let m = vol.mesh(&raw).unwrap();
         assert!(m.is_watertight());
 
@@ -1043,7 +1048,13 @@ mod tests {
 
         let v0 = m.volume();
         for fair in [false, true] {
-            let m = vol.mesh(&MeshOpts { fair, smooth: 10 }).unwrap();
+            let m = vol
+                .mesh(&MeshOpts {
+                    fair,
+                    smooth: 10,
+                    ..Default::default()
+                })
+                .unwrap();
             assert!(m.is_watertight());
             let x_max = m.verts.iter().map(|v| v[0]).fold(f32::MIN, f32::max);
             assert!(

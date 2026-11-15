@@ -14,6 +14,14 @@
 //! level sets shrink by mean curvature) leaves spheres, cylinders and planes where they are. Holding
 //! φ near a distance (rather than only keeping each sample on its side) keeps a distance-like slope
 //! inside thin members, which otherwise goes flat and lets the surface hug the inside samples.
+//!
+//! `grow` trades faithfulness for smoothness: the optimizer's own design can have ripples and
+//! ridges a voxel or two high (thin shells that widen by a voxel at a time), which no surface within
+//! half a voxel can smooth out. Letting the surface move further *outward* fills terraces, dents and
+//! narrow pockets, and never thins a wall. It does thicken thin walls (by about half the distance on
+//! each side): the thin-plate energy also flattens the field's V across a wall. Letting it move
+//! further *inward* as well was tried and dropped: on optimized shells it mostly erodes (a 3-voxel
+//! slab thins by the full distance while its ripple stays) and opens holes in them.
 
 /// A scalar field on an x-fastest grid, in voxel units (sample i at position i).
 #[derive(Clone)]
@@ -61,7 +69,10 @@ impl Field {
 /// says). Wider bands don't help smooth shapes and let thin members shrink.
 pub const DELTA: f32 = 0.45;
 
-/// Iterations of `fair` (converged for the terraces on the test shapes).
+/// Iterations of `fair` with the default band (converged for the terraces on the test shapes).
+/// Letting the surface grow further smooths longer wavelengths, which take longer to converge: the
+/// iterations go up in proportion (measured on an optimized stand leg: growing by 4 voxels had
+/// converged by 800 iterations, and changed the volume by 2% from 400 on), to at most 1000.
 pub const ITERS: usize = 100;
 
 /// Samples further than this (voxels) from the surface keep their initial value.
@@ -118,19 +129,22 @@ fn extend(inside: &[bool], free: &[bool], dims: [usize; 3]) -> Vec<bool> {
     out
 }
 
-/// A smooth field (negative inside) whose zero level is within about `DELTA` voxels of the surface
-/// of `inside` (see the module docs). `free` samples, e.g. outside the design domain, are
+/// A smooth field (negative inside) whose zero level is within `DELTA` voxels inward and
+/// `grow.max(DELTA)` outward of the surface of `inside` (see the module docs). `free` samples, e.g. outside the design domain, are
 /// unconstrained, so the field continues smoothly through them (where the solid meets the domain's
 /// boundary, the surface beyond it gives the outline on the boundary). They start as if the solid
 /// continued straight through the free region's boundary (`extend`): starting them as outside
 /// would, within the iterations, pull thin walls along that boundary outward on their other side.
-pub fn fair(inside: &[bool], free: Option<&[bool]>, dims: [usize; 3]) -> Field {
+pub fn fair(inside: &[bool], free: Option<&[bool]>, dims: [usize; 3], grow: f32) -> Field {
+    let grow = grow.max(DELTA);
+    let iters = ((ITERS as f32 * grow / DELTA).ceil() as usize).min(1000);
     let init = match free {
         Some(f) => mask_sdf(&extend(inside, f, dims), dims),
         None => mask_sdf(inside, dims),
     };
     let n = inside.len();
-    let mut lo: Vec<f32> = init.v.iter().map(|v| v - DELTA).collect();
+    // φ < 0 inside: a lower φ moves the surface outward
+    let mut lo: Vec<f32> = init.v.iter().map(|v| v - grow).collect();
     let mut hi: Vec<f32> = init.v.iter().map(|v| v + DELTA).collect();
     if let Some(free) = free {
         for i in (0..n).filter(|&i| free[i]) {
@@ -138,8 +152,8 @@ pub fn fair(inside: &[bool], free: Option<&[bool]>, dims: [usize; 3]) -> Field {
             hi[i] = f32::INFINITY;
         }
     }
-    let active: Vec<bool> = init.v.iter().map(|v| v.abs() <= BAND).collect();
-    solve(init, &lo, &hi, &active, ITERS)
+    let active: Vec<bool> = init.v.iter().map(|v| v.abs() <= BAND + grow).collect();
+    solve(init, &lo, &hi, &active, iters)
 }
 
 /// Minimises Σ (Lφ)² (L the 7-point Laplacian, mirrored at the grid's edges) subject to
@@ -395,7 +409,7 @@ mod tests {
             let inside = voxelise(&c);
             let mut before = mesh_field(&filtered(&inside));
             before.smooth(10, None);
-            let mut after = mesh_field(&fair(&inside, None, [N; 3]));
+            let mut after = mesh_field(&fair(&inside, None, [N; 3], DELTA));
             after.smooth(crate::mesher::DEFAULT_SMOOTH, None);
             let (b, a) = (measure(&before, &c), measure(&after, &c));
             println!(
@@ -420,6 +434,64 @@ mod tests {
         }
     }
 
+    /// A slab with a rippled top (1 voxel amplitude, 8-voxel wavelength: what the optimizer's
+    /// terraced shells look like) on a 3-voxel base, faired growing by up to `grow`: the top surface's
+    /// height along a row, and the base's thinnest point (the lowest top minus the bottom surface's
+    /// highest point).
+    fn rippled_slab(grow: f32) -> (Vec<f32>, f32) {
+        let d = [48usize, 12, 24];
+        let n = d[0] * d[1] * d[2];
+        let top = |x: f32| 8.4 + (x * std::f32::consts::TAU / 8.0).sin();
+        let bottom = 4.4;
+        let mut inside = vec![false; n];
+        let mut free = vec![false; n];
+        for z in 0..d[2] {
+            for y in 0..d[1] {
+                for x in 0..d[0] {
+                    let i = (z * d[1] + y) * d[0] + x;
+                    // free sides in x and y: the slab continues through them
+                    free[i] = x == 0 || y == 0 || x == d[0] - 1 || y == d[1] - 1;
+                    let zf = z as f32;
+                    inside[i] = !free[i] && zf > bottom && zf < top(x as f32);
+                }
+            }
+        }
+        let f = fair(&inside, Some(&free), d, grow);
+        let crossings = |x: usize| {
+            let col: Vec<f32> = (0..d[2]).map(|z| f.v[f.idx(x, 6, z)]).collect();
+            let at = |k: usize| k as f32 + col[k] / (col[k] - col[k + 1]);
+            let up = (0..d[2] - 1).find(|&k| col[k] >= 0.0 && col[k + 1] < 0.0).map(at);
+            let down = (0..d[2] - 1).rev().find(|&k| col[k] < 0.0 && col[k + 1] >= 0.0).map(at);
+            (up.expect("bottom surface"), down.expect("top surface"))
+        };
+        let cols: Vec<(f32, f32)> = (4..44).map(crossings).collect();
+        let tops: Vec<f32> = cols.iter().map(|c| c.1).collect();
+        let lowest_top = tops.iter().fold(f32::MAX, |m, &t| m.min(t));
+        let highest_bottom = cols.iter().fold(f32::MIN, |m, c| m.max(c.0));
+        (tops, lowest_top - highest_bottom)
+    }
+
+    fn peak_to_peak(v: &[f32]) -> f32 {
+        v.iter().fold(f32::MIN, |m, &x| m.max(x)) - v.iter().fold(f32::MAX, |m, &x| m.min(x))
+    }
+
+    /// The default band keeps the ripple (it is the design's, not the voxels'); growing by 2 voxels
+    /// flattens it to a third, and the base only gets thicker (by about 2 voxels).
+    #[test]
+    fn growing_smooths_ripples_without_thinning() {
+        let (tops, base) = rippled_slab(DELTA);
+        let (g_tops, g_base) = rippled_slab(2.0);
+        let (p, gp) = (peak_to_peak(&tops), peak_to_peak(&g_tops));
+        println!("ripple {p:.2} -> {gp:.2}; base {base:.2} -> {g_base:.2} voxels");
+        assert!(p > 1.4, "the default band keeps the ripple: {p}");
+        assert!(gp < 0.35 * p, "growing smooths: {gp} vs {p}");
+        assert!(g_base >= base, "growing doesn't thin: {g_base} vs {base}");
+        assert!(
+            g_base < base + 2.5,
+            "growing thickens by at most ~the distance: {g_base} vs {base}"
+        );
+    }
+
     /// A tilted plane (slope 0.3, voxel steps every 3⅓ voxels) filling the grid, with free samples
     /// around it: the faired surface is the plane to within a tenth of a voxel (the voxels' own
     /// surface is off by up to half a voxel).
@@ -440,7 +512,7 @@ mod tests {
                 }
             }
         }
-        let f = fair(&inside, Some(&free), d);
+        let f = fair(&inside, Some(&free), d, DELTA);
         let err: Vec<f32> = (6..36)
             .map(|x| {
                 // the zero crossing up the column at y = 9

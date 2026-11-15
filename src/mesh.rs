@@ -209,6 +209,11 @@ impl Mesh {
 
     /// Number of connected components.
     pub fn body_count(&self) -> usize {
+        self.pieces().1
+    }
+
+    /// Connected pieces of the surface: each triangle's piece (0..count), and the count.
+    fn pieces(&self) -> (Vec<u32>, usize) {
         let mut parent: Vec<u32> = (0..self.verts.len() as u32).collect();
         fn find(p: &mut [u32], mut x: u32) -> u32 {
             while p[x as usize] != x {
@@ -217,20 +222,60 @@ impl Mesh {
             }
             x
         }
-        let mut used = vec![false; self.verts.len()];
         for t in &self.tris {
-            for &i in t {
-                used[i as usize] = true;
-            }
             let r = find(&mut parent, t[0]);
             for &i in &t[1..] {
                 let ri = find(&mut parent, i);
                 parent[ri as usize] = r;
             }
         }
-        (0..self.verts.len() as u32)
-            .filter(|&i| used[i as usize] && find(&mut parent, i) == i)
-            .count()
+        let mut id = vec![u32::MAX; self.verts.len()];
+        let mut n = 0;
+        let label = self
+            .tris
+            .iter()
+            .map(|t| {
+                let r = find(&mut parent, t[0]) as usize;
+                if id[r] == u32::MAX {
+                    id[r] = n;
+                    n += 1;
+                }
+                id[r]
+            })
+            .collect();
+        (label, n as usize)
+    }
+
+    /// Removes the closed pieces of the surface enclosing less than `fraction` of the volume of the
+    /// largest: small separate bodies (an optimizer leaves crumbs of material) and small voids inside
+    /// a body (a void's surface encloses negative volume, so removing it fills the void). Returns the
+    /// number removed and their net volume (mm³; a filled void counts negative).
+    pub fn drop_small_pieces(&mut self, fraction: f64) -> (usize, f64) {
+        let (label, n) = self.pieces();
+        if n < 2 || fraction <= 0.0 {
+            return (0, 0.0);
+        }
+        let mut vol = vec![0f64; n];
+        for (t, &l) in self.tris.iter().zip(&label) {
+            let [a, b, c] = t.map(|i| self.verts[i as usize].map(f64::from));
+            vol[l as usize] += (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]))
+                / 6.0;
+        }
+        let largest = vol.iter().fold(0f64, |m, v| m.max(v.abs()));
+        let drop: Vec<bool> = vol.iter().map(|v| v.abs() < fraction * largest).collect();
+        let count = drop.iter().filter(|&&d| d).count();
+        if count == 0 {
+            return (0, 0.0);
+        }
+        let removed = vol.iter().zip(&drop).filter(|p| *p.1).map(|p| p.0).sum();
+        let mut i = 0;
+        self.tris.retain(|_| {
+            i += 1;
+            !drop[label[i - 1] as usize]
+        });
+        self.remove_unreferenced_vertices();
+        (count, removed)
     }
 
     pub fn remove_unreferenced_vertices(&mut self) {
@@ -656,6 +701,37 @@ impl Mesh {
 #[cfg(test)]
 mod tests {
     use super::Mesh;
+
+    /// A big block with a 2³ void inside it, and a 2³ crumb beside it: dropping pieces under 5% of
+    /// the block removes the crumb and fills the void, leaving one closed body of the block's volume.
+    #[test]
+    fn small_pieces_are_dropped_and_voids_filled() {
+        let n = 20;
+        let mut vol = vec![0.5f32; n * n * n];
+        let mut set = |r: [std::ops::Range<usize>; 3], v: f32| {
+            for x in r[0].clone() {
+                for y in r[1].clone() {
+                    for z in r[2].clone() {
+                        vol[(x * n + y) * n + z] = v;
+                    }
+                }
+            }
+        };
+        set([1..13, 1..13, 1..13], -0.5);
+        set([5..7, 5..7, 5..7], 0.5);
+        set([16..18, 16..18, 16..18], -0.5);
+        let mut m = crate::mc::polygonize(&vol, [n, n, n], [0.0; 3], 1.0);
+        assert_eq!(m.body_count(), 3);
+        let full = m.volume();
+        let (dropped, removed) = m.drop_small_pieces(0.05);
+        assert_eq!(dropped, 2);
+        assert_eq!(m.body_count(), 1);
+        assert!(m.is_watertight());
+        // the crumb's volume went, the void's came back: about equal
+        assert!((m.volume() - (full - removed)).abs() < 1e-6);
+        assert!(removed.abs() < 0.5, "crumb and void cancel: {removed}");
+        assert_eq!(m.drop_small_pieces(0.05).0, 0);
+    }
 
     /// What `save` writes, `load` reads back: the same triangles at the same positions.
     #[test]

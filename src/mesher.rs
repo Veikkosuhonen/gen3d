@@ -218,12 +218,12 @@ pub fn polygonize(mut grid: Grid) -> Result<Mesh> {
     Ok(mesh)
 }
 
-pub fn build_mesh(shape: &Shape, voxel: Option<f32>, decimate: Option<f32>) -> Result<Mesh> {
+pub fn build_mesh(shape: &Shape, voxel: Option<f32>, decimate: Option<f32>, min_body: Option<f64>) -> Result<Mesh> {
     let t0 = Instant::now();
     let gpu = crate::gpu::headless()?;
     let grid = sample_grid(shape, voxel, &gpu)?;
     let t1 = Instant::now();
-    let mesh = polygonize(grid)?;
+    let mut mesh = polygonize(grid)?;
     let t2 = Instant::now();
     println!(
         "sampled in {:.2}s, marching cubes in {:.2}s: {} triangles",
@@ -231,7 +231,23 @@ pub fn build_mesh(shape: &Shape, voxel: Option<f32>, decimate: Option<f32>) -> R
         (t2 - t1).as_secs_f64(),
         fmt_count(mesh.tris.len())
     );
+    drop_small_pieces(&mut mesh, min_body);
     Ok(decimate_checked(mesh, decimate))
+}
+
+/// `Mesh::drop_small_pieces` below `min_body` % of the largest body, saying what went.
+pub fn drop_small_pieces(mesh: &mut Mesh, min_body: Option<f64>) {
+    let Some(pct) = min_body.filter(|p| *p > 0.0) else {
+        return;
+    };
+    let (n, vol) = mesh.drop_small_pieces(pct / 100.0);
+    if n > 0 {
+        println!(
+            "removed {n} piece{} under {pct}% of the largest body (volume {:+.3} cm³)",
+            if n == 1 { "" } else { "s" },
+            -vol / 1000.0
+        );
+    }
 }
 
 /// Taubin smoothing passes for meshes of .vti grids (`Mesh::smooth`).

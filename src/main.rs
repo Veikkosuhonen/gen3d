@@ -197,6 +197,13 @@ struct MeshArgs {
     /// .vti: mesh the array's interpolated threshold surface instead of fairing it
     #[arg(long)]
     no_fair: bool,
+    /// .vti: let the faired surface move up to MM outward to be smoother: fills terraces, ripples,
+    /// dents and narrow pockets; walls only get thicker (the part gets heavier). Implies --fair
+    #[arg(long, value_name = "MM", conflicts_with = "no_fair")]
+    grow: Option<f32>,
+    /// remove separate pieces and inner voids enclosing less than PCT % of the largest body's volume
+    #[arg(long, value_name = "PCT")]
+    min_body: Option<f64>,
     #[arg(long, value_enum, default_value = "stl")]
     format: Format,
     /// the side of the part that faces up on the printer: the mesh is turned so it does and set on
@@ -487,11 +494,11 @@ fn export(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option<&str>)
     if ext.is_some() && m.format == Format::Vti {
         bail!("--format vti only applies to `export`");
     }
-    if m.smooth.is_some() || m.fair || m.no_fair {
-        bail!("--smooth and --fair apply to .vti grids (shapes are meshed from their exact distance field)");
+    if m.smooth.is_some() || m.fair || m.no_fair || m.grow.is_some() {
+        bail!("--smooth, --fair and --grow apply to .vti grids (shapes are meshed from their exact distance field)");
     }
     let decimate = m.decimate.or(shape.decimate());
-    let mut mesh = mesher::build_mesh(&shape, m.voxel, decimate)?;
+    let mut mesh = mesher::build_mesh(&shape, m.voxel, decimate, m.min_body)?;
     mesh.orient(oriented(m.up, shape.up));
     mesher::report(&mesh);
     let out = match (ext, output) {
@@ -540,8 +547,11 @@ fn export_volume(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option
         vol.inside_count,
         vol.count()
     );
+    if m.grow.is_some_and(|v| v.is_nan() || v < 0.0) {
+        bail!("--grow must be a distance >= 0 mm");
+    }
     let opts = volume::MeshOpts {
-        fair: if m.fair {
+        fair: if m.fair || m.grow.is_some() {
             true
         } else if m.no_fair {
             false
@@ -549,15 +559,26 @@ fn export_volume(s: &ShapeArgs, m: &MeshArgs, output: Option<&Path>, ext: Option
             vol.fair_by_default()
         },
         smooth: m.smooth.unwrap_or(mesher::DEFAULT_SMOOTH),
+        grow: m.grow.unwrap_or(0.0),
     };
-    let mesh = vol.mesh(&opts)?;
+    let mut mesh = vol.mesh(&opts)?;
+    let band = if opts.grow > 0.0 {
+        format!(" (grow {} mm)", opts.grow)
+    } else {
+        String::new()
+    };
     println!(
         "{}marching cubes and {} smoothing passes in {:.2}s: {} triangles",
-        if opts.fair { "faired, " } else { "" },
+        if opts.fair {
+            format!("faired{band}, ")
+        } else {
+            String::new()
+        },
         opts.smooth,
         t0.elapsed().as_secs_f64(),
         mesh.tris.len()
     );
+    mesher::drop_small_pieces(&mut mesh, m.min_body);
     let mut mesh = mesher::decimate_checked(mesh, m.decimate);
     mesh.orient(oriented(m.up, vol.up()));
     mesher::report(&mesh);

@@ -3,6 +3,53 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-15: Smoother than the design: `--grow` and `--min-body`
+
+**Why:** faired meshes of optimized parts still had steps that slicers turn into ragged perimeters:
+ripples about a voxel high all over the stand leg's shells, ridges in the table's pockets,
+saw-toothed rims on the book stand. These are in the optimizer's design itself (thin shells that
+widen a voxel at a time), so no surface within fairing's ±0.45 voxel can remove them. The stand leg
+mesh also had 12 bodies: 10 tiny voids inside the part.
+
+**What:**
+- `fairing::fair` takes a `grow` distance: the faired field may go that far below the voxels'
+  distance (the surface moves outward), still at most 0.45 voxel above it (inward). Iterations scale
+  with it (100 × grow/0.45, at most 1000).
+- `export|slice|open --grow MM` (implies fairing) and Print's *grow to smooth* in mm, converted with
+  the grid's geometric-mean spacing.
+- `--min-body PCT` / *drop small pieces*: `Mesh::drop_small_pieces` removes connected pieces that
+  enclose less than PCT % of the largest's volume, which drops crumbs and fills small voids (a void's
+  surface encloses negative volume). For shapes too.
+
+Tried and dropped (stand leg, table): a symmetric wider band (2 voxels: smooth, but opens holes in the
+2-voxel shells, −25% volume); morphological opening + closing before fairing (holes, −13%); Gaussian
+blur of the distance field (σ 1.5 barely smooths, σ 2.5 holes, −18%); 100 Taubin passes (fine ripple
+gone, lumps stay); letting the surface also move inward (`--shrink`): 1 voxel opens holes in the
+table's pocket shells (1 → 15 bodies), and on a rippled 3-voxel slab it thins the base by 1.2 voxels
+while the ripple stays (1.44 → 1.38 voxels).
+
+**Result** (`--grow` ≈ 2 voxels `--min-body 1` vs default; volume, bodies, mesh time):
+
+| part (voxel) | default | grown |
+|---|---|---|
+| stand leg (0.6 mm), `--grow 1.2` | 63.4 cm³, 12 bodies, 1.2 s | 79.6 cm³ (+25%), 2, 3.0 s |
+| table (1.7 mm), `--grow 3.4` | 2127 cm³, 1, 1.3 s | 2327 cm³ (+9%), 1, 3.1 s |
+| book stand (1.5 mm), `--grow 3` | 613 cm³, 4, 0.9 s | 714 cm³ (+16%), 1, 2.3 s |
+| monitor table (1.73×0.8×0.8 mm), `--grow 2.2` | 811 cm³, 1, 1.3 s | 877 cm³ (+8%), 1, 3.6 s |
+
+Visually the stand leg's ripples and the book stand's saw-tooth rims are gone; the table's pocket ridges
+are softened but remain (4 voxels removes them, but fills the pockets half in; 6 fills them). Growth
+also thickens thin walls by about half the distance per side (the thin-plate energy flattens the
+field's V across a wall), which is most of the stand leg's +25%. Compliance isn't recomputed.
+
+**Verified:** `growing_smooths_ripples_without_thinning` (a 1-voxel ripple on a 3-voxel slab: peak to
+peak 1.44 → 0.45 voxel growing by 2; the base 3.37 → 5.55 voxels, never thinner),
+`small_pieces_are_dropped_and_voids_filled`; all four parts above watertight; the Print panel snapshot.
+
+**Still open:** ridges standing out of thin shells need inward smoothing that doesn't thin the shell
+(a curvature-only energy, or thickness-aware bounds); the thickening of thin walls is a side effect,
+not a choice; the mass and compliance of the grown part aren't reported.
+
 ## 2026-11-15: 2D optimization along an axis
 
 **Why:** many parts are a profile of constant thickness loaded in its own plane (a beam or block

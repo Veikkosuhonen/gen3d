@@ -215,7 +215,7 @@ Keys are matched by physical position (US layout), so `[` `]` work without AltGr
 gen3d                                   the app
 gen3d view   [FILE] [-D NAME=VAL]...    the app with a .wgsl shape or .vti grid open
 gen3d export SHAPE [-o out.stl] [--format stl|3mf|obj|ply|vti] [--voxel MM] [--bounds X0 Y0 Z0 X1 Y1 Z1] [--decimate F] [--up=+z|-z|+x|-x|+y|-y]
-            [.vti: --smooth N] [--fair | --no-fair]
+            [--min-body PCT] [.vti: --smooth N] [--fair | --no-fair] [--grow MM]
 gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh opts] [-- extra slicer args]
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf] [mesh opts]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
@@ -313,7 +313,17 @@ gen3d slice  result.vti --array density                   # straight to G-code
   same smooth surface instead of the voxel staircase. `--no-fair` meshes the interpolated
   `density_filtered` instead (the view's surface); `--fair` fairs any other array (e.g. a binary mask).
   Fairing can't remove features of a whole voxel, such as the ridges of a coarse design's thin shells:
-  a finer `--voxel` or larger `--rmin` in `optimize` can.
+  a finer `--voxel` or larger `--rmin` in `optimize` can, or `--grow`.
+- **Smoother than the design (`--grow MM`, Print's *grow to smooth*):** lets the faired surface move up
+  to MM outward instead of half a voxel, so it can fill the ripples, terraces, dents and narrow pockets
+  the optimizer itself leaves a voxel or two deep. Walls never get thinner, but thin ones get thicker
+  (by about MM/2 a side), so the part is heavier and stiffer than optimized: about 2 voxels gave
+  +8% (monitor table) to +25% (stand leg, 2-voxel shells) volume. Ridges sticking out of a shell
+  stay, softened, unless MM is large enough to fill the pocket around them. Meshing takes 2-3x as
+  long. (Letting the surface move inward too was tried: on optimized shells it mostly thins them and
+  opens holes.)
+- **Small pieces (`--min-body PCT`, Print's *drop small pieces*):** removes separate pieces and fills
+  voids inside the part that enclose less than PCT % of the largest body's volume. Works for shapes too.
 - **Colour:** `--color NAME` (or `F`) colours the surface and the section face by another array, using a
   viridis colour map. The range is the 1st to 99th percentile of that array over the inside samples (so
   a few hotspots don't flatten it); the sidebar shows a colour bar and can fix the range.
@@ -540,6 +550,8 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
   is plenty for FDM; triangle counts grow with 1/voxel².
 - Non-exact SDFs (smooth booleans, twist, noise) are fine for meshing; only the preview's raymarcher cares.
   Scale the field down (`d *= 0.7`) or set `//! step`.
+- Optimized results often have a few tiny voids inside or crumbs beside the part (`bodies=` above 1);
+  `--min-body 1` removes them.
 - `--decimate` uses meshoptimizer's quadric simplifier. If a collapse pinches a thin feature, the area is
   locked and simplification is redone; if the result still isn't watertight the full mesh is kept.
 
@@ -573,12 +585,12 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/gpu.rs` | adapter selection (hardware first, software fallback with a warning) |
 | `src/mesher.rs` | compute-shader sampling harness, grid padding, polygonize + report |
 | `src/mc.rs` | marching cubes with a generated crack-free case table |
-| `src/mesh.rs` | volume / watertight / bodies, decimation, STL/3MF/OBJ/PLY writers |
+| `src/mesh.rs` | volume / watertight / bodies (and dropping small ones), decimation, STL/3MF/OBJ/PLY writers |
 | `src/viewer.rs` | raymarching preview harness and pipelines, headless PNG render |
 | `src/slicer.rs` | PrusaSlicer / OrcaSlicer discovery and CLI driving, G-code summary, profiles, opening files |
 | `src/vti.rs` | VTK ImageData reader and writers (per-axis spacing) |
 | `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing (domain faces, outlines) |
-| `src/fairing.rs` | smooth surfaces from binary voxels: constrained thin-plate fairing of the field |
+| `src/fairing.rs` | smooth surfaces from binary voxels: constrained thin-plate fairing of the field (`--grow` widens the band outward) |
 | `src/topopt/mod.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
 | `src/topopt/mg.rs` | multigrid preconditioner: Galerkin coarse levels, Chebyshev/Jacobi smoothers, banded Cholesky |
 | `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32) |

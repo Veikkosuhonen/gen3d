@@ -200,6 +200,10 @@ struct PrintUi {
     decimate: Option<f32>,
     /// Taubin smoothing passes for a grid's mesh; None = the default (`mesher::DEFAULT_SMOOTH`)
     smooth: Option<u32>,
+    /// mm a grid's faired surface may grow outward to be smoother (0 = only the voxels' half voxel)
+    grow: f32,
+    /// drop pieces and voids under this % of the largest body (0 = keep all)
+    min_body: f64,
     /// show the exported mesh in the viewport instead of the raymarched shape
     show_mesh: bool,
     /// with `show_mesh`: draw the triangle edges
@@ -220,6 +224,8 @@ impl Default for PrintUi {
             voxel: None,
             decimate: None,
             smooth: None,
+            grow: 0.0,
+            min_body: 0.0,
             show_mesh: false,
             edges: false,
             three_mf: false,
@@ -2532,6 +2538,9 @@ impl App {
             if let Some(n) = self.print.smooth {
                 a.extend(["--smooth".into(), n.to_string()]);
             }
+            if self.print.grow > 0.0 {
+                a.extend(["--grow".into(), fmt_num(self.print.grow as f64)]);
+            }
         } else {
             for (k, v) in &self.defines {
                 a.extend(["-D".into(), format!("{k}={v}")]);
@@ -2542,6 +2551,9 @@ impl App {
         }
         if let Some(d) = self.print.decimate {
             a.extend(["--decimate".into(), fmt_num(d as f64)]);
+        }
+        if self.print.min_body > 0.0 {
+            a.extend(["--min-body".into(), fmt_num(self.print.min_body)]);
         }
         // always: without it the file's own orientation would apply
         a.push(format!("--up={}", self.up.name()));
@@ -3791,6 +3803,21 @@ impl App {
                     self.print.smooth = None;
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("grow to smooth");
+                ui.add(
+                    egui::DragValue::new(&mut self.print.grow)
+                        .speed(0.05)
+                        .range(0.0..=10.0)
+                        .suffix(" mm"),
+                )
+                .on_hover_text(
+                    "let the faired surface move up to this far outward to be smoother: fills the \
+                     ripples, terraces and narrow pockets the optimizer leaves (try 1-3 voxels). Walls \
+                     only get thicker, so the part gets heavier and stiffer; it no longer matches the \
+                     optimized design exactly (0 = off)",
+                );
+            });
         } else if let Some(shape) = self.design_shape.clone() {
             egui::Grid::new("mesh").num_columns(2).show(ui, |ui| {
                 ui.label("voxel");
@@ -3847,6 +3874,28 @@ impl App {
                 ui.end_row();
             });
         }
+        ui.horizontal(|ui| {
+            let mut on = self.print.min_body > 0.0;
+            if ui
+                .checkbox(&mut on, "drop small pieces")
+                .on_hover_text(
+                    "remove separate crumbs of material and fill small voids inside the part, smaller than \
+                     this share of the largest body's volume (slicers print crumbs as blobs)",
+                )
+                .changed()
+            {
+                self.print.min_body = if on { 1.0 } else { 0.0 };
+            }
+            if on {
+                ui.add(
+                    egui::DragValue::new(&mut self.print.min_body)
+                        .speed(0.1)
+                        .range(0.01..=50.0)
+                        .prefix("under ")
+                        .suffix(" %"),
+                );
+            }
+        });
         ui.horizontal(|ui| {
             ui.label("format");
             ui.radio_value(&mut self.print.three_mf, false, "STL");
