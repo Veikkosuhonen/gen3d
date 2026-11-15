@@ -31,6 +31,7 @@ Measured on `bracket_domain` at 1.3 mm (62×19×31, 34k domain elements): **~100
     Mirror symmetry is used since 2026-11-14 (one side solved; a hierarchy per load pattern).
     Coarse-to-fine continuation is done (the β = 1 stage on a 2× coarser grid);
   - getting memory down to ~100 B per element (f16 vectors, or fewer CG vectors);
+  - memory and time that scale with the domain, not its bounding box: `sparse-grid-plan.md`;
   - fewer, fused passes in the smoother.
   - a smaller OC move limit at high β (now 0.2 throughout). At β = 32 compliance oscillates by about
     ±0.1% per iteration. Since 2026-11-14 the run stops on that (no new best in 3 iterations), but a
