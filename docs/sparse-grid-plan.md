@@ -18,8 +18,8 @@ dispatched over it (`apply_fine` early-outs on `free == 0`, after reading it).
 - 164 B per box element on the GPU: ~11 per-element f32 arrays (`ee`, `ce`, `flags`, `x`, `xnew`,
   `xtilde`, `xphys`, `xused`, `dvs`, `dc`, `dv`) and ~7 per-node 3-vectors (`r`, `z`, `p`, `q`, `u`,
   `diag`, the smoother's `d`), plus coarse levels.
-- `bracket_domain` fills 96% of its box (36,620 of 63×19×32), so it gains nothing. Thin-walled
-  shapes are expected to fill much less. Unmeasured: see step 0.
+- `bracket_domain` fills 96% of its box (36,620 of 63×19×32), and the editor
+  shapes in `shapes/` fill 61–100% (see "Void").
 
 Rejected: a true adaptive octree (varying element size). Hanging nodes, a non-conforming multigrid,
 filters across element sizes and remeshing as the design moves; a research project, and printable
@@ -67,10 +67,25 @@ there; the fine stage continues from it. Measured on `bracket_domain` (default s
 | final (0.5 mm) | 50% | 62% | 74% |
 | final (0.35 mm) | 47% | 54% | 64% |
 
-- **The fine stage never leaves its starting set.** No element of the final design with x > 1e-3 lies
-  outside the first fine iteration's live set dilated by 2 voxels (0 of 606k). So the active set can
-  be fixed once, when the fine stage starts: no reallocation during a stage.
-- **The fine stage is most of the time**: here 7 s for 66 coarse iterations, 22 s for 60 fine ones.
+The shapes in `shapes/` (default voxel and settings, `--ground slide`; `wide_stand_leg` with
+`--ground grip`, see "Still open"). Percentages of the bounding box, 4³ bricks, live = x > 1e-3
+dilated by 2 voxels:
+
+| shape | grid | domain bricks | live bricks, fine start | live bricks, final | coarse / fine stage time |
+|---|---|---|---|---|---|
+| `bracket_domain` | 160×48×80 @ 0.5 mm | 99% | 74% | 62% | 6.3 / 21.4 s |
+| `table` | 52×52×107 @ 3.9 mm | 100% | 87% | 66% | 5.7 / 8.6 s |
+| `monitor_table` (2D) | 1×440×210 @ 1.1 mm | 97% | 42% | 38% | 4.7 / 14.9 s |
+| `book_stand1` | 67×44×79 @ 3 mm | 61% | 53% | 42% | 2.9 / 9.6 s |
+| `stand_leg` | 26×158×73 @ 1.4 mm | 95% | 60% | 48% | 2.5 / 7.4 s |
+| `wide_stand_leg` | 76×68×56 @ 2.7 mm | 80% | 62% | 49% | 2.9 / 9.2 s |
+
+- **The fine stage never leaves its starting set.** On every shape, no element of the final design
+  with x > 1e-3 lies outside the first fine iteration's live set dilated by 2 voxels. So the active
+  set can be fixed once, when the fine stage starts: no reallocation during a stage.
+- **The fine stage is most of the time**: 60–80% of each run.
+- **The box is not where the space is.** Editor shapes start from a box design primitive, so the
+  domain fills 61–100% of the box. The void is the bigger saving on every shape but `book_stand1`.
 - **The gain is moderate on a compact part**: ~1.35× fewer bricks for the whole fine stage, 1.6–1.9×
   if the set were shrunk later. The floor is the solid fraction (38% here, kept-solid included) plus
   the margin; it improves with resolution (the margin is fixed in voxels) and at lower volume
@@ -118,15 +133,13 @@ Mirror planes in `filter`/`sens` keep working: mirror the coordinate, then look 
 
 ## Steps
 
-0. **Measure first.**
-   - Log in `setup`: domain fill of the box, and for B = 4 and 8 the active brick count (with the
-     node dilation) and brick occupancy.
-   - Run it on the shapes in `shapes/` (those without supports with `--ground`).
-   - Also the fine-stage live bricks (as in "Void"), with `out/` results and a script, for the same
-     shapes.
-   - **Go/no-go:** proceed if box × void sparsity would leave typical target shapes under ~60% of
-     today's fine-stage memory. The bracket alone (99% box fill) gives ~74%, so that rests on the
-     spread-out shapes. Otherwise do the scaling plan's 164 → ~100 B per element first.
+0. **Measure first.** Done (2026-11-15), see the table in "Void": the fine stage would use 42–87% of
+   today's bricks (median ~60%) with the set fixed at its start, 38–66% if it were shrunk to the
+   final design. About **1.6× less memory and work for the fine stage** on these shapes, at their
+   current resolutions; more at finer ones (the bracket: 62% at 0.5 mm, 54% at 0.35 mm final).
+   That is about the same as the scaling plan's 164 → ~100 B per element. The two multiply, but the
+   other one is less work and helps every shape, so it may be the one to do first. Sparsity also
+   cuts time, which that doesn't.
 1. **`src/topopt/bricks.rs`.** The brick set: build from the domain, coarsen, page and neighbour
    tables, gather/scatter dense ↔ slots, `index(i, j, k) -> Option<usize>`. Unit tests: round trip,
    an all-active set matches the dense count, the coarse set covers every fine brick's children and
@@ -160,6 +173,13 @@ set once or twice (say when β doubles) would take the remaining gain (Liu et al
 at the cost of rebuilding the hierarchy and buffers mid-run. Bricks only leave, never come back: the
 measurement above shows the design doesn't grow past a 2-voxel margin. Worth it only if step 6's
 numbers show the late fine iterations dominate.
+
+## Still open (found while measuring)
+
+- `wide_stand_leg` with `--ground slide` is a mechanism: max displacement 36 m from the first
+  iteration and 5 km at the end, one iteration with 20k CG iterations (64 s), 535 s in all. Mirrored in
+  X and Y (1/4 solved), with 8 pinned nodes added. With `--ground grip` it is fine (12.8 s). Not
+  related to this plan.
 
 ## Risks and open questions
 
