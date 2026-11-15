@@ -24,6 +24,8 @@ pub enum Kind {
     Capsule,
     Torus,
     Cone,
+    /// A .vti grid's solid (`Prim::file`), e.g. an optimization result; `pos` is its centre.
+    Import,
 }
 
 impl Kind {
@@ -44,6 +46,7 @@ impl Kind {
             Kind::Capsule => "capsule",
             Kind::Torus => "torus",
             Kind::Cone => "cone",
+            Kind::Import => "import",
         }
     }
 
@@ -57,6 +60,7 @@ impl Kind {
             Kind::Capsule => &["radius", "height"],
             Kind::Torus => &["radius", "tube radius"],
             Kind::Cone => &["bottom radius", "top radius", "height"],
+            Kind::Import => &[],
         }
     }
 
@@ -75,6 +79,7 @@ impl Kind {
             Kind::Capsule => [s / 4.0, s * 1.5, 0.0],
             Kind::Torus => [h, s / 6.0, 0.0],
             Kind::Cone => [h, 0.0, s],
+            Kind::Import => [0.0; 3],
         }
     }
 }
@@ -218,6 +223,28 @@ pub struct Prim {
     /// The axes a fixed primitive holds (`Role::Fixed`): all three clamp; only the one across a
     /// surface makes a roller that lets the part slide along it.
     pub fix: [bool; 3],
+    /// The .vti file (`Kind::Import`), relative to the shape's folder (or the working directory).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub file: String,
+    /// Its solid, attached when the shape loads (`Kind::Import`).
+    #[serde(skip)]
+    pub grid: Option<GridRef>,
+}
+
+/// An import primitive's field. Equal when it is the same field (the cache shares them).
+#[derive(Clone)]
+pub struct GridRef(pub std::sync::Arc<crate::volume::SdfGrid>);
+
+impl PartialEq for GridRef {
+    fn eq(&self, other: &GridRef) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for GridRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "GridRef({:?})", self.0.dims)
+    }
 }
 
 /// Standard gravity, N per kg.
@@ -242,6 +269,8 @@ impl Default for Prim {
             kg: false,
             rock: 0.0,
             fix: [true; 3],
+            file: String::new(),
+            grid: None,
         }
     }
 }
@@ -548,6 +577,13 @@ impl Prim {
                 len([q[0], q[1], q[2] - q[2].clamp(-h, h)]) - r
             }
             Kind::Torus => len2(len2(q[0], q[1]) - d0, q[2]) - d1.max(0.0),
+            Kind::Import => match &self.grid {
+                Some(g) => {
+                    let c = g.0.centre();
+                    g.0.sample([q[0] + c[0], q[1] + c[1], q[2] + c[2]])
+                }
+                None => 1e10,
+            },
             Kind::Cone => {
                 let (r1, r2, h) = (d0.max(0.0), d1.max(0.0), (0.5 * d2).max(1e-4));
                 let (qx, qy) = (len2(q[0], q[1]), q[2]);
@@ -583,6 +619,7 @@ impl Prim {
             Kind::Capsule => [d0, d0, (0.5 * d1).max(d0)],
             Kind::Torus => [d0.abs() + d1, d0.abs() + d1, d1],
             Kind::Cone => [d0.max(d1), d0.max(d1), 0.5 * d2],
+            Kind::Import => self.grid.as_ref().map_or([0.0; 3], |g| g.0.half()),
         };
         let axes = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]].map(|e| self.to_world(e));
         let pad = 0.25 * self.blend.max(0.0);
@@ -604,6 +641,7 @@ impl Prim {
             Kind::Capsule => (0.5 * d1).max(d0),
             Kind::Torus => d0.abs() + d1,
             Kind::Cone => len2(d0.max(d1), 0.5 * d2),
+            Kind::Import => len(self.grid.as_ref().map_or([0.0; 3], |g| g.0.half())),
         };
         r + 0.25 * self.blend.max(0.0)
     }
@@ -805,6 +843,11 @@ pub fn decl_const(data: &[[f32; 4]]) -> String {
     format!("const g3d_ed = array<vec4f, {}>({});\n", data.len(), items.join(", "))
 }
 
+/// The WGSL function `import::wgsl` generates for import primitive `i`'s grid.
+pub fn import_fn(i: usize) -> String {
+    format!("g3d_imp_e{i}")
+}
+
 /// Which of its own functions the script defines that the generated code wraps (each renamed to
 /// `g3d_script_<name>`).
 #[derive(Clone, Copy, Debug, Default)]
@@ -848,15 +891,21 @@ pub fn wgsl(prims: &[Prim], mirror: &Mirror, script: Script, reach: f32) -> Stri
     for &(i, p) in &visible {
         let b = base(i);
         let _ = writeln!(s, "// {} ({})", p.name.replace(['\n', '\r'], " "), p.kind.name());
+        let eval = match (p.kind, &p.grid) {
+            // the grid's own function (`import::wgsl`), with the lattice centred on `pos`
+            (Kind::Import, Some(g)) => {
+                let [x, y, z] = g.0.centre();
+                format!("{}(q + vec3f({x:?}, {y:?}, {z:?}))", import_fn(i))
+            }
+            (Kind::Import, None) => "1e10".into(),
+            (kind, _) => format!("g3d_ed_{}(q, g3d_ed[{}].xyz, g3d_ed[{}].w)", kind.name(), b + 2, b + 1),
+        };
         let _ = writeln!(
             s,
             "fn g3d_p{i}(p: vec3f) -> f32 {{\n    \
              let q = g3d_ed_local(p, g3d_ed[{b}].xyz, g3d_ed[{}].xyz);\n    \
-             return g3d_ed_{kind}(q, g3d_ed[{}].xyz, g3d_ed[{}].w);\n}}",
+             return {eval};\n}}",
             b + 1,
-            b + 2,
-            b + 1,
-            kind = p.kind.name()
         );
         // with mirror planes, the union of the primitive and its mirror images
         let _ = writeln!(s, "fn g3d_e{i}(p: vec3f) -> f32 {{\n    var d = g3d_p{i}(p);");

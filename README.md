@@ -87,7 +87,8 @@ e.g. `override B: f32 = A * 2.0;`), all of that shape's parameters stay compiled
 
 ### Primitives from the app (`NAME.prims.json`)
 
-The Design step can also add **primitives**: sphere, box, cylinder, capsule, torus and cone, each with
+The Design step can also add **primitives**: sphere, box, cylinder, capsule, torus, cone and
+[import](#importing-a-result-into-a-shape-import) (a `.vti` result), each with
 a position, rotation (degrees about X, then Y, then Z), size, edge rounding (boxes, cylinders), an
 **operation** (*add*, *subtract* or *intersect*) and a *blend* radius that smooths it. They are stored
 next to the shape, `knob.wgsl` → `knob.prims.json`, and applied to the script **top to bottom**: each
@@ -121,8 +122,16 @@ The script's own `map` is not mirrored. A new plane goes through the middle of t
 
 ### Importing a result into a shape (`//! import`)
 
-To combine an optimization result (or any `.vti` grid) with exact SDFs, import it: the grid's solid
-becomes an SDF function the shape can use like any other.
+To combine an optimization result (or any `.vti` grid) with exact SDFs, import it. There are two ways:
+
+- **As a primitive (in the app):** Design → *Add* → **import…** lists the `.vti` files in `out/` and
+  next to the shape, newest first. The result becomes a primitive like the others: drag it with the
+  arrows, rotate it, set its operation (add, subtract, intersect), blend and optimization role, and
+  mirror it. Its *position* is the grid's centre, so a new one sits exactly where it was optimized and
+  rotates about its middle; *reset* puts it back there. Clicking it in the view selects it. The
+  sidecar stores the file relative to the shape (`"kind": "import", "file": "../out/x_topopt.vti"`).
+  Start from an empty New shape to build on a result with primitives alone.
+- **In the script:** `//! import NAME file.vti` gives the shape an SDF function to use in `map`:
 
 ```wgsl
 //! import leg ../out/stand_leg_topopt.vti
@@ -135,18 +144,19 @@ fn map(p: vec3f) -> f32 {
 }
 ```
 
+Either way:
+
 - **The file** is looked up next to the shape, then relative to the working directory. When it changes
   (e.g. you rerun the optimizer), the shape reloads.
 - **The surface** is the one Print would mesh from that file: an optimizer's `density` is
   [faired](#viewing-and-meshing-grids-vti) at 0.5, and other arrays get the view's interpolated
-  threshold surface. Where the result ends at the design domain, the faces are flat. Options after the
-  file: `array=NAME`, `iso=X`, `below` / `above`, `fair` / `no-fair`, `grow=MM` (as `export`'s
-  `--array`, `--iso`, ... for `.vti` files).
-- **Without `fn map`** (a file with only directives), the shape *is* the imported solid(s). Add
-  primitives in the Design step to put bosses on, cut holes and so on: New shape, add an `//! import`
-  line, then build on it in the app.
-- Without `//! bounds`, the bounds are the grid's box (grown to fit primitives as usual). Without
-  `//! up`, the result's print orientation carries over, and `//! step` defaults to 0.8.
+  threshold surface. Where the result ends at the design domain, the faces are flat. `//! import`
+  takes options after the file: `array=NAME`, `iso=X`, `below` / `above`, `fair` / `no-fair`,
+  `grow=MM` (as `export`'s `--array`, `--iso`, ... for `.vti` files); a primitive uses the defaults.
+- **Without `fn map`** (a file with only directives), the shape *is* the `//! import`ed solid(s).
+- Without `//! bounds`, the bounds are the `//! import`ed grid's box (grown to fit primitives as
+  usual), and an import primitive grows them like any primitive. Without `//! up`, an `//! import`ed
+  result's print orientation carries over, and `//! step` defaults to 0.8.
 - The field is computed on the CPU when the shape loads (about 1.5 s for a 4M-sample result) and
   cached, so editing the script reloads quickly. On the GPU, all imported grids share one storage
   buffer (`g3d_imp`, group 0 binding 8). The field is sampled trilinearly, so features smaller than

@@ -562,6 +562,34 @@ pub struct SdfGrid {
     pub sd: Vec<f32>,
 }
 
+impl SdfGrid {
+    /// The centre of the lattice's box.
+    pub fn centre(&self) -> [f32; 3] {
+        std::array::from_fn(|k| (self.origin[k] + 0.5 * (self.dims[k] - 1) as f64 * self.spacing[k]) as f32)
+    }
+
+    /// Half the lattice box's size.
+    pub fn half(&self) -> [f32; 3] {
+        std::array::from_fn(|k| (0.5 * (self.dims[k] - 1) as f64 * self.spacing[k]) as f32)
+    }
+
+    /// The field at `p` as `import::wgsl`'s `g3d_imp_sample` computes it (for picking on the CPU).
+    pub fn sample(&self, p: [f32; 3]) -> f32 {
+        let q: [f64; 3] = std::array::from_fn(|k| (p[k] as f64 - self.origin[k]) / self.spacing[k]);
+        let qc: [f64; 3] = std::array::from_fn(|k| q[k].clamp(0.0, (self.dims[k] - 1) as f64));
+        let v = trilinear(&self.sd, self.dims, qc);
+        let out = (0..3)
+            .map(|k| ((q[k] - qc[k]) * self.spacing[k]).powi(2))
+            .sum::<f64>()
+            .sqrt() as f32;
+        if out > 0.0 {
+            (out * out + v.max(0.0).powi(2)).sqrt()
+        } else {
+            v
+        }
+    }
+}
+
 impl Volume {
     /// Whether padded-lattice index `i` (lattice index; may be -1 or `dims`) is in the design domain.
     fn in_domain(&self, i: [i64; 3]) -> bool {

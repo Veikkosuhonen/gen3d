@@ -3,6 +3,40 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: Import primitives: move and rotate a result in the editor
+
+**Why:** an `//! import`ed result stays where it was optimized; moving it meant editing `map`.
+As an editor primitive it gets the gizmo, rotation, operations, blend, roles and mirror planes.
+
+**What:**
+- `Kind::Import` with `Prim::file` (saved relative to the shape) and the grid attached on load
+  (`Prim::grid`, a shared `Arc`, compared by pointer; not saved). `load_shape` loads the visible
+  import primitives' grids through the same cache as `//! import` and adds them to
+  `shape.imports` as `g3d_imp_e<i>`; all import WGSL is now emitted once, after the editor code.
+- `pos` is the lattice's centre, so a new one sits where the result was optimized and rotates about
+  its middle: `g3d_p<i>` evaluates `g3d_imp_e<i>(local(p) + centre)`. Its numbers live in
+  `g3d_ed` like any primitive, so dragging is a buffer write, with no recompile and no new fairing.
+- Picking, bounds and the gizmo use the CPU copy: `SdfGrid::sample` (same trilinear sampling and
+  outside bound as the WGSL), `centre`, `half` for `aabb` / `bound_radius`.
+- App: *Add* → **import…** lists `.vti` files in `out/` and next to the design, newest first.
+  The panel shows the file and a *reset* button (back to the file's position, no rotation); the
+  kind can't be switched to or from import. Changing `file` counts as structural (reloads).
+- `import::resolve` / `relative` / `load_default` factored out of the directive parsing.
+
+**Result:** the bracket result as a primitive, rotated 30° about Z and lifted to z = 25, with a
+subtracted cylinder through it: render, `snapshot` (selected, gizmo at its centre) and export
+(23.23 cm³, watertight, one body) all fine. Dragging costs the same as any primitive.
+
+**Verified:** `import_primitive_moves_and_matches_cpu` (moved and rotated, two rotations: the GPU's
+map matches `Prim::sdf` within 1e-3 on a 9³ lattice; the box is at `pos`, not at its file
+position; bounds contain it) and `app::tests::import_primitive_in_editor` (*Add import* saves a
+relative file, attaches the grid, centres it; moving it moves the bounds). Full suite passes,
+clippy clean.
+
+**Still open:** fairing still runs on the UI thread the first time a file is added or changes
+(1-2 s for big results). Import primitives take the default options only (no iso/grow per
+primitive).
+
 ## 2026-11-16: Import a .vti result into a shape (`//! import`)
 
 **Why:** an optimization result is only as exact as its voxels. Bolt holes, mounting faces and
@@ -48,9 +82,8 @@ example exports. A `snapshot` of the Design step shows the import with an editor
 gizmo. The full suite passes, clippy is clean.
 
 **Still open:**
-- The import is fixed in place. Moving or rotating it means editing `map` (`leg(p - offset)`);
-  an *import* primitive kind in the editor (position, rotation, operation) would make that
-  possible with the mouse.
+- The import is fixed in place. Moving or rotating it means editing `map` (`leg(p - offset)`).
+  (Done the same day: import primitives, next entry up.)
 - Picking in the app doesn't see the imported solid (it's not on the CPU), the same as script
   geometry.
 - The fairing runs on load in the app's UI thread (1-2 s for large results, once per file

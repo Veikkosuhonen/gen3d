@@ -119,6 +119,17 @@ impl Shape {
         }
     }
 
+    /// Append generated WGSL to the source; errors in it point at `<gen3d>/{name}`.
+    fn push_generated(&mut self, name: &str, code: &str) {
+        let idx = self.files.len();
+        self.files.push(library_path(name));
+        for (i, line) in code.lines().enumerate() {
+            self.source.push_str(line);
+            self.source.push('\n');
+            self.origins.push(Origin { file: idx, line: i + 1 });
+        }
+    }
+
     /// The editor's sidecar file for this shape (it may not exist yet).
     pub fn prims_path(&self) -> PathBuf {
         prims::sidecar(&self.path)
@@ -777,19 +788,11 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
         }
         // interpolated distance fields are only approximately distances
         shape.directives.entry("step".into()).or_insert_with(|| "0.8".into());
-        let mut code = crate::import::wgsl(&shape.imports);
         // without a map of its own, the shape is the imported solids (plus any primitives)
         if prims::find_fn(&shape.source, "map")?.is_none() {
-            code += &crate::import::map(&shape.imports);
+            let map = crate::import::map(&shape.imports);
+            shape.push_generated("import.wgsl", &map);
         }
-        let idx = shape.files.len();
-        shape.files.push(library_path("import.wgsl"));
-        for (i, line) in code.lines().enumerate() {
-            shape.source.push_str(line);
-            shape.source.push('\n');
-            shape.origins.push(Origin { file: idx, line: i + 1 });
-        }
-        shape.files.extend(shape.imports.iter().map(|i| i.path.clone()));
     }
     shape.base_bounds = shape.bounds;
 
@@ -814,6 +817,23 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
             }
             if file.meta.plane2d.is_some() {
                 shape.plane2d = file.meta.plane2d;
+            }
+            // the visible import primitives' grids
+            let dir = path.parent().unwrap_or(Path::new("."));
+            for (i, p) in shape.prims.iter_mut().enumerate() {
+                if p.kind != prims::Kind::Import || p.hidden {
+                    continue;
+                }
+                let at = |e: anyhow::Error| anyhow!("{}: primitive `{}`: {e:#}", display_path(&sidecar), p.name);
+                let file = crate::import::resolve(&p.file, dir).map_err(at)?;
+                let grid = crate::import::load_default(&file).map_err(at)?;
+                p.grid = Some(prims::GridRef(grid.clone()));
+                shape.imports.push(crate::import::Import {
+                    name: prims::import_fn(i),
+                    path: file,
+                    grid,
+                    up: None,
+                });
             }
         }
         shape.editor = true;
@@ -850,6 +870,11 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
             shape.source.push('\n');
             shape.origins.push(Origin { file: idx, line: i + 1 });
         }
+    }
+    if !shape.imports.is_empty() {
+        let code = crate::import::wgsl(&shape.imports);
+        shape.push_generated("import.wgsl", &code);
+        shape.files.extend(shape.imports.iter().map(|i| i.path.clone()));
     }
     Ok(shape)
 }

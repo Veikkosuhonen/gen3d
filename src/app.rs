@@ -1463,7 +1463,7 @@ impl App {
             || new
                 .iter()
                 .zip(&old)
-                .any(|(a, b)| a.kind != b.kind || a.hidden != b.hidden || a.role != b.role);
+                .any(|(a, b)| a.kind != b.kind || a.hidden != b.hidden || a.role != b.role || a.file != b.file);
         if let Err(e) = prims::save(&path, &new, &shape.mirror, shape.sidecar_meta()) {
             self.notice = Some(format!("{e:#}"));
             return;
@@ -1623,6 +1623,54 @@ impl App {
         let i = prims.len() - 1;
         self.set_prims(prims);
         self.select(Some(i));
+    }
+
+    /// Add a .vti grid's solid (an optimization result) as an import primitive, where the grid is.
+    fn add_import(&mut self, file: &Path) {
+        let Some(shape) = &self.design_shape else { return };
+        let dir = shape.path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let grid = match crate::import::load_default(file) {
+            Ok(g) => g,
+            Err(e) => {
+                self.notice = Some(format!("{e:#}"));
+                return;
+            }
+        };
+        let mut prims = self.prims();
+        let name = file.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        prims.push(Prim {
+            file: crate::import::relative(file, &dir),
+            grid: Some(prims::GridRef(grid.clone())),
+            ..Prim::new(Kind::Import, name, grid.centre(), 0.0)
+        });
+        let i = prims.len() - 1;
+        self.set_prims(prims);
+        self.select(Some(i));
+    }
+
+    /// .vti files to offer for importing: in `out/` and next to the design, newest first.
+    fn import_candidates(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![std::env::current_dir().unwrap_or_default().join("out")];
+        if let Some(d) = self.design.as_ref().and_then(|d| d.parent()) {
+            dirs.push(d.to_path_buf());
+        }
+        let mut files: Vec<(std::time::SystemTime, PathBuf)> = dirs
+            .iter()
+            .filter_map(|d| std::fs::read_dir(d).ok())
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_vti(p))
+            .filter_map(|p| Some((p.metadata().ok()?.modified().ok()?, p.canonicalize().ok()?)))
+            .collect();
+        files.sort_by_key(|f| std::cmp::Reverse(f.0));
+        let mut seen = std::collections::HashSet::new();
+        files
+            .into_iter()
+            .map(|(_, p)| p)
+            .filter(|p| seen.insert(p.clone()))
+            .take(30)
+            .collect()
     }
 
     /// Adds a starting setup's supports and loads (regions sized to the design's bounds) and sets
@@ -2101,6 +2149,7 @@ impl App {
         let before = self.prims();
         let mut prims = before.clone();
         let mut add = None;
+        let mut import = None;
         let mut sel = self.edit.sel;
         let mut action = None; // (duplicate?, index)
         ui.horizontal_wrapped(|ui| {
@@ -2110,6 +2159,27 @@ impl App {
                     add = Some(k);
                 }
             }
+            ui.menu_button("import…", |ui| {
+                let files = self.import_candidates();
+                if files.is_empty() {
+                    ui.weak("no .vti files in out/ or next to the shape");
+                }
+                for f in files {
+                    if ui
+                        .button(file_name(&f))
+                        .on_hover_text(f.display().to_string())
+                        .clicked()
+                    {
+                        import = Some(f);
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text(
+                "an optimization result (or any .vti grid) as a primitive: move, rotate, subtract from or \
+                 blend it like the others",
+            );
         });
         let file = self
             .design_shape
@@ -2293,19 +2363,38 @@ impl App {
                     ui.end_row();
                 }
                 ui.label("kind");
-                let mut kind = p.kind;
-                egui::ComboBox::from_id_salt("prim kind")
-                    .selected_text(kind.name())
-                    .show_ui(ui, |ui| {
-                        for k in Kind::ALL {
-                            ui.selectable_value(&mut kind, k, k.name());
+                if p.kind == Kind::Import {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("import  {}", p.file))
+                            .on_hover_text("the .vti file it shows");
+                        if let Some(g) = &p.grid
+                            && ui
+                                .small_button("reset")
+                                .on_hover_text("back where the grid is in its file (no move, no rotation)")
+                                .clicked()
+                        {
+                            p.pos = g.0.centre();
+                            p.rot = [0.0; 3];
+                            new_step = true;
                         }
                     });
-                if kind != p.kind {
-                    p.kind = kind;
-                    p.dims = kind.default_dims(nice(2.0 * p.bound_radius() / 3f32.sqrt()));
+                    ui.end_row();
                 }
-                ui.end_row();
+                let mut kind = p.kind;
+                if p.kind != Kind::Import {
+                    egui::ComboBox::from_id_salt("prim kind")
+                        .selected_text(kind.name())
+                        .show_ui(ui, |ui| {
+                            for k in Kind::ALL {
+                                ui.selectable_value(&mut kind, k, k.name());
+                            }
+                        });
+                    if kind != p.kind {
+                        p.kind = kind;
+                        p.dims = kind.default_dims(nice(2.0 * p.bound_radius() / 3f32.sqrt()));
+                    }
+                    ui.end_row();
+                }
                 ui.label("position");
                 drag3(ui, &mut p.pos, 0.1, "");
                 ui.end_row();
@@ -2407,6 +2496,9 @@ impl App {
         }
         if let Some(k) = add {
             self.add_prim(k);
+        }
+        if let Some(f) = import {
+            self.add_import(&f);
         }
     }
 
@@ -4597,6 +4689,44 @@ mod tests {
         assert_eq!(p[3], ("infill".into(), "15%".into()));
         assert_eq!(p[4], ("supports".into(), "off".into()));
         assert_eq!(p.len(), 5, "an empty printer model is dropped");
+    }
+
+    /// Add an optimization result as an import primitive and move it: saved with its file
+    /// relative to the shape, the grid attached, the bounds following it. Skipped without a GPU.
+    #[test]
+    fn import_primitive_in_editor() {
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("gen3d-editor-import-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        crate::import::tests::write_box(&dir.join("out/r.vti"));
+        let path = dir.join("t.wgsl");
+        std::fs::write(&path, "").unwrap();
+        let mut app = App::new(dir.clone());
+        app.win = Some(Win::new(Arc::new(gpu), VIEW_FORMAT, None));
+        app.open_design(&path, vec![]);
+        assert!(app.loaded, "{:?}", app.error);
+        app.add_import(&dir.join("out/r.vti"));
+        assert!(
+            app.error.is_none() && app.notice.is_none(),
+            "{:?} {:?}",
+            app.error,
+            app.notice
+        );
+        let p = &app.prims()[0];
+        assert_eq!(
+            (p.kind, p.file.as_str(), p.pos),
+            (Kind::Import, "out/r.vti", [0.0, 0.0, 6.0])
+        );
+        assert!(p.grid.is_some() && app.shape.imports.len() == 1);
+        assert_eq!(prims::load(&prims::sidecar(&path)).unwrap()[0].file, "out/r.vti");
+        let mut ps = app.prims();
+        ps[0].pos[0] = 30.0;
+        app.set_prims(ps);
+        assert!(app.shape.bounds.1[0] > 38.0, "bounds follow: {:?}", app.shape.bounds);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Add, click-select, drag along X with the gizmo, undo; through egui input like a user would.

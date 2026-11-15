@@ -79,14 +79,7 @@ pub fn parse(val: &str, dir: &Path) -> Result<Import> {
             _ => bail!("unknown option `{opt}` (array=NAME, iso=X, below, above, fair, no-fair, grow=MM)"),
         }
     }
-    let local = dir.join(file);
-    let path = if local.exists() || Path::new(file).is_absolute() {
-        local
-    } else if Path::new(file).exists() {
-        PathBuf::from(file)
-    } else {
-        bail!("{file}: not found (next to the shape or in the working directory)");
-    };
+    let path = resolve(file, dir)?;
     let (grid, up) = load(&path, &o)?;
     Ok(Import {
         name: name.to_string(),
@@ -94,6 +87,44 @@ pub fn parse(val: &str, dir: &Path) -> Result<Import> {
         grid,
         up,
     })
+}
+
+/// Where `file` (as written in a shape or its sidecar) is: next to the shape (`dir`), else
+/// relative to the working directory.
+pub fn resolve(file: &str, dir: &Path) -> Result<PathBuf> {
+    let local = dir.join(file);
+    if local.exists() || Path::new(file).is_absolute() {
+        Ok(local)
+    } else if Path::new(file).exists() {
+        Ok(PathBuf::from(file))
+    } else {
+        bail!("{file}: not found (next to the shape or in the working directory)");
+    }
+}
+
+/// `path`'s solid with the default options (as Print would mesh it), for an import primitive.
+pub fn load_default(path: &Path) -> Result<Arc<SdfGrid>> {
+    Ok(load(path, &Opts::default())?.0)
+}
+
+/// `path` as a shape in `dir` should refer to it: relative to `dir` when they share a root.
+pub fn relative(path: &Path, dir: &Path) -> String {
+    let (Ok(p), Ok(d)) = (path.canonicalize(), dir.canonicalize()) else {
+        return path.display().to_string();
+    };
+    let (pc, dc): (Vec<_>, Vec<_>) = (p.components().collect(), d.components().collect());
+    let common = pc.iter().zip(&dc).take_while(|(a, b)| a == b).count();
+    if common <= 1 {
+        return p.display().to_string();
+    }
+    let mut out = PathBuf::new();
+    for _ in common..dc.len() {
+        out.push("..");
+    }
+    for c in &pc[common..] {
+        out.push(c);
+    }
+    out.display().to_string()
 }
 
 type Cached = (SystemTime, u64, Opts, Arc<SdfGrid>, Option<crate::mesh::Up>);
@@ -240,7 +271,7 @@ pub fn buffer(gpu: &crate::gpu::Gpu, imports: &[Import]) -> Result<Option<wgpu::
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::mesher::{Grid, sample_field};
     use crate::shape::load_shape;
     use crate::vti::{GridArray, write_grid};
@@ -254,7 +285,7 @@ mod tests {
 
     /// A binary `density` (cell data) of the box |x|, |y| < 4, 2 < z < 10 on 1 mm cells over
     /// [-8, 8] x [-8, 8] x [0, 12], like an optimizer result.
-    fn write_box(path: &std::path::Path) {
+    pub(crate) fn write_box(path: &std::path::Path) {
         let (n, m) = ([16, 16, 12], [17, 17, 13]);
         let mut d = vec![0f32; n.iter().product()];
         for z in 0..n[2] {
@@ -353,6 +384,67 @@ mod tests {
             };
             let d = sample_field(&shape, &far, "map", 1, &gpu).unwrap()[0];
             assert!(d > 21.0 && d < 27.0, "{opt}: {d}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An import primitive, moved and rotated: the GPU's field matches the CPU copy used for
+    /// picking, and the box is where `pos` puts its centre. Skipped without a GPU adapter.
+    #[test]
+    fn import_primitive_moves_and_matches_cpu() {
+        use crate::prims::{Kind, Prim, save, sidecar};
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        let dir = tmp("prim");
+        write_box(&dir.join("r.vti"));
+        let p = dir.join("s.wgsl");
+        std::fs::write(&p, "").unwrap();
+        for rot in [[0.0, 0.0, 0.0], [25.0, -40.0, 70.0]] {
+            let prim = Prim {
+                file: "r.vti".into(),
+                rot,
+                ..Prim::new(Kind::Import, "r".into(), [5.0, 5.0, 20.0], 0.0)
+            };
+            save(&sidecar(&p), &[prim], &[None; 3], None).unwrap();
+            let shape = load_shape(&p, &[]).unwrap();
+            let prim = &shape.prims[0];
+            assert!(prim.grid.is_some());
+            // the grid's box (17 x 17 x 13 mm around the centre) moved to pos, rotated
+            let (lo, hi) = shape.bounds;
+            let pos = [5.0, 5.0, 20.0];
+            assert!(
+                (0..3).all(|k| lo[k] < pos[k] - 6.0 && hi[k] > pos[k] + 6.0),
+                "{rot:?}: {lo:?} {hi:?}"
+            );
+            let grid = Grid {
+                vol: vec![],
+                dims: [9, 9, 9],
+                origin: [-7.0, -7.0, 8.0],
+                step: 3.0,
+            };
+            let gpu_vals = sample_field(&shape, &grid, "map", 1, &gpu).unwrap();
+            let mut i = 0;
+            for x in 0..9 {
+                for y in 0..9 {
+                    for z in 0..9 {
+                        let q = [-7.0 + 3.0 * x as f32, -7.0 + 3.0 * y as f32, 8.0 + 3.0 * z as f32];
+                        let cpu = prim.sdf(q);
+                        assert!(
+                            (cpu - gpu_vals[i]).abs() < 1e-3,
+                            "{rot:?} at {q:?}: cpu {cpu} gpu {}",
+                            gpu_vals[i]
+                        );
+                        i += 1;
+                    }
+                }
+            }
+            // the box's centre (z = 6 in the file) is at pos, well inside (4 mm from the faces; the
+            // faired field is flatter than a distance that deep)
+            let c = prim.sdf([5.0, 5.0, 20.0]);
+            assert!(c < -2.5 && c > -4.5, "{rot:?}: centre {c}");
+            assert!(prim.sdf([0.0, 0.0, 6.0]) > 2.0, "not at the file's position any more");
         }
         std::fs::remove_dir_all(&dir).ok();
     }
