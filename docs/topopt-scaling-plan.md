@@ -31,15 +31,60 @@ Measured on `bracket_domain` at 1.3 mm (62×19×31, 34k domain elements): **~100
     combinations of others are no longer solved, since 2026-11-14), decimated output for the mesher.
     Mirror symmetry is used since 2026-11-14 (one side solved; a hierarchy per load pattern).
     Coarse-to-fine continuation is done (the β = 1 stage on a 2× coarser grid);
-  - getting memory down to ~100 B per element (f16 vectors, or fewer CG vectors). 168 → 143 B
-    (2026-11-15: the fine smoother keeps no diagonal or direction); 188 → 163 B with overhang
-    control, whose filter adds 20 B;
+  - getting memory down to ~100 B per element: 168 → 143 B so far (163 B with overhang control).
+    Breakdown and next steps in "Memory per element" below;
   - memory and time that scale with the domain, not its bounding box: `sparse-grid-plan.md`;
   - fewer, fused passes in the smoother.
   - a smaller OC move limit at high β (now 0.2 throughout). At β = 32 compliance oscillates by about
     ±0.1% per iteration. Since 2026-11-14 the run stops on that (no new best in 3 iterations), but a
     smaller move limit would probably remove the oscillation itself, and might give a slightly
     better final design. Untested.
+
+## Memory per element
+
+Measured per buffer on `bracket_domain` at 0.3 mm (2.8M elements, one load case, overhang control
+on), after the 2026-11-15 smoother change: **163 B per element** (143 B without overhang control).
+
+| what | B/element |
+|---|---|
+| CG vectors `r`, `z`, `p`, `q` and the displacement `u` (3 f32 per node each) | 61.5 |
+| optimizer arrays: `flags`, `x`, `xnew`, `xtilde`, `xphys`, `xused`, `dvs`, `dc`, `dv` | 36 |
+| stored coarse matrices (`mats`; level 2 is 18.8 of it) | 21.9 |
+| overhang filter: `xhat`, `m, r` (vec2), `cc`, `cv` | 20 |
+| `ee`, `ce`, `free` (u32 per node) | 12.1 |
+| coarse-level vectors (`diag`, `b`, `x`, `r`, `d`, levels ≥ 1) | ~9 |
+| tables, coarsest inverse | ~2.4 |
+
+Each extra solved load case adds 12 B (its `u`), and a model with combined cases one `u combined`
+(12 B). Mirror symmetry solves 1/2–1/8 of the grid, so its memory per *grid* element drops
+accordingly; on small grids the fixed-size buffers (one dense coarsest inverse per hierarchy, the
+Galerkin table) dominate.
+
+Done:
+- **The fine smoother's diagonal and direction (−25 B, 2026-11-15).** `cheb_fine` works the diagonal
+  out inline and keeps its direction in CG's q; level 1's mat-vec prolongs on the fly (`apply_p`).
+  Slightly faster than before (see the devlog).
+
+Next steps, in order of value for the risk:
+1. **Drop duplicate optimizer arrays (~8 B, low risk).** `xused` (the densities the last solve used,
+   for output) can be taken from `xphys` before the update, or written out at that point; `dvs`
+   (unfiltered volume sensitivities) can share a buffer that is free at that time, as `dc`'s
+   unfiltered sensitivities share `xnew`. Check every reader first.
+2. **Pack flags and free axes (~7 B, low risk).** `flags` (3 bits per element) and `free` (3 bits per
+   node) are a u32 each; 8 per u32 (4 bits each) saves 3.5 B each. Every kernel that reads them
+   changes, the CPU side not at all.
+3. **Level-2 matrices in f16 (~9 B, moderate risk).** 300 f32 per level-2 element. f16 entries with
+   one f32 scale per element (the largest entry): f16's ~1e-3 relative precision is enough for a
+   preconditioner's coarse level, but rounding must not make the level indefinite. Measure CG
+   iterations per solve and watch for `Diverged` on high-contrast designs (β = 32).
+4. **The overhang filter's `m, r` (~8 B, costs time).** Recompute them in the adjoint pass instead of
+   storing them: one more forward layer sweep per iteration.
+5. **CG vectors in f16 (up to ~30 B, research).** The biggest block. Displacements and residuals span
+   more than f16's range (6e-5 to 65504 normal), so they need a per-vector scale, and CG in reduced
+   precision may need more iterations or stall. Try z and p first (the preconditioned vectors) with
+   r, u in f32. Only worth it if grids past ~60M elements are wanted.
+
+Steps 1–3 would give ~119 B (139 B with overhang control); 100 B needs step 5.
 
 ## Why the solver comes before the hardware
 
