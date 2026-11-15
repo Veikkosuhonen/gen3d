@@ -345,6 +345,9 @@ struct PrimFile {
     /// the side printed up (`mesh::Up`); absent = not chosen (+z)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     up: Option<crate::mesh::Up>,
+    /// optimize in 2D along this axis ('x', 'y' or 'z'); absent = 3D
+    #[serde(default, rename = "2d", skip_serializing_if = "Option::is_none")]
+    plane2d: Option<char>,
     #[serde(default)]
     prims: Vec<Prim>,
 }
@@ -353,7 +356,22 @@ struct PrimFile {
 pub struct Sidecar {
     pub prims: Vec<Prim>,
     pub mirror: Mirror,
+    pub meta: Meta,
+}
+
+/// A sidecar's shape-wide settings besides the primitives and mirror planes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Meta {
+    /// the side printed up
     pub up: Option<crate::mesh::Up>,
+    /// optimize in 2D, projected along this axis (0 x, 1 y, 2 z)
+    pub plane2d: Option<usize>,
+}
+
+impl From<Option<crate::mesh::Up>> for Meta {
+    fn from(up: Option<crate::mesh::Up>) -> Meta {
+        Meta { up, plane2d: None }
+    }
 }
 
 fn no_mirror(m: &Mirror) -> bool {
@@ -433,18 +451,27 @@ pub fn load_file(path: &Path) -> Result<Sidecar> {
             }
         }
     }
+    let plane2d = match file.plane2d {
+        None => None,
+        Some(c) => Some(
+            crate::topopt::parse_axis(&c.to_string())
+                .with_context(|| format!("{}: \"2d\" is '{c}', not 'x', 'y' or 'z'", path.display()))?,
+        ),
+    };
     Ok(Sidecar {
         prims,
         mirror,
-        up: file.up,
+        meta: Meta { up: file.up, plane2d },
     })
 }
 
-pub fn save(path: &Path, prims: &[Prim], mirror: &Mirror, up: Option<crate::mesh::Up>) -> Result<()> {
+pub fn save(path: &Path, prims: &[Prim], mirror: &Mirror, meta: impl Into<Meta>) -> Result<()> {
+    let meta = meta.into();
     let file = PrimFile {
         note: NOTE.into(),
         mirror: *mirror,
-        up,
+        up: meta.up,
+        plane2d: meta.plane2d.map(|a| ['x', 'y', 'z'][a]),
         prims: prims.to_vec(),
     };
     let mut text = serde_json::to_string_pretty(&file)?;
@@ -1125,13 +1152,19 @@ mod tests {
         let mut hole = Prim::new(Kind::Cylinder, "hole".into(), [12.0, 0.0, 5.0], 1.0);
         hole.op = Op::Subtract;
         let mirror: Mirror = [Some(1.0), None, None];
-        save(&sidecar(&p), &[b.clone(), hole], &mirror, Some(crate::mesh::Up::MinusX)).unwrap();
+        let meta = Meta {
+            up: Some(crate::mesh::Up::MinusX),
+            plane2d: Some(1),
+        };
+        save(&sidecar(&p), &[b.clone(), hole], &mirror, meta).unwrap();
+        assert!(std::fs::read_to_string(sidecar(&p)).unwrap().contains("\"2d\": \"y\""));
         let file = load_file(&sidecar(&p)).unwrap();
         assert_eq!((file.prims.len(), file.mirror), (2, mirror));
-        assert_eq!(file.up, Some(crate::mesh::Up::MinusX), "the print orientation is saved");
+        assert_eq!(file.meta, meta, "the print orientation and 2D axis are saved");
 
         let s = load_shape(&p, &[]).unwrap();
         assert_eq!(s.up, Some(crate::mesh::Up::MinusX));
+        assert_eq!((s.plane2d, s.sidecar_meta()), (Some(1), meta));
         assert_eq!(s.mirror, mirror);
         // symmetric about x = 1: the box reaches x = 12 (+ margin), so its twin reaches -10
         let (lo, hi) = s.bounds;

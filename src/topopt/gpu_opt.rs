@@ -195,7 +195,7 @@ pub(super) fn optimize_gpu(
         },
         m: [layer as u32, l as u32, mirror, am.as_ref().map_or(0, |a| a.base as u32)],
         f: {
-            let q = super::overhang::q();
+            let q = am.as_ref().map_or(1.0, |a| a.q);
             let pw = super::overhang::P;
             [
                 pw as f32,
@@ -412,11 +412,16 @@ pub(super) fn optimize_gpu(
         let mut rebuilt = 0.0;
         for (mg, age) in mgs.iter().zip(&mut estimate_age) {
             for c in 0..mg.us.len() {
-                let mut n = mg.solve(c, tol, STALE_CG_ITS)?;
+                let mut n = match mg.solve(c, tol, STALE_CG_ITS) {
+                    // seen on a 2D slab's first fine iteration after a coarse start: as a stall,
+                    // but from zero (a second breakdown is an error)
+                    Err(e) if e.is::<super::gpu_mg::Diverged>() => STALE_CG_ITS,
+                    r => r?,
+                };
                 if n >= STALE_CG_ITS {
-                    // not converged yet: an old λmax estimate may have weakened the smoother, or a
-                    // fresh one come out too low; refresh it (carefully if it was fresh) and carry
-                    // on from where CG got to
+                    // not converged yet (or broke down): an old λmax estimate may have weakened
+                    // the smoother, or a fresh one come out too low; refresh it (carefully if it
+                    // was fresh) and carry on from where CG got to
                     let t = Instant::now();
                     if *age == Some(0) {
                         mg.reestimate_long()?;
@@ -575,6 +580,7 @@ mod tests {
             fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]; 3],
             cases: vec![1, 2, 3],
+            extrude: None,
         };
         let [nx, ny, nz] = n.map(|v| v + 1);
         for k in 0..nz {
@@ -670,6 +676,7 @@ mod tests {
                 symmetry: true,
                 overhang,
                 up,
+                plane2d: None,
             };
             let ms = MgSettings::default();
             let cpu = optimize(&p, &settings(Solver::Multigrid(ms)), &dir.join("cpu.vti"), None).unwrap();

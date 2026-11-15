@@ -315,6 +315,14 @@ enum Cmd {
         /// it, and export / slice / open use it from there
         #[arg(long, value_enum, allow_hyphen_values = true)]
         up: Option<mesh::Up>,
+        /// optimize in 2D: project the problem along this axis (x, y or z), optimize the profile and
+        /// extrude it back. For parts that are a profile of constant thickness, loaded in its plane.
+        /// Default: the shape's (sidecar "2d" or `//! 2d`), else 3D
+        #[arg(long = "2d", value_name = "AXIS", value_parser = ["x", "y", "z"], conflicts_with = "three_d")]
+        two_d: Option<String>,
+        /// optimize in 3D even when the shape says 2D
+        #[arg(long = "3d")]
+        three_d: bool,
         /// density filter radius in voxels (larger = thicker, simpler members)
         #[arg(long, default_value_t = 1.5)]
         rmin: f64,
@@ -684,6 +692,8 @@ fn run(cli: Cli) -> Result<()> {
             no_symmetry,
             no_overhang,
             up,
+            two_d,
+            three_d,
             rmin,
             penal,
             force,
@@ -704,8 +714,14 @@ fn run(cli: Cli) -> Result<()> {
             let shape = load_shape(&s.shape, &defines)?;
             let gpu = gpu::headless()?;
             let on_gpu = matches!(solver.solver(&gpu), topopt::Solver::Gpu(_));
+            let plane2d = match (two_d, three_d) {
+                (Some(a), _) => topopt::parse_axis(&a),
+                (None, true) => None,
+                (None, false) => shape.plane2d,
+            };
             let settings = topopt::Settings {
-                voxel: voxel.unwrap_or_else(|| topopt::auto_voxel(&shape, topopt::auto_elements(on_gpu))) as f64,
+                voxel: voxel.unwrap_or_else(|| topopt::auto_voxel(&shape, topopt::auto_elements(on_gpu), plane2d))
+                    as f64,
                 volfrac,
                 penal,
                 rmin,
@@ -724,6 +740,7 @@ fn run(cli: Cli) -> Result<()> {
                 symmetry: !no_symmetry,
                 overhang: !no_overhang,
                 up: up.or(shape.up).unwrap_or_default(),
+                plane2d,
             };
             let out = output.unwrap_or_else(|| topopt_out(&shape.path, &defines));
             topopt::run(&shape, &settings, &out, &gpu, resume)?;
@@ -762,6 +779,7 @@ fn run(cli: Cli) -> Result<()> {
                     symmetry: true,
                     overhang: false,
                     up: crate::mesh::Up::PlusZ,
+                    plane2d: None,
                 };
                 let problem = topopt::setup(&shape, &settings, &gpu)?;
                 let ne = problem.domain.iter().filter(|d| **d).count();

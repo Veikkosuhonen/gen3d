@@ -65,7 +65,9 @@ fn settings_key(s: &Settings) -> String {
         s.symmetry,
         s.overhang,
         s.up.name()
-    )
+    ) + &s
+        .plane2d
+        .map_or(String::new(), |a| format!(" 2d {}", ["x", "y", "z"][a]))
 }
 
 /// FNV-1a over the model's grid, domain, supports and loads, every group's (stable across builds).
@@ -232,6 +234,7 @@ mod tests {
             symmetry: true,
             overhang: false,
             up: crate::mesh::Up::PlusZ,
+            plane2d: None,
         }
     }
 

@@ -3,6 +3,72 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-15: 2D optimization along an axis
+
+**Why:** many parts are a profile of constant thickness loaded in its own plane (a beam or block
+pushed from the top, a bracket plate). Optimizing them in 3D spends most of the elements on the
+thickness and can give a part that varies through it. Optimizing the profile in 2D and extruding
+it gives a finer profile for the same time, with a constant cross-section.
+
+**What:** (plan: `docs/plane2d-plan.md`)
+- `topopt/plane2d.rs`: `setup` samples the 3D problem as usual, then projects it along the axis
+  into a slab one element thick: domain and kept solid where any element in the column is, supports
+  ORed over the node column, the loads' in-plane components summed (out-of-plane dropped; a case
+  with nothing left is an error). The slab stands for the domain's thickest column (T): loads are
+  scaled by h / T, so stresses and displacements are the part's, and `Model::scale` reports the
+  part's compliance. Pins and the rigid-body check run on the slab.
+- The slab's second node layer is held along the axis: without that its out-of-plane bending
+  (∝ h³) made GPU CG diverge. Holding both layers is plane strain (12% too stiff); holding the first
+  made the multigrid coarse matrix singular (both coarse DOFs interpolate the one free fine DOF).
+- Output: the result is written on the 3D grid, each 3D domain element getting its column's
+  values, so the 3D domain cuts it again. At most 24 cells along the axis (`vti::write_grid` takes
+  per-axis spacing; readers already did): the beam's file went from 219 MB to 59 MB, its export
+  from 2.6 s to 0.75 s, same volume. FieldData `plane2d` records the axis.
+- AM filter: Q for 3 supports on a grid one element across in a lateral axis (Langelaar's 2D
+  filter), CPU and GPU (the GPU takes Q from `Am`).
+- Settings: `--2d x|y|z` / `--3d`, `//! 2d y`, sidecar `"2d"` (`prims::Meta` now carries `up` and
+  the axis), the app's *Design space* dropdown in Optimize (saved like *printed … up*; the element
+  count shows the profile's). Checkpoint key includes the axis; a mirror plane across the axis is
+  dropped; the solver's element limit counts the slab.
+- `auto_voxel`: a third of the 3D element count in the profile (100k on the GPU), at most 50M cells
+  sampled in 3D.
+- Fixes found on the bracket in 2D (after a coarse start): the GPU's f32 coarse matrix had a
+  mechanism (a 1e-9 void link lost next to solid), the banded Cholesky clamped its pivot to 1e-300,
+  and the dense inverse's 1e150 became inf in f32. Collapsed pivots (below 1e-6 of the diagonal for
+  GPU matrices, 1e-12 for CPU ones) now drop the DOF from the coarse solve. A GPU CG breakdown
+  (NaN) now restarts once from zero after a careful λmax re-estimate instead of failing.
+- `shapes/beam_2d.wgsl`: the MBB beam (120 × 20 × 40 mm, pads at both bottom ends, load on top),
+  `//! 2d y`.
+
+**Result:** (Apple M1 Pro, GPU, overhang control on)
+
+| beam_2d | elements | compliance | time |
+|---|---|---|---|
+| 3D, auto (0.69 mm) | 293k | 41.59 N·mm | 22.9 s |
+| 2D, auto (0.22 mm) | 99k in the profile | 41.85 N·mm | 29.8 s |
+| 2D, 0.18 mm | 148k | 40.91 N·mm | 45.6 s |
+
+Without overhang control the solid-ish start agrees with 3D to 1–2% (beam at iteration 1: 933 vs
+925 N·mm at 1 mm). Multigrid needs 3–4 CG iterations on the slab. The bracket in 2D along y
+finishes at 14.5 N·mm (3D: 7.88): its bolt holes run along x, the kind of problem 2D gets wrong,
+but it runs. The 3D bracket is unchanged by the Cholesky change (7.8775 in 115 iterations).
+
+**Verified:** `plane2d::projects_and_extrudes` (projection rules, out-of-plane hold, extrusion,
+coarser written grid), `slab_matches_the_solid_beam` (slab vs 3D compliance within 5%, MGCG < 30
+iterations), `slab_gpu_matches_cpu` (overhang across the slab, per-iteration compliance within
+2e-3, result constant through the thickness), `mirrored_primitives` (sidecar `"2d"`),
+`write_grid_round_trips` (per-axis spacing). All tests pass; clippy clean. App checked with
+`snapshot` (the dropdown and the profile's element count).
+
+**Still open:**
+- One thickness for the whole slab; a per-column thickness would handle domains that aren't prisms
+  better.
+- 2D with overhang control can oscillate in its first iterations (the bracket: 403, 184, 207, 136,
+  ...; 3D falls steadily). It settles, but a coarse start can hand over a half-formed design.
+- Axisymmetric (revolved) 2D.
+- A slab element costs ~3× a 3D one per iteration (setup ~0.15 s at 100–150k): the multigrid
+  setup on slabs hasn't been profiled.
+
 ## 2026-11-14: Save the print orientation with the shape and the result
 
 **Why:** the print orientation was a session setting: reopening the app reset it to +z, the CLI

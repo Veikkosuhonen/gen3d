@@ -41,6 +41,11 @@ pub struct Shape {
     pub up: Option<crate::mesh::Up>,
     /// The sidecar's own `"up"` (what saving the sidecar keeps).
     pub sidecar_up: Option<crate::mesh::Up>,
+    /// Optimize in 2D, projected along this axis (0 x, 1 y, 2 z), when the shape says (the
+    /// sidecar's `"2d"`, else `//! 2d`). None: 3D.
+    pub plane2d: Option<usize>,
+    /// The sidecar's own `"2d"`.
+    pub sidecar_plane2d: Option<usize>,
     /// Whether the editor's code is part of `source` (the sidecar file exists).
     pub editor: bool,
     /// Whether the script itself defines `fn map` (without one, the primitives are the shape).
@@ -100,6 +105,8 @@ impl Shape {
             mirror: [None; 3],
             up: None,
             sidecar_up: None,
+            plane2d: None,
+            sidecar_plane2d: None,
             editor: false,
             script_map: true,
             base_bounds: ([-50.0, -50.0, 0.0], [50.0, 50.0, 100.0]),
@@ -112,6 +119,14 @@ impl Shape {
     /// The editor's sidecar file for this shape (it may not exist yet).
     pub fn prims_path(&self) -> PathBuf {
         prims::sidecar(&self.path)
+    }
+
+    /// The settings the sidecar holds (what saving it keeps).
+    pub fn sidecar_meta(&self) -> prims::Meta {
+        prims::Meta {
+            up: self.sidecar_up,
+            plane2d: self.sidecar_plane2d,
+        }
     }
 
     /// Replace the primitives' values without regenerating the source: valid while the kinds and
@@ -726,6 +741,9 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
                 }
                 shape.bounds = ([v[0], v[1], v[2]], [v[3], v[4], v[5]]);
             }
+            "2d" => {
+                shape.plane2d = Some(crate::topopt::parse_axis(val).ok_or_else(|| bad("expected x, y or z"))?);
+            }
             "up" => {
                 shape.up = Some(crate::mesh::Up::parse(val).ok_or_else(|| bad("expected +z, -z, +x, -x, +y or -y"))?);
             }
@@ -756,9 +774,13 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
     if sidecar.exists() || !has_code(&read_file(&path)?) {
         if sidecar.exists() {
             let file = prims::load_file(&sidecar)?;
-            (shape.prims, shape.mirror, shape.sidecar_up) = (file.prims, file.mirror, file.up);
-            if file.up.is_some() {
-                shape.up = file.up;
+            (shape.prims, shape.mirror) = (file.prims, file.mirror);
+            (shape.sidecar_up, shape.sidecar_plane2d) = (file.meta.up, file.meta.plane2d);
+            if file.meta.up.is_some() {
+                shape.up = file.meta.up;
+            }
+            if file.meta.plane2d.is_some() {
+                shape.plane2d = file.meta.plane2d;
             }
         }
         shape.editor = true;
@@ -783,7 +805,7 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
         shape.bc = fixed || load || keep;
         // the optimizer sets g3d_reach from its element size; this default is for the preview (with
         // the GPU solver's automatic size, the usual case)
-        let reach = 1.5 * crate::topopt::auto_voxel(&shape, crate::topopt::auto_elements(true));
+        let reach = 1.5 * crate::topopt::auto_voxel(&shape, crate::topopt::auto_elements(true), shape.plane2d);
         shape.files.push(sidecar);
         let idx = shape.files.len();
         shape.files.push(library_path("editor.wgsl"));

@@ -38,9 +38,11 @@ pub(super) const SUPPORTS: usize = 5;
 /// The supports' offsets in the layer below, along the layer's two axes (`Am::lateral`).
 pub(super) const STENCIL: [[isize; 2]; SUPPORTS] = [[0, 0], [-1, 0], [1, 0], [0, -1], [0, 1]];
 
-/// `smax`'s root: Q = P + ln N / ln ξ0 with ξ0 = 0.5, so that N supports of density 0.5 give 0.5.
-pub(super) fn q() -> f64 {
-    P + (SUPPORTS as f64).ln() / 0.5f64.ln()
+/// `smax`'s root for `supports` supports per element: Q = P + ln N / ln ξ0 with ξ0 = 0.5, so that
+/// N supports of density 0.5 give 0.5. (With a Q for more supports than there are, densities below
+/// ~0.6 fade layer by layer going up: a uniform 0.3 start lost most of its stiffness on a 2D slab.)
+pub(super) fn q(supports: usize) -> f64 {
+    P + (supports as f64).ln() / 0.5f64.ln()
 }
 
 /// Smooth minimum of a and b (≈ min, exact when a = b = 0). Never below 0 for a, b ≥ 0, but
@@ -66,6 +68,9 @@ pub(super) struct Am {
     pub base: usize,
     /// the lateral axes have a mirror plane on their low face
     mirror: [bool; 2],
+    /// `smax`'s root (`q`): for the 5-element cross, or 3 on a grid one element across in a
+    /// lateral axis (a 2D slab: Langelaar's 2D filter)
+    pub q: f64,
 }
 
 /// The filter's forward pass: printed densities, and per element its supports' largest density m
@@ -78,13 +83,9 @@ pub(super) struct Printed {
     pub r: Vec<f64>,
 }
 
-/// smax of supports with largest density m and r = Σ (ξ / m)^P.
-fn smax(m: f64, r: f64) -> f64 {
-    if m <= 0.0 {
-        0.0
-    } else {
-        m.powf(P / q()) * r.powf(1.0 / q())
-    }
+/// smax of supports with largest density m and r = Σ (ξ / m)^P, with root q.
+fn smax(m: f64, r: f64, q: f64) -> f64 {
+    if m <= 0.0 { 0.0 } else { m.powf(P / q) * r.powf(1.0 / q) }
 }
 
 impl Am {
@@ -101,6 +102,7 @@ impl Am {
             lateral,
             base: 0,
             mirror: lateral.map(|a| mirror[a]),
+            q: q(1 + 2 * lateral.iter().filter(|&&a| p.n[a] > 1).count()),
         };
         am.base = (0..p.n[b])
             .find(|&l| am.layer(l).any(|(_, _, e)| p.domain[e]))
@@ -163,7 +165,7 @@ impl Am {
                     max[e] = m;
                     r[e] = self.supports(u, v, l - 1).map(|n| (xi[n] / m).powf(P)).sum();
                 }
-                xi[e] = smin(x[e], smax(max[e], r[e]));
+                xi[e] = smin(x[e], smax(max[e], r[e], self.q));
             }
         }
         Printed { xi, max, r }
@@ -172,7 +174,7 @@ impl Am {
     /// Chain rule through the filter: from df/dξ (`d`), df/dx for the design elements (0 elsewhere).
     /// `x` and `fw` are the forward pass's input and result.
     pub fn sensitivities(&self, p: &Problem, x: &[f64], fw: &Printed, d: &[f64]) -> Vec<f64> {
-        let q = q();
+        let q = self.q;
         // λ = df/dξ including the layers above, complete for layer l when it is reached
         let mut lam = d.to_vec();
         let mut out = vec![0.0; x.len()];
@@ -186,7 +188,7 @@ impl Am {
                     continue;
                 }
                 let (m, r) = (fw.max[e], fw.r[e]);
-                let sm = smax(m, r);
+                let sm = smax(m, r, q);
                 let (da, db) = smin_deriv(x[e], sm);
                 out[e] = lam[e] * da;
                 if m <= 0.0 {

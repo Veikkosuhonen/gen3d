@@ -380,6 +380,8 @@ struct App {
     /// the side of the part that faces up on the printer: the build direction of Optimize's overhang
     /// control, and how Print turns the mesh (`--up`)
     up: Up,
+    /// Optimize in 2D, projected along this axis (`--2d`); None: 3D
+    plane2d: Option<usize>,
     slicer: Option<(slicer::Kind, PathBuf)>,
     browser: Browser,
     /// What the viewport shows (the design's shape, or a grid's generated shape).
@@ -933,6 +935,7 @@ impl App {
             opt: OptUi::default(),
             print: PrintUi::default(),
             up: Up::PlusZ,
+            plane2d: None,
             slicer: slicer::find_slicer(None),
             browser: Browser::new(cwd.clone()),
             shape: Shape::placeholder(&cwd),
@@ -1002,6 +1005,7 @@ impl App {
         self.step = Step::Design;
         self.print_result = false;
         self.up = Up::PlusZ;
+        self.plane2d = None;
         self.defines = defines;
         self.vopts = VolumeOpts::default();
         self.volume = None;
@@ -1225,6 +1229,9 @@ impl App {
             if let Some(u) = shape.up {
                 self.up = u;
             }
+            if shape.plane2d.is_some() {
+                self.plane2d = shape.plane2d;
+            }
             self.design_shape = Some(shape.clone());
             self.design_fields = fields.clone();
         }
@@ -1441,7 +1448,7 @@ impl App {
                 .iter()
                 .zip(&old)
                 .any(|(a, b)| a.kind != b.kind || a.hidden != b.hidden || a.role != b.role);
-        if let Err(e) = prims::save(&path, &new, &shape.mirror, shape.sidecar_up) {
+        if let Err(e) = prims::save(&path, &new, &shape.mirror, shape.sidecar_meta()) {
             self.notice = Some(format!("{e:#}"));
             return;
         }
@@ -1476,7 +1483,11 @@ impl App {
             return;
         }
         let path = shape.prims_path();
-        if let Err(e) = prims::save(&path, &shape.prims, &shape.mirror, Some(self.up)) {
+        let meta = prims::Meta {
+            up: Some(self.up),
+            ..shape.sidecar_meta()
+        };
+        if let Err(e) = prims::save(&path, &shape.prims, &shape.mirror, meta) {
             self.notice = Some(format!("{e:#}"));
             return;
         }
@@ -1487,12 +1498,41 @@ impl App {
         }
     }
 
+    /// Keep the chosen 2D / 3D design space with the shape, like `save_up`.
+    fn save_plane2d(&mut self) {
+        let Some(shape) = &self.design_shape else { return };
+        if !shape.editor {
+            if shape.plane2d != self.plane2d {
+                let file = shape.path.file_name().unwrap_or_default().to_string_lossy();
+                self.notice = Some(match self.plane2d {
+                    Some(a) => format!("To keep 2D, add `//! 2d {}` to {file}.", ["x", "y", "z"][a]),
+                    None => format!("To keep 3D, remove the `//! 2d` line from {file}."),
+                });
+            }
+            return;
+        }
+        let path = shape.prims_path();
+        let meta = prims::Meta {
+            plane2d: self.plane2d,
+            ..shape.sidecar_meta()
+        };
+        if let Err(e) = prims::save(&path, &shape.prims, &shape.mirror, meta) {
+            self.notice = Some(format!("{e:#}"));
+            return;
+        }
+        self.mtimes.insert(path.clone(), mtime(&path));
+        if let Some(s) = &mut self.design_shape {
+            s.plane2d = self.plane2d;
+            s.sidecar_plane2d = self.plane2d;
+        }
+    }
+
     /// Save new mirror planes to the sidecar and show them (the generated code changes: a reload).
     fn set_mirror(&mut self, mirror: prims::Mirror) {
         let Some(shape) = &self.design_shape else { return };
         let path = shape.prims_path();
         let prims = if shape.editor { shape.prims.clone() } else { vec![] };
-        if let Err(e) = prims::save(&path, &prims, &mirror, shape.sidecar_up) {
+        if let Err(e) = prims::save(&path, &prims, &mirror, shape.sidecar_meta()) {
             self.notice = Some(format!("{e:#}"));
             return;
         }
@@ -2582,9 +2622,9 @@ impl App {
             return;
         };
         let o = &self.opt;
-        let vox = o
-            .voxel
-            .unwrap_or_else(|| crate::topopt::auto_voxel(shape, crate::topopt::auto_elements(self.gpu_solver)));
+        let vox = o.voxel.unwrap_or_else(|| {
+            crate::topopt::auto_voxel(shape, crate::topopt::auto_elements(self.gpu_solver), self.plane2d)
+        });
         let mut a = vec![design.display().to_string()];
         for (k, v) in &self.defines {
             a.extend(["-D".into(), format!("{k}={v}")]);
@@ -2606,6 +2646,11 @@ impl App {
         }
         // always: without it the file's own orientation would apply
         a.push(format!("--up={}", self.up.name()));
+        // always: without it the file's own 2D setting would apply
+        match self.plane2d {
+            Some(ax) => a.extend(["--2d".into(), ["x", "y", "z"][ax].into()]),
+            None => a.push("--3d".into()),
+        }
         if o.ground != Ground::None {
             a.extend(["--ground".into(), o.ground.name().into()]);
         }
@@ -3407,6 +3452,37 @@ impl App {
                     self.save_up();
                 }
             });
+            ui.horizontal(|ui| {
+                ui.label("Design space").on_hover_text(
+                    "2D: the problem is flattened along an axis (domain, supports and loads seen \
+                     through the part), the profile is optimized, and the result is extruded back \
+                     through the design domain. About 4x finer than 3D in the same time, and right for parts \
+                     of constant thickness loaded in their own plane (a plate or a block pushed from \
+                     the side, top or front). Wrong for anything else: forces along the axis are \
+                     ignored.",
+                );
+                let before = self.plane2d;
+                let name = |p: Option<usize>| match p {
+                    None => "3D".to_string(),
+                    Some(a) => format!("2D along {}", ["X", "Y", "Z"][a]),
+                };
+                egui::ComboBox::from_id_salt("opt_plane2d")
+                    .selected_text(name(self.plane2d))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.plane2d, None, "3D");
+                        for ax in 0..3 {
+                            ui.selectable_value(&mut self.plane2d, Some(ax), name(Some(ax)))
+                                .on_hover_text(format!(
+                                    "a profile in the {} plane, extruded along {}",
+                                    ["YZ", "XZ", "XY"][ax],
+                                    ["X", "Y", "Z"][ax]
+                                ));
+                        }
+                    });
+                if self.plane2d != before {
+                    self.save_plane2d();
+                }
+            });
         });
         if self.design_shape.as_ref().is_some_and(|s| s.editor) && !self.opt_job.running() {
             ui.horizontal_wrapped(|ui| {
@@ -3448,7 +3524,7 @@ impl App {
         let running_here = job.running && mine;
 
         section(ui, "Settings");
-        let auto = crate::topopt::auto_voxel(&shape, crate::topopt::auto_elements(self.gpu_solver));
+        let auto = crate::topopt::auto_voxel(&shape, crate::topopt::auto_elements(self.gpu_solver), self.plane2d);
         ui.add_enabled_ui(!running_here, |ui| {
             let o = &mut self.opt;
             egui::Grid::new("opt").num_columns(2).show(ui, |ui| {
@@ -3519,9 +3595,18 @@ impl App {
         let n: usize = shape
             .size()
             .iter()
-            .map(|s| (*s / vox).ceil().max(1.0) as usize)
+            .enumerate()
+            .filter(|(a, _)| Some(*a) != self.plane2d)
+            .map(|(_, s)| (*s / vox).ceil().max(1.0) as usize)
             .product();
-        ui.weak(format!("≤ {n} elements (only those inside the domain are solved)"));
+        let plane = if self.plane2d.is_some() {
+            " in the 2D profile"
+        } else {
+            ""
+        };
+        ui.weak(format!(
+            "≤ {n} elements{plane} (only those inside the domain are solved)"
+        ));
         ui.add_space(6.0);
 
         if running_here {

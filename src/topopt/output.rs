@@ -19,6 +19,9 @@ use rayon::prelude::*;
 
 use super::symmetry::{Model, Sym};
 
+/// FieldData of a 2D result: the axis it was projected along, as a unit vector.
+pub(crate) const PLANE2D: &str = "plane2d";
+
 /// Grids with more elements than this get a decimated, density-only live preview.
 pub(super) const PREVIEW_CELLS: usize = 4_000_000;
 
@@ -58,7 +61,8 @@ pub(super) fn stop_requested() -> bool {
 struct Grid {
     n: [usize; 3],
     origin: [f64; 3],
-    h: f64,
+    /// per axis
+    spacing: [f64; 3],
     /// displacement array names, per load case
     names: Vec<String>,
     /// a reduced (symmetric) model: its fields are mirrored onto this grid, and each case's
@@ -67,6 +71,8 @@ struct Grid {
     sym: Option<Sym>,
     /// the print orientation, recorded in the file
     up: crate::mesh::Up,
+    /// a 2D model: its (full, mirrored) slab's fields are extruded onto this, the 3D grid
+    extrude: Option<std::sync::Arc<super::plane2d::Extrude>>,
 }
 
 /// One iteration's output fields (`filtered`, `energy` and `disps` empty for a density-only
@@ -85,16 +91,18 @@ pub(super) struct Snapshot {
 impl Grid {
     fn of(m: &Model) -> Grid {
         let p = m.p();
-        let (n, origin) = match &m.sym {
-            Some(s) => (s.full_n, s.full_origin),
-            None => (p.n, p.origin),
+        let (n, origin, spacing) = match (&p.extrude, &m.sym) {
+            (Some(x), _) => (x.n, x.origin, x.spacing),
+            (None, Some(s)) => (s.full_n, s.full_origin, [p.h; 3]),
+            (None, None) => (p.n, p.origin, [p.h; 3]),
         };
         Grid {
             n,
             origin,
-            h: p.h,
+            spacing,
             sym: m.sym.clone(),
             up: crate::mesh::Up::PlusZ,
+            extrude: p.extrude.clone(),
             names: p
                 .cases
                 .iter()
@@ -110,16 +118,28 @@ impl Grid {
         }
     }
 
-    /// A cell array on this grid (mirrored from the reduced one).
-    fn cells<'a>(&self, v: &'a [f32]) -> std::borrow::Cow<'a, [f32]> {
-        match &self.sym {
-            Some(sym) if !v.is_empty() => sym.expand_cells(v).into(),
-            _ => v.into(),
+    /// A cell array on this grid (mirrored from the reduced one, extruded from a 2D slab with
+    /// `outside` off the 3D domain).
+    fn cells<'a>(&self, v: &'a [f32], outside: f32) -> std::borrow::Cow<'a, [f32]> {
+        if v.is_empty() {
+            return v.into();
+        }
+        let v: std::borrow::Cow<[f32]> = match &self.sym {
+            Some(sym) => sym.expand_cells(v).into(),
+            None => v.into(),
+        };
+        match &self.extrude {
+            Some(x) => x.cells(&v, outside).into(),
+            None => v,
         }
     }
 
     fn write(&self, s: &Snapshot, out: &Path) -> Result<u64> {
-        let (density, filtered, energy) = (self.cells(&s.density), self.cells(&s.filtered), self.cells(&s.energy));
+        let (density, filtered, energy) = (
+            self.cells(&s.density, 0.0),
+            self.cells(&s.filtered, f32::NAN),
+            self.cells(&s.energy, 0.0),
+        );
         let disps: Vec<std::borrow::Cow<[f32]>> = match &self.sym {
             Some(sym) if !s.disps.is_empty() => {
                 let cases = self.names.len();
@@ -131,6 +151,10 @@ impl Grid {
                     .collect()
             }
             _ => s.disps.iter().map(|d| d[..].into()).collect(),
+        };
+        let disps: Vec<std::borrow::Cow<[f32]>> = match &self.extrude {
+            Some(x) => disps.iter().map(|d| x.points(d).into()).collect(),
+            None => disps,
         };
         let mut arrays = vec![crate::vti::GridArray {
             name: "density",
@@ -162,14 +186,18 @@ impl Grid {
                 data,
             });
         }
-        crate::vti::write_grid(
-            out,
-            self.origin,
-            self.h,
-            self.n.map(|v| v + 1),
-            &arrays,
-            &[(crate::volume::PRINT_UP, &self.up.vector())],
-        )
+        let up = self.up.vector();
+        // a 2D result: the axis it was projected along
+        let axis = self.extrude.as_ref().map(|x| {
+            let mut v = [0.0; 3];
+            v[x.axis] = 1.0;
+            v
+        });
+        let mut field: Vec<(&str, &[f32])> = vec![(crate::volume::PRINT_UP, &up)];
+        if let Some(a) = &axis {
+            field.push((PLANE2D, a));
+        }
+        crate::vti::write_grid(out, self.origin, self.spacing, self.n.map(|v| v + 1), &arrays, &field)
     }
 
     /// The density averaged over k³ blocks of cells, on a grid k× coarser.
@@ -195,10 +223,11 @@ impl Grid {
         let g = Grid {
             n: nc,
             origin: self.origin,
-            h: self.h * k as f64,
+            spacing: self.spacing.map(|s| s * k as f64),
             names: vec![],
             sym: None,
             up: self.up,
+            extrude: None,
         };
         (g, out)
     }
@@ -281,7 +310,7 @@ impl Output {
         self.writer = Some(std::thread::spawn(move || {
             let t = Instant::now();
             let bytes = if k > 1 {
-                let (g, d) = grid.decimate(&grid.cells(&s.density), k);
+                let (g, d) = grid.decimate(&grid.cells(&s.density, 0.0), k);
                 g.write(
                     &Snapshot {
                         density: d,
@@ -324,15 +353,16 @@ mod tests {
         let g = Grid {
             n: [5, 2, 3],
             origin: [1.0, 2.0, 3.0],
-            h: 0.5,
+            spacing: [0.5; 3],
             names: vec![],
             sym: None,
             up: crate::mesh::Up::PlusZ,
+            extrude: None,
         };
         let d: Vec<f32> = (0..30).map(|i| i as f32).collect();
         let (c, v) = g.decimate(&d, 2);
         assert_eq!(c.n, [3, 1, 2]);
-        assert_eq!(c.h, 1.0);
+        assert_eq!(c.spacing, [1.0; 3]);
         // block (0,0,0): cells x 0-1, y 0-1, z 0-1
         let want: f32 = [0, 1, 5, 6, 10, 11, 15, 16].iter().map(|&i| i as f32).sum::<f32>() / 8.0;
         assert_eq!(v[0], want);

@@ -982,7 +982,7 @@ mod tests {
         crate::vti::write_grid(
             path,
             [0.0; 3],
-            1.0,
+            [1.0; 3],
             n.map(|v| v + 1),
             &[arr("density", &dens), arr(FILTERED, &filt)],
             &[(PRINT_UP, &crate::mesh::Up::MinusX.vector())],

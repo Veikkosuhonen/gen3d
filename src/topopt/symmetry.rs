@@ -61,9 +61,15 @@ impl Model {
         &self.groups[0]
     }
 
-    /// Full compliance per reduced compliance (2^planes).
-    pub fn scale(&self) -> f64 {
+    /// How many copies of the model's grid make the whole grid (2^planes).
+    pub fn copies(&self) -> f64 {
         self.sym.as_ref().map_or(1.0, |s| (1u32 << s.k()) as f64)
+    }
+
+    /// The whole part's compliance per the model's: 2^planes, and for a 2D slab the thickness it
+    /// stands for, in elements (its loads are scaled down by that, see `plane2d.rs`).
+    pub fn scale(&self) -> f64 {
+        self.copies() * self.p().extrude.as_ref().map_or(1.0, |x| x.layers as f64)
     }
 
     /// The axes the filter reflects at the grid's low face.
@@ -309,6 +315,7 @@ pub(crate) fn reduce(full: &Problem, axes: [bool; 3]) -> Result<Model, String> {
                 fixed,
                 loads,
                 cases: full.cases.clone(),
+                extrude: full.extrude.clone(),
             });
         }
     }

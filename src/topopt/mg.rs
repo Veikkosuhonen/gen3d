@@ -283,6 +283,8 @@ struct Banded {
     l: Vec<f64>,
     /// node index -> position in the band ordering
     perm: Vec<usize>,
+    /// per position: left out of the solve (a mechanism, see `factor`)
+    dropped: Vec<bool>,
 }
 
 /// Node ordering for a small band: the axis with the most nodes slowest.
@@ -301,7 +303,12 @@ fn direct_flops(n: [usize; 3]) -> f64 {
 }
 
 impl Banded {
-    fn factor(level: &Coarse) -> Banded {
+    /// Factor a level. A DOF whose pivot falls to `drop` × its diagonal or below is a mechanism
+    /// (in the matrix as given: rounding can make one, e.g. the GPU's f32 sums losing a void
+    /// element's 1e-9 stiffness next to solid ones): it is left out of the solve (its row and
+    /// column zeroed, the solution 0 there) rather than divided by ~0, which put 1e150 into the
+    /// inverse and inf into its f32 copy (a 2D slab's GPU run after a coarse start).
+    fn factor(level: &Coarse, drop: f64) -> Banded {
         let (axes, bw) = band_order(level.n);
         let nn = level.n.map(|v| v + 1);
         let nodes = level.nodes();
@@ -337,23 +344,40 @@ impl Banded {
                 l[i * w + bw] = 1.0;
             }
         }
+        let mut dropped = vec![false; n];
         for i in 0..n {
             let j0 = i.saturating_sub(bw);
+            let diag = l[i * w + bw];
             for j in j0..=i {
+                if dropped[j] && j < i {
+                    l[i * w + bw - (i - j)] = 0.0;
+                    continue;
+                }
                 let k0 = j0.max(j.saturating_sub(bw));
                 let mut s = l[i * w + bw - (i - j)];
                 for k in k0..j {
                     s -= l[i * w + bw - (i - k)] * l[j * w + bw - (j - k)];
                 }
                 if i == j {
-                    // a semidefinite pivot (a mechanism) would be ~0: keep it finite
-                    l[i * w + bw] = s.max(1e-300).sqrt();
+                    if s <= drop * diag {
+                        dropped[i] = true;
+                        l[i * w..i * w + w].fill(0.0);
+                        l[i * w + bw] = 1.0;
+                    } else {
+                        l[i * w + bw] = s.sqrt();
+                    }
                 } else {
                     l[i * w + bw - (i - j)] = s / l[j * w + bw];
                 }
             }
         }
-        Banded { n, bw, l, perm }
+        Banded {
+            n,
+            bw,
+            l,
+            perm,
+            dropped,
+        }
     }
 
     fn solve(&self, b: &[f64], x: &mut [f64]) {
@@ -375,6 +399,11 @@ impl Banded {
                 s -= self.l[k * w + bw - (k - i)] * y[k];
             }
             y[i] = s / self.l[i * w + bw];
+        }
+        for (i, d) in self.dropped.iter().enumerate() {
+            if *d {
+                y[i] = 0.0;
+            }
         }
         for (m, &p) in self.perm.iter().enumerate() {
             x[3 * m..3 * m + 3].copy_from_slice(&y[3 * p..3 * p + 3]);
@@ -423,7 +452,8 @@ pub(super) fn dense_inverse(n: [usize; 3], mats: Vec<f64>) -> Vec<f64> {
         .iter()
         .map(|&d| if d > 0.0 { 1.0 / d } else { 0.0 })
         .collect();
-    let chol = Banded::factor(&l);
+    // (the GPU's levels are summed in f32: a pivot that loses 6 digits is rounding)
+    let chol = Banded::factor(&l, 1e-6);
     let nd = 3 * l.nodes();
     let mut inv = vec![0.0; nd * nd];
     // A⁻¹ is symmetric, so its columns are its rows
@@ -547,7 +577,7 @@ impl<'a> Multigrid<'a> {
             let next = Coarse::from_coarse(last);
             coarse.push(next);
         }
-        let bottom = Banded::factor(coarse.last().unwrap());
+        let bottom = Banded::factor(coarse.last().unwrap(), 1e-12);
         let mut mg = Multigrid {
             fem,
             fine_inv: fem.inv_diag(),
@@ -828,6 +858,7 @@ mod tests {
             fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]],
             cases: vec![1],
+            extrude: None,
         };
         let [nx, ny, _] = p.nodes();
         for j in 0..ny {
@@ -931,7 +962,7 @@ mod tests {
         let ke = super::super::hex_ke(0.3);
         let fem = fem(&p, &ke);
         let c = Coarse::from_fine(&fem);
-        let chol = Banded::factor(&c);
+        let chol = Banded::factor(&c, 1e-12);
         let n = 3 * c.nodes();
         let b: Vec<f64> = pseudo(n, 3)
             .iter()

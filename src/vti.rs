@@ -143,11 +143,11 @@ pub struct GridArray<'a> {
 /// defaults to the first array shows them. The file is written to a temporary name and renamed into
 /// place, so a viewer reloading it never sees a half-written file. Returns the file size.
 /// `field`: whole-dataset values (VTK FieldData, one tuple each, written as ascii), e.g. an
-/// optimizer result's `print_up`.
+/// optimizer result's `print_up`. `spacing` is per axis.
 pub fn write_grid(
     path: &Path,
     origin: [f64; 3],
-    spacing: f64,
+    spacing: [f64; 3],
     points: [usize; 3],
     arrays: &[GridArray],
     field: &[(&str, &[f32])],
@@ -199,7 +199,7 @@ pub fn write_grid(
             w,
             r#"<?xml version="1.0"?>
 <VTKFile type="ImageData" version="1.0" byte_order="LittleEndian" header_type="UInt64">
-  <ImageData WholeExtent="{extent}" Origin="{} {} {}" Spacing="{spacing} {spacing} {spacing}" Direction="1 0 0 0 1 0 0 0 1">
+  <ImageData WholeExtent="{extent}" Origin="{} {} {}" Spacing="{} {} {}" Direction="1 0 0 0 1 0 0 0 1">
 {field_xml}    <Piece Extent="{extent}">
       <CellData>
 {}      </CellData>
@@ -209,7 +209,7 @@ pub fn write_grid(
   </ImageData>
   <AppendedData encoding="raw">
    _"#,
-            origin[0], origin[1], origin[2], xml[0], xml[1]
+            origin[0], origin[1], origin[2], spacing[0], spacing[1], spacing[2], xml[0], xml[1]
         )?;
         for a in order {
             w.write_all(&(a.data.len() as u64 * 4).to_le_bytes())?;
@@ -669,7 +669,7 @@ mod tests {
         write_grid(
             &p,
             [1.0, 2.0, 3.0],
-            0.5,
+            [0.5, 0.5, 0.25],
             [3, 2, 2],
             &arrays,
             &[("print_up", &[-1.0, 0.0, 0.0])],
@@ -679,7 +679,7 @@ mod tests {
         assert_eq!(f.arrays[0].name, "rho"); // cell data first
         assert_eq!(f.arrays[0].data, cells);
         assert_eq!(f.arrays[1].data, pts);
-        assert_eq!(f.lattice(true).0, [1.25, 2.25, 3.25]);
+        assert_eq!(f.lattice(true).0, [1.25, 2.25, 3.125]);
         assert_eq!(f.field, vec![("print_up".to_string(), vec![-1.0, 0.0, 0.0])]);
         std::fs::remove_dir_all(&dir).ok();
     }

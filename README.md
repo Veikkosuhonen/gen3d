@@ -54,6 +54,7 @@ Directives (`//! key value`, anywhere in the main file):
 | `decimate 0.5` | keep this fraction of triangles after meshing |
 | `slicer ../printers/x.ini` | slicer config(s) for this shape |
 | `range NAME min max` | slider range for parameter `NAME` in the viewer (one line per parameter) |
+| `2d y` | optimize in 2D, projected along this axis (`x` `y` `z`), see [2D optimization](#2d-optimization) (an editor shape keeps it in its sidecar's `"2d"` instead) |
 | `up -x` | the side printed up (`+z` `-z` `+x` `-x` `+y` `-y`): Optimize's overhang control and Print's mesh orientation default to it (an editor shape keeps it in its sidecar's `"up"` instead) |
 
 `#include "file.wgsl"` resolves relative to the shape first, then the built-in library (compiled into the
@@ -176,8 +177,9 @@ camera presets, section view, bounds box, clipping and render resolution.
 - **2 Optimize** (for shapes with `field_fixed` and `field_load`, see
   [Topology optimization](#topology-optimization)): material share, load, element size, minimum member
   size, iterations, crisp 0/1, printable without supports and which side is printed up (on by default,
-  +z up; see [overhang control](#overhang-control)). With another side up the viewport shows the
-  build plate. **Optimize** runs in the background with a progress bar; from the first
+  +z up; see [overhang control](#overhang-control)), and the design space: 3D or
+  [2D along X, Y or Z](#2d-optimization) (saved with the shape). With another side up the viewport
+  shows the build plate. **Optimize** runs in the background with a progress bar; from the first
   iteration the viewport shows the result growing. Then pick the threshold on its histogram (with the
   material volume in cm³ and grams), optionally colour by `energy` or `displacement`, and continue
   with **Print the result**.
@@ -218,7 +220,7 @@ gen3d slice  SHAPE [-o out.gcode] [-c config.ini]... [--slicer prusa|orca] [mesh
 gen3d open   SHAPE [--slicer prusa|orca] [--format stl|3mf] [mesh opts]
 gen3d render SHAPE [-o img.png] [--size W H] [--section] [--yaw DEG] [--pitch DEG] [--no-fields]
 gen3d check  SHAPE                     (for a .vti: lists its arrays and value ranges)
-gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--no-symmetry] [--no-overhang] [--up=+z|...] [--modulus MPA] [--nu V] [-o out.vti] [--resume]
+gen3d optimize SHAPE [--volfrac 0.3] [--voxel MM] [--force N] [--rmin VOXELS] [--iters N] [--beta-max 32 | --no-projection] [--no-coarse-start] [--no-symmetry] [--no-overhang] [--up=+z|...] [--2d x|y|z | --3d] [--modulus MPA] [--nu V] [-o out.vti] [--resume]
 
 .vti options (render/export/slice/open): --array NAME  --iso X  --below|--above  --blocky  --color NAME
 gen3d new    NAME
@@ -354,6 +356,41 @@ gen3d optimize shapes/bracket_domain.wgsl --volfrac 0.3    # -> out/bracket_doma
 gen3d view out/bracket_domain_topopt.vti                     # opens on `density`, threshold 0.5
 gen3d export out/bracket_domain_topopt.vti                   # -> out/bracket_domain_topopt.stl
 ```
+
+### 2D optimization
+
+Many parts are a profile of constant thickness loaded in its own plane: a beam or a block pushed
+from the top, a bracket plate, a shelf support. For those, `--2d AXIS` (the shape's `//! 2d y` or
+sidecar `"2d": "y"`, the app's *Design space*) optimizes the profile and extrudes it back, at about
+4× the in-plane resolution of a 3D run in the same time, with a cross-section that is the same all
+through.
+
+- **Into 2D:** the problem is sampled in 3D as usual, then projected along the axis. Looking
+  through the part: an element of the profile is in the domain (kept solid) where any element
+  behind it is; a node is held where any node behind it is; the loads' in-plane components are
+  summed through the part and their component along the axis is dropped (a load with nothing
+  left is an error).
+- **The solve:** the profile is a slab one element thick, solved by the same optimizer (plane
+  stress). It stands for the domain's full thickness T: its loads are scaled by element / T, so
+  stresses and displacements are the thick part's, and the reported compliance is the part's.
+  Overhang control works in the profile's plane (45° chamfers and arches, extruded); printed along
+  the axis, the extrusion stands as a prism and needs nothing. Mirror planes in the plane are used;
+  one across the axis is ignored.
+- **Back to 3D:** the result (`density`, `density_filtered`, `energy`, `displacement` in the
+  plane) is written on the 3D grid, the profile copied through the design domain: where the 3D
+  domain is missing (a hole, a chamfer, a void) the part is too. Along the axis the grid has at most
+  24 cells (finer isn't needed for a prism; the beam's result is 2.4M cells, not 9M). The file
+  records the axis as FieldData `plane2d`.
+- **Element size:** by default about 100k elements in the profile (GPU; 13k on the CPU), with at
+  most 50M cells sampled in 3D.
+- **When it's wrong:** anything that isn't the same through the thickness. A load along the axis,
+  a support on one face only, a domain that changes along the axis: the projection makes a prism of
+  them, so check the result in 3D. [`shapes/beam_2d.wgsl`](shapes/beam_2d.wgsl) is the clean case:
+  the classic MBB beam, a 120 × 20 × 40 mm block on pads at both ends, loaded in the middle of its
+  top: 2D reaches compliance 41.9 N·mm in 29 s (0.22 mm elements), 3D 41.6 in 23 s (0.69 mm).
+  The bracket (`bracket_domain.wgsl --2d y`) is the other kind: its bolt holes run along x, so in
+  2D the plate is clamped across its whole width, and the part can't be a closed 3D box; it ends at
+  14.5 N·mm against 7.9 in 3D.
 
 ### Supports and loads from primitives
 
@@ -491,6 +528,8 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
     Past that, `optimize` says it doesn't fit. The CPU solver allows 8M (~1.2 kB each).
 - **Shortcuts in this version:**
   - Overhang control: 45° only, and the print direction is one of the six axis directions.
+  - 2D: the profile is extruded through the domain's thickest part; no per-column thickness, no
+    axisymmetric (revolved) profiles.
 
 ## Mesh quality notes
 
@@ -537,7 +576,7 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/mesh.rs` | volume / watertight / bodies, decimation, STL/3MF/OBJ/PLY writers |
 | `src/viewer.rs` | raymarching preview harness and pipelines, headless PNG render |
 | `src/slicer.rs` | PrusaSlicer / OrcaSlicer discovery and CLI driving, G-code summary, profiles, opening files |
-| `src/vti.rs` | VTK ImageData reader and writers |
+| `src/vti.rs` | VTK ImageData reader and writers (per-axis spacing) |
 | `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing (domain faces, outlines) |
 | `src/fairing.rs` | smooth surfaces from binary voxels: constrained thin-plate fairing of the field |
 | `src/topopt/mod.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
@@ -547,6 +586,7 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/topopt/gpu_engine.rs` | GPU kernels as recorded dispatch programs, reductions, scalars, readback |
 | `src/topopt/output.rs` | writing the result as it runs: background writes, decimated previews, full result on Stop |
 | `src/topopt/overhang.rs` | overhang control: the AM filter (layer-by-layer smooth min/max), its adjoint, the unsupported-element count |
+| `src/topopt/plane2d.rs` | 2D optimization: projecting the problem into a one-element slab, extruding the result back onto the 3D grid |
 | `src/topopt/symmetry.rs` | mirror symmetry: the reduced model (one side), load parts per symmetric/antisymmetric pattern, expanding the fields back |
 | `src/topopt/checkpoint.rs` | stop and resume: the `.resume` checkpoint next to the result |
 | `src/wgsl/sdf.wgsl` | the SDF library |

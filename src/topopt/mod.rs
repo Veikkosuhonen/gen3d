@@ -43,6 +43,7 @@ mod gpu_opt;
 pub mod mg;
 mod output;
 mod overhang;
+mod plane2d;
 mod symmetry;
 
 /// Linear solver for K u = f.
@@ -95,6 +96,9 @@ pub struct Settings {
     pub overhang: bool,
     /// the build direction: the side of the part that faces up on the printer
     pub up: crate::mesh::Up,
+    /// optimize in 2D: the problem projected along this axis (0 x, 1 y, 2 z) and the result
+    /// extruded back (`plane2d.rs`)
+    pub plane2d: Option<usize>,
 }
 
 /// How the bottom of the design domain is supported (`--ground`). The optimizer decides where the
@@ -149,6 +153,8 @@ pub struct Problem {
     pub loads: Vec<Vec<[f64; 3]>>,
     /// the load cases' numbers, in the order of `loads`
     pub cases: Vec<u32>,
+    /// a 2D problem (a slab one element thick): how it maps back onto its 3D grid
+    pub(crate) extrude: Option<std::sync::Arc<plane2d::Extrude>>,
 }
 
 impl Problem {
@@ -458,12 +464,24 @@ pub fn auto_elements(gpu_solver: bool) -> f64 {
     if gpu_solver { 300_000.0 } else { 40_000.0 }
 }
 
+/// The most cells the 3D grid of a 2D problem gets at the automatic element size (it is sampled
+/// in 3D before it is projected).
+const AUTO_2D_SAMPLED: f64 = 50e6;
+
 /// Element size giving at most about `target` elements in the shape's bounds, rounded up to 2
 /// significant digits. (It may be finer than the shape's `//! voxel`, which is its meshing and
-/// preview resolution; the optimized result is a grid of its own.)
-pub fn auto_voxel(shape: &Shape, target: f64) -> f32 {
-    let vol: f64 = shape.size().iter().map(|s| (*s as f64).max(1e-3)).product();
-    let v = (vol / target).cbrt();
+/// preview resolution; the optimized result is a grid of its own.) In 2D (`plane2d`, the axis
+/// projected along) half as many in the bounds' cross-section, but no more than
+/// `AUTO_2D_SAMPLED` in its 3D grid.
+pub fn auto_voxel(shape: &Shape, target: f64, plane2d: Option<usize>) -> f32 {
+    let size = shape.size().map(|s| (s as f64).max(1e-3));
+    let vol: f64 = size.iter().product();
+    let v = match plane2d {
+        None => (vol / target).cbrt(),
+        Some(a) => (vol / size[a] / (target / 3.0))
+            .sqrt()
+            .max((vol / AUTO_2D_SAMPLED).cbrt()),
+    };
     let mag = 10f64.powf(v.log10().floor() - 1.0);
     ((v / mag).ceil() * mag) as f32
 }
@@ -482,6 +500,11 @@ fn x_fastest(v: &[f32], d: [usize; 3], comps: usize) -> Vec<f32> {
         }
     }
     out
+}
+
+/// An axis by name: "x", "y" or "z" (any case) → 0, 1, 2.
+pub fn parse_axis(s: &str) -> Option<usize> {
+    ["x", "y", "z"].iter().position(|a| a.eq_ignore_ascii_case(s.trim()))
 }
 
 /// The most cells `setup` samples the shape's bounds at (before cropping to the domain).
@@ -529,7 +552,43 @@ fn crop_cells(v: &[f32], n: [usize; 3], a: [usize; 3], b: [usize; 3]) -> Vec<f32
     out
 }
 
-/// Sample the shape's domain and boundary-condition fields on the element grid.
+/// Pin the least nodes that keep the part from moving (with mirror planes, their mirror images
+/// too), then check that the supports hold it.
+fn pin(p: &mut Problem, mirror: [bool; 3]) -> Result<()> {
+    let pts = p.nodes();
+    let mut pins = stabilize(p);
+    // with mirror planes, the pins' mirror images too (so the supports stay symmetric)
+    for (a, _) in mirror.iter().enumerate().filter(|(_, m)| **m) {
+        for k in 0..pins.len() {
+            let (i, axes) = pins[k];
+            let mut ijk = [i % pts[0], (i / pts[0]) % pts[1], i / (pts[0] * pts[1])];
+            ijk[a] = pts[a] - 1 - ijk[a];
+            let m = (ijk[2] * pts[1] + ijk[1]) * pts[0] + ijk[0];
+            if m != i {
+                pins.push((m, axes));
+            }
+        }
+    }
+    for (i, axes) in pins {
+        p.fixed[i] |= axes;
+        let q = p.node_pos(i);
+        let names: String = (0..3)
+            .filter(|c| axes >> c & 1 == 1)
+            .map(|c| ['X', 'Y', 'Z'][c])
+            .collect();
+        println!(
+            "pinned the node at ({:.1}, {:.1}, {:.1}) in {names}: the supports alone let the part move",
+            q[0], q[1], q[2]
+        );
+    }
+    if rigid_rank(p) < 6 {
+        bail!("the supports can't hold the part in place (all on one line?): add or widen a support");
+    }
+    Ok(())
+}
+
+/// Sample the shape's domain and boundary-condition fields on the element grid (with
+/// `Settings::plane2d`: then projected into a 2D slab, see `plane2d.rs`).
 pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     let h = s.voxel;
     if h <= 0.0 {
@@ -620,8 +679,10 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         Solver::Multigrid(_) => 8_000_000,
         Solver::Gpu(_) => 100_000_000,
     };
-    if ne > max {
-        bail!("{ne} elements is too many for this solver (at most {max}); use a larger --voxel");
+    // (a 2D problem solves one element across the axis)
+    let solved = s.plane2d.map_or(ne, |a| ne / n[a]);
+    if solved > max {
+        bail!("{solved} elements is too many for this solver (at most {max}); use a larger --voxel");
     }
     let cells = cells_at(n, origin);
     let pts = n.map(|v| v + 1);
@@ -645,6 +706,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         fixed: vec![],
         loads: vec![],
         cases: vec![],
+        extrude: None,
     };
     let active = p.active_nodes();
     p.fixed = vec![0; active.len()];
@@ -673,35 +735,9 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         }
         println!("ground ({}): {} nodes on the bottom layer", s.ground.name(), n.len());
     }
-    let mut pins = stabilize(&p);
-    // with mirror planes, the pins' mirror images too (so the supports stay symmetric)
-    for (a, _) in mirror.iter().enumerate().filter(|(_, m)| **m) {
-        for k in 0..pins.len() {
-            let (i, axes) = pins[k];
-            let mut ijk = [i % pts[0], (i / pts[0]) % pts[1], i / (pts[0] * pts[1])];
-            ijk[a] = pts[a] - 1 - ijk[a];
-            let m = (ijk[2] * pts[1] + ijk[1]) * pts[0] + ijk[0];
-            if m != i {
-                pins.push((m, axes));
-            }
-        }
+    if s.plane2d.is_none() {
+        pin(&mut p, mirror)?;
     }
-    for (i, axes) in pins {
-        p.fixed[i] |= axes;
-        let q = p.node_pos(i);
-        let names: String = (0..3)
-            .filter(|c| axes >> c & 1 == 1)
-            .map(|c| ['X', 'Y', 'Z'][c])
-            .collect();
-        println!(
-            "pinned the node at ({:.1}, {:.1}, {:.1}) in {names}: the supports alone let the part move",
-            q[0], q[1], q[2]
-        );
-    }
-    if rigid_rank(&p) < 6 {
-        bail!("the supports can't hold the part in place (all on one line?): add or widen a support");
-    }
-    let nfixed = p.fixed.iter().filter(|b| **b != 0).count();
     // each load is spread over its own nodes so its magnitudes sum to its force
     let nn = active.len();
     let mut cases: std::collections::BTreeMap<u32, Vec<[f64; 3]>> = Default::default();
@@ -761,9 +797,37 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
             }
         }
     }
-    let nload = loaded.iter().filter(|b| **b).count();
     p.cases = cases.keys().copied().collect();
     p.loads = cases.into_values().collect();
+    let mut nload = loaded.iter().filter(|b| **b).count();
+    if let Some(a) = s.plane2d {
+        p = plane2d::project(&p, a, lo[a] as f64);
+        let mut m = mirror;
+        m[a] = false;
+        pin(&mut p, m)?;
+        let layers = p.extrude.as_ref().map_or(1, |x| x.layers);
+        println!(
+            "2D: projected along {}, a slab standing for {} mm ({layers} elements) of thickness",
+            ["x", "y", "z"][a],
+            (layers as f64 * h) as f32
+        );
+        for (c, l) in p.cases.iter().zip(&p.loads) {
+            if l.iter().all(|v| v.iter().all(|x| *x == 0.0)) {
+                bail!(
+                    "load case {c} has no force in the 2D plane (it pushes along {}, the axis the problem is \
+                     projected along): optimize it in 3D, or in 2D along another axis",
+                    ["x", "y", "z"][a]
+                );
+            }
+        }
+        nload = (0..p.fixed.len())
+            .filter(|&i| p.loads.iter().any(|l| l[i].iter().any(|x| *x != 0.0)))
+            .count();
+    }
+    // (in 2D, not counting the slab's out-of-plane hold)
+    let held = 7 & !s.plane2d.map_or(0, |a| 1u8 << a);
+    let nfixed = p.fixed.iter().filter(|b| **b & held != 0).count();
+    let n = p.n;
     let ndomain = p.domain.iter().filter(|b| **b).count();
     let npassive = p.passive.iter().filter(|b| **b).count();
     println!(
@@ -1206,6 +1270,14 @@ fn mirror_axes(shape: &Shape, s: &Settings) -> [bool; 3] {
         return [false; 3];
     }
     let mut axes = shape.mirror.map(|m| m.is_some());
+    // a 2D slab is one element thick across its axis
+    if let Some(a) = s.plane2d.filter(|&a| axes[a]) {
+        println!(
+            "symmetry: not using the mirror plane in {} (the 2D problem is projected along it)",
+            ["x", "y", "z"][a]
+        );
+        axes[a] = false;
+    }
     // printing breaks the symmetry about a plane across the build direction
     let b = s.up.axis();
     if s.overhang && axes[b] {
@@ -1273,7 +1345,7 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
     };
     let fine = model(setup(shape, s, gpu)?, shape, s);
     // the whole part's elements (the coarse grid's resolution is what matters, not the model's size)
-    let ndomain = (fine.p().domain.iter().filter(|d| **d).count() as f64 * fine.scale()) as usize;
+    let ndomain = (fine.p().domain.iter().filter(|d| **d).count() as f64 * fine.copies()) as usize;
     let coarse_start = s.coarse_start && s.beta_max > 1.0 && ndomain / 8 >= COARSE_MIN_ELEMENTS;
     let resumed = |c: &checkpoint::Checkpoint, p: &Model, grid: &str| -> Result<Stage> {
         c.check(p)?;
@@ -1897,6 +1969,7 @@ pub(super) mod tests {
             fixed: vec![0; n.map(|v| v + 1).iter().product()],
             loads: vec![],
             cases: vec![],
+            extrude: None,
         }
     }
 
@@ -2004,6 +2077,7 @@ pub(super) mod tests {
             symmetry: true,
             overhang: false,
             up: crate::mesh::Up::PlusZ,
+            plane2d: None,
         }
     }
 
@@ -2104,6 +2178,7 @@ pub(super) mod tests {
             fixed,
             loads: vec![f.clone(), rocked(1.0), rocked(-1.0), g.clone(), clamped],
             cases: vec![1, 2, 3, 4, 5],
+            extrude: None,
         };
         let b = p.load_basis();
         assert_eq!(b.solved, vec![0, 1]);
@@ -2143,6 +2218,7 @@ pub(super) mod tests {
             symmetry: true,
             overhang: false,
             up: crate::mesh::Up::PlusZ,
+            plane2d: None,
         };
         // iterations until `next` says Stop at β, for a compliance sequence
         let run = |beta: f64, seq: &dyn Fn(usize) -> f64| {
@@ -2264,6 +2340,7 @@ pub(super) mod tests {
             symmetry: true,
             overhang: false,
             up: crate::mesh::Up::PlusZ,
+            plane2d: None,
         };
         let p = setup(&shape, &s, &gpu).unwrap();
         assert_eq!(p.cases, [1, 2]);
@@ -2393,6 +2470,7 @@ pub(super) mod tests {
             symmetry: true,
             overhang: false,
             up: crate::mesh::Up::PlusZ,
+            plane2d: None,
         };
         let err = setup(&shape, &s, &gpu).err().unwrap().to_string();
         assert!(err.contains("needs supports"), "{err}");
@@ -2440,6 +2518,7 @@ pub(super) mod tests {
             fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]],
             cases: vec![1],
+            extrude: None,
         };
         for j in 0..=n[1] {
             for i in 0..=n[0] {
@@ -2524,6 +2603,7 @@ pub(super) mod tests {
             fixed: vec![0; 2 * 2 * 5],
             loads: vec![vec![[0.0; 3]; 2 * 2 * 5]],
             cases: vec![1],
+            extrude: None,
         };
         for j in 0..2 {
             for i in 0..2 {

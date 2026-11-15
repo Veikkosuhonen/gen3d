@@ -29,6 +29,20 @@ use super::{CaseSolve, LoadBasis, Problem};
 const POWER_STEPS: usize = 12;
 const POWER_STEPS_LONG: usize = 40;
 
+/// CG broke down (a non-finite residual): the preconditioner wasn't positive definite, which an
+/// underestimated smoother λmax causes. The solution was reset to zero, so the solve can be
+/// retried after a careful re-estimate.
+#[derive(Debug)]
+pub(super) struct Diverged(pub f32);
+
+impl std::fmt::Display for Diverged {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "GPU CG diverged (residual {})", self.0)
+    }
+}
+
+impl std::error::Error for Diverged {}
+
 /// Entries of a symmetric 24×24 element matrix's upper triangle (how coarse levels are stored).
 const SYM: usize = 300;
 
@@ -682,7 +696,9 @@ impl<'a> GpuMg<'a> {
             its += CHECK_EVERY;
             let rr = self.e.read_scalar(RR)?;
             if !rr.is_finite() {
-                bail!("GPU CG diverged (residual {rr})");
+                // start the next attempt from zero, not from the NaNs
+                self.e.write_f32(&self.us[c], &vec![0.0; self.len(0)]);
+                return Err(Diverged(rr).into());
             }
             if rr <= target {
                 break;
@@ -724,6 +740,7 @@ mod tests {
             fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]],
             cases: vec![1],
+            extrude: None,
         };
         let [nx, ny, _] = n.map(|v| v + 1);
         for j in 0..ny {
