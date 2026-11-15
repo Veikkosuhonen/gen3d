@@ -43,9 +43,11 @@ CPU, and is now 2.09e-3. The other runs moved by similar amounts in both directi
 further), and every per-iteration compliance stays within 1.3e-3. `wide_stand_leg` (grip, mirrored
 in X and Y) and `table` (slide): compliance within 0.15% and 0.01% of before.
 
-**Still open:** the editor shapes run at 400–670 B per element: five load cases (three solved) and
-mirror symmetry (up to four hierarchies) multiply per-case and per-hierarchy buffers. That, not the
-fine smoother, is where their memory goes.
+**Still open:** the editor shapes report 370–670 B per element, but that divides by the elements
+solved (a quarter of the grid when mirrored in X and Y). Per element of the whole grid `table` uses
+151 B (43 MB at 289k elements), and most of that is fixed-size: three hierarchies' dense
+coarsest-level inverses (52 B per element here) and the Galerkin table (16 B). Both stay constant as
+the grid grows, so these shapes are nowhere near the memory limit at their default voxel sizes.
 
 ## 2026-11-15: Smoother than the design: `--grow` and `--min-body`
 
