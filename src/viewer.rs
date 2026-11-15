@@ -424,6 +424,8 @@ pub struct Bindings {
     pub par: Option<wgpu::Buffer>,
     /// editor primitives (group 1, binding 0)
     pub ed: Option<wgpu::Buffer>,
+    /// imported grids (group 0, `import::BINDING`)
+    pub imp: Option<wgpu::Buffer>,
 }
 
 /// What the viewer shows: a .wgsl shape, or a .vti grid turned into a shape by `volume.rs`.
@@ -580,6 +582,9 @@ pub fn build_pipeline(
     if let Some(p) = &b.par {
         buffers.push((5, p));
     }
+    if let Some(p) = &b.imp {
+        buffers.push((crate::import::BINDING, p));
+    }
     let entries: Vec<_> = buffers
         .iter()
         .map(|(i, b)| wgpu::BindGroupEntry {
@@ -714,6 +719,7 @@ pub fn render_png(
             .shape
             .editor_data(None)
             .map(|d| uniform_buffer(&gpu, "editor primitives", &d)),
+        imp: crate::import::buffer(&gpu, &src.shape.imports)?,
     };
     let constants = compiled_defines(&src.shape.defines, &live);
     let pipeline = build_pipeline(&gpu, &module, &constants, format, &bindings)?;

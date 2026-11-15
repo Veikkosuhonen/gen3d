@@ -4,6 +4,7 @@ mod app;
 mod browser;
 mod fairing;
 mod gpu;
+mod import;
 mod jobs;
 mod mc;
 mod mesh;

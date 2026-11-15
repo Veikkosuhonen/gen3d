@@ -471,45 +471,11 @@ impl Volume {
                 self.iso
             );
         }
-        let [nx, ny, nz] = self.dims;
-        let p = [nx + 2, ny + 2, nz + 2];
-        let field = self.field();
         let cell = self.file.arrays[self.array].cell;
-        // grid index (may be in the padding) -> in the domain
-        let in_domain = |i: [i64; 3]| {
-            (0..3).all(|k| i[k] >= 0 && i[k] < self.dims[k] as i64)
-                && (!cell
-                    || self
-                        .domain
-                        .as_ref()
-                        .is_none_or(|d| d[((i[2] as usize) * ny + i[1] as usize) * nx + i[0] as usize]))
-        };
-        // the field on the padded lattice (x-fastest), < 0 inside
+        let in_domain = |i: [i64; 3]| self.in_domain(i);
+        let Padded { p, mut f, free, faired } = self.padded(opts);
+        let n = f.len();
         let pidx = |x: usize, y: usize, z: usize| (z * p[1] + y) * p[0] + x;
-        let n = p[0] * p[1] * p[2];
-        let mut free = vec![false; n];
-        let mut f = vec![1f32; n];
-        for z in 0..p[2] {
-            for y in 0..p[1] {
-                for x in 0..p[0] {
-                    let c = [x as i64 - 1, y as i64 - 1, z as i64 - 1];
-                    let i = pidx(x, y, z);
-                    if !in_domain(c) {
-                        free[i] = true;
-                        continue;
-                    }
-                    let v = field[((c[2] as usize) * ny + c[1] as usize) * nx + c[0] as usize];
-                    let d = if self.below { v - self.iso } else { self.iso - v };
-                    f[i] = if d.is_finite() { d } else { 1.0 };
-                }
-            }
-        }
-        let faired = opts.fair.then(|| {
-            let inside: Vec<bool> = f.iter().zip(&free).map(|(&v, &fr)| !fr && v < 0.0).collect();
-            // in voxels of the (geometric) mean spacing; the fairing works in voxel units
-            let h = (self.spacing.iter().product::<f64>()).cbrt() as f32;
-            crate::fairing::fair(&inside, Some(&free), p, opts.grow / h)
-        });
         if let Some(fv) = &faired {
             for i in 0..n {
                 f[i] = if free[i] { 1.0 } else { fv.v[i] };
@@ -571,6 +537,118 @@ impl Volume {
             }
         }
         Ok(mesh)
+    }
+}
+
+/// A volume's surface field on its lattice padded by one sample on each side (x-fastest).
+struct Padded {
+    p: [usize; 3],
+    /// the shown array less the threshold, signed `< 0` inside (1 at `free` samples)
+    f: Vec<f32>,
+    /// samples outside the design domain or in the padding
+    free: Vec<bool>,
+    /// with `MeshOpts::fair`: the faired field (voxels)
+    faired: Option<crate::fairing::Field>,
+}
+
+/// A signed distance field on a regular lattice (mm, negative inside, x-fastest): a volume's solid
+/// for use inside a shape (`Volume::sdf`).
+#[derive(Clone, Debug)]
+pub struct SdfGrid {
+    /// position of the first sample
+    pub origin: [f64; 3],
+    pub spacing: [f64; 3],
+    pub dims: [usize; 3],
+    pub sd: Vec<f32>,
+}
+
+impl Volume {
+    /// Whether padded-lattice index `i` (lattice index; may be -1 or `dims`) is in the design domain.
+    fn in_domain(&self, i: [i64; 3]) -> bool {
+        let [nx, ny, _] = self.dims;
+        (0..3).all(|k| i[k] >= 0 && i[k] < self.dims[k] as i64)
+            && (!self.file.arrays[self.array].cell
+                || self
+                    .domain
+                    .as_ref()
+                    .is_none_or(|d| d[((i[2] as usize) * ny + i[1] as usize) * nx + i[0] as usize]))
+    }
+
+    fn padded(&self, opts: &MeshOpts) -> Padded {
+        let [nx, ny, nz] = self.dims;
+        let p = [nx + 2, ny + 2, nz + 2];
+        let field = self.field();
+        let pidx = |x: usize, y: usize, z: usize| (z * p[1] + y) * p[0] + x;
+        let n = p[0] * p[1] * p[2];
+        let mut free = vec![false; n];
+        let mut f = vec![1f32; n];
+        for z in 0..p[2] {
+            for y in 0..p[1] {
+                for x in 0..p[0] {
+                    let c = [x as i64 - 1, y as i64 - 1, z as i64 - 1];
+                    let i = pidx(x, y, z);
+                    if !self.in_domain(c) {
+                        free[i] = true;
+                        continue;
+                    }
+                    let v = field[((c[2] as usize) * ny + c[1] as usize) * nx + c[0] as usize];
+                    let d = if self.below { v - self.iso } else { self.iso - v };
+                    f[i] = if d.is_finite() { d } else { 1.0 };
+                }
+            }
+        }
+        let faired = opts.fair.then(|| {
+            let inside: Vec<bool> = f.iter().zip(&free).map(|(&v, &fr)| !fr && v < 0.0).collect();
+            crate::fairing::fair(&inside, Some(&free), p, opts.grow / self.mean_spacing())
+        });
+        Padded { p, f, free, faired }
+    }
+
+    /// The (geometric) mean spacing: the fairing works in voxels of this size.
+    fn mean_spacing(&self) -> f32 {
+        (self.spacing.iter().product::<f64>()).cbrt() as f32
+    }
+
+    /// The solid as a signed distance field, for combining it with other shapes (`import.rs`).
+    ///
+    /// With `opts.fair` (as `mesh` would), the faired surface, cut off where the design domain and
+    /// the grid end: halfway between the last sample in it and the first outside, as the mesh's flat
+    /// faces there are. That is on the lattice padded by one sample, so the solid is closed.
+    /// Without, the smooth view's field (`sd`), on the lattice itself. `opts.smooth` is unused.
+    pub fn sdf(&self, opts: &MeshOpts) -> SdfGrid {
+        if !opts.fair {
+            return SdfGrid {
+                origin: self.origin,
+                spacing: self.spacing,
+                dims: self.dims,
+                sd: self.sd.clone(),
+            };
+        }
+        let Padded { p, free, faired, .. } = self.padded(opts);
+        let faired = faired.expect("fair");
+        let dom = crate::fairing::mask_sdf(&free.iter().map(|f| !f).collect::<Vec<_>>(), p);
+        let mut sd: Vec<f32> = faired.v.iter().zip(&dom.v).map(|(a, b)| a.max(*b)).collect();
+        // a solid sample next to the domain's edge: at least half a voxel inside, so the face is on
+        // the cell face (as the mesh puts it) even where the faired field is shallow (thin plates)
+        let [nx, ny, nz] = p;
+        for z in 1..nz - 1 {
+            for y in 1..ny - 1 {
+                for x in 1..nx - 1 {
+                    let i = (z * ny + y) * nx + x;
+                    let edge = [1, nx, nx * ny].iter().any(|&s| free[i - s] || free[i + s]);
+                    if !free[i] && sd[i] < 0.0 && edge {
+                        sd[i] = sd[i].min(-0.5);
+                    }
+                }
+            }
+        }
+        let h = self.mean_spacing();
+        SdfGrid {
+            origin: std::array::from_fn(|k| self.origin[k] - self.spacing[k]),
+            spacing: self.spacing,
+            dims: p,
+            sd: sd.into_iter().map(|v| v * h).collect(),
+        }
     }
 }
 

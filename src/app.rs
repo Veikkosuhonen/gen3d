@@ -295,6 +295,8 @@ struct Win {
     ed: Option<wgpu::Buffer>,
     /// the live (`f32`) parameters' buffer, and their names in buffer order
     par: Option<wgpu::Buffer>,
+    /// the imported grids' buffer (`import.rs`)
+    imp: Option<wgpu::Buffer>,
     live: Vec<String>,
     egui: egui::Context,
     renderer: egui_wgpu::Renderer,
@@ -338,6 +340,7 @@ impl Win {
             vol: None,
             ed: None,
             par: None,
+            imp: None,
             live: vec![],
             egui,
             renderer,
@@ -1192,6 +1195,10 @@ impl App {
             Ok(v) => v,
             Err(e) => return self.fail(&format!("{e:#}")),
         };
+        let imp = match crate::import::buffer(&win.gpu, &src.shape.imports) {
+            Ok(b) => b,
+            Err(e) => return self.fail(&format!("{e:#}")),
+        };
         let built = preview_module(&win.gpu, &src).and_then(|(m, live)| {
             let bindings = Bindings {
                 ubuf: win.ubuf.clone(),
@@ -1201,6 +1208,7 @@ impl App {
                     uniform_buffer(&win.gpu, "parameters", &data)
                 }),
                 ed: ed_data.map(|d| uniform_buffer(&win.gpu, "editor primitives", &d)),
+                imp,
             };
             let constants = compiled_defines(&src.shape.defines, &live);
             let p = build_pipeline(&win.gpu, &m, &constants, VIEW_FORMAT, &bindings)?;
@@ -1214,6 +1222,7 @@ impl App {
                 win.vol = b.vol;
                 win.ed = b.ed;
                 win.par = b.par;
+                win.imp = b.imp;
                 win.live = live;
                 self.built_defines = constants;
                 self.rebuild_gen += 1;
@@ -1317,6 +1326,7 @@ impl App {
             vol: None,
             par: win.par.clone(),
             ed: win.ed.clone(),
+            imp: win.imp.clone(),
         };
         let constants = compiled_defines(&defines, &win.live);
         self.built_defines = constants.clone();

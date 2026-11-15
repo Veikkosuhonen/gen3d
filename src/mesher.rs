@@ -155,19 +155,27 @@ pub fn sample_field(shape: &Shape, grid: &Grid, func: &str, comps: usize, gpu: &
         }),
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     });
+    let imports = crate::import::buffer(gpu, &shape.imports)?;
+    let mut entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniforms.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: out.as_entire_binding(),
+        },
+    ];
+    if let Some(b) = &imports {
+        entries.push(wgpu::BindGroupEntry {
+            binding: crate::import::BINDING,
+            resource: b.as_entire_binding(),
+        });
+    }
     let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniforms.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: out.as_entire_binding(),
-            },
-        ],
+        entries: &entries,
     });
 
     let layer = ny * nz * comps;

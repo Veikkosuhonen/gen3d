@@ -59,6 +59,8 @@ pub struct Shape {
     pub script_fixed: Option<String>,
     /// Whether primitives have boundary-condition roles (so `g3d_reach` is declared).
     pub bc: bool,
+    /// .vti grids imported as SDF functions (`//! import`; `import.rs`), bound as `g3d_imp`.
+    pub imports: Vec<crate::import::Import>,
 }
 
 impl Shape {
@@ -113,6 +115,7 @@ impl Shape {
             script_load: None,
             script_fixed: None,
             bc: false,
+            imports: vec![],
         }
     }
 
@@ -747,6 +750,12 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
             "up" => {
                 shape.up = Some(crate::mesh::Up::parse(val).ok_or_else(|| bad("expected +z, -z, +x, -x, +y or -y"))?);
             }
+            "import" => {
+                let dir = path.parent().unwrap_or(Path::new("."));
+                shape
+                    .imports
+                    .push(crate::import::parse(val, dir).map_err(|e| bad(&format!("{e:#}")))?);
+            }
             "voxel" => {
                 shape.voxel = val
                     .split_whitespace()
@@ -757,6 +766,30 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
             }
             _ => {}
         }
+    }
+    if !shape.imports.is_empty() {
+        // without bounds of its own, the shape is where the grids are
+        if !shape.directives.contains_key("bounds") {
+            shape.bounds = crate::import::bounds(&shape.imports).unwrap_or(shape.bounds);
+        }
+        if shape.up.is_none() {
+            shape.up = shape.imports.iter().find_map(|i| i.up);
+        }
+        // interpolated distance fields are only approximately distances
+        shape.directives.entry("step".into()).or_insert_with(|| "0.8".into());
+        let mut code = crate::import::wgsl(&shape.imports);
+        // without a map of its own, the shape is the imported solids (plus any primitives)
+        if prims::find_fn(&shape.source, "map")?.is_none() {
+            code += &crate::import::map(&shape.imports);
+        }
+        let idx = shape.files.len();
+        shape.files.push(library_path("import.wgsl"));
+        for (i, line) in code.lines().enumerate() {
+            shape.source.push_str(line);
+            shape.source.push('\n');
+            shape.origins.push(Origin { file: idx, line: i + 1 });
+        }
+        shape.files.extend(shape.imports.iter().map(|i| i.path.clone()));
     }
     shape.base_bounds = shape.bounds;
 

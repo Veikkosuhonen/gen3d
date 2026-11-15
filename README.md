@@ -56,6 +56,7 @@ Directives (`//! key value`, anywhere in the main file):
 | `range NAME min max` | slider range for parameter `NAME` in the viewer (one line per parameter) |
 | `2d y` | optimize in 2D, projected along this axis (`x` `y` `z`), see [2D optimization](#2d-optimization) (an editor shape keeps it in its sidecar's `"2d"` instead) |
 | `up -x` | the side printed up (`+z` `-z` `+x` `-x` `+y` `-y`): Optimize's overhang control and Print's mesh orientation default to it (an editor shape keeps it in its sidecar's `"up"` instead) |
+| `import NAME file.vti [options]` | a `.vti` grid's solid (e.g. an optimization result) as `fn NAME(p: vec3f) -> f32`, see [Importing a result](#importing-a-result-into-a-shape-import) (one line per grid) |
 
 `#include "file.wgsl"` resolves relative to the shape first, then the built-in library (compiled into the
 binary). Each file is included once. Shapes are validated with [naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga)
@@ -117,6 +118,40 @@ itself and its mirror images (`g3d_e<i>` is the min over them), so a subtracted 
 sides and a support or loaded region gets its twin. A load keeps its direction on the mirrored region
 (the same push over both; its force is spread over both). The bounds become symmetric about the planes.
 The script's own `map` is not mirrored. A new plane goes through the middle of the bounds.
+
+### Importing a result into a shape (`//! import`)
+
+To combine an optimization result (or any `.vti` grid) with exact SDFs, import it: the grid's solid
+becomes an SDF function the shape can use like any other.
+
+```wgsl
+//! import leg ../out/stand_leg_topopt.vti
+#include <sdf.wgsl>
+
+fn map(p: vec3f) -> f32 {
+    let foot = sdRoundBox(p - vec3f(0, 0, 2), vec3f(20, 40, 2), 1.0);         // an exact base plate
+    let bolt = sdCylinder(p - vec3f(0, 30, 0), 3.2, 30.0);                    // a clean bolt hole
+    return opSubtract(opSmoothUnion(leg(p), foot, 2.0), bolt);
+}
+```
+
+- **The file** is looked up next to the shape, then relative to the working directory. When it changes
+  (e.g. you rerun the optimizer), the shape reloads.
+- **The surface** is the one Print would mesh from that file: an optimizer's `density` is
+  [faired](#viewing-and-meshing-grids-vti) at 0.5, and other arrays get the view's interpolated
+  threshold surface. Where the result ends at the design domain, the faces are flat. Options after the
+  file: `array=NAME`, `iso=X`, `below` / `above`, `fair` / `no-fair`, `grow=MM` (as `export`'s
+  `--array`, `--iso`, ... for `.vti` files).
+- **Without `fn map`** (a file with only directives), the shape *is* the imported solid(s). Add
+  primitives in the Design step to put bosses on, cut holes and so on: New shape, add an `//! import`
+  line, then build on it in the app.
+- Without `//! bounds`, the bounds are the grid's box (grown to fit primitives as usual). Without
+  `//! up`, the result's print orientation carries over, and `//! step` defaults to 0.8.
+- The field is computed on the CPU when the shape loads (about 1.5 s for a 4M-sample result) and
+  cached, so editing the script reloads quickly. On the GPU, all imported grids share one storage
+  buffer (`g3d_imp`, group 0 binding 8). The field is sampled trilinearly, so features smaller than
+  the result's voxel are as coarse as they are in the result. That is why the exact SDFs you add
+  around it stay sharp.
 
 ### Library (`src/wgsl/sdf.wgsl`)
 
@@ -593,7 +628,8 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/viewer.rs` | raymarching preview harness and pipelines, headless PNG render |
 | `src/slicer.rs` | PrusaSlicer / OrcaSlicer discovery and CLI driving, G-code summary, profiles, opening files |
 | `src/vti.rs` | VTK ImageData reader and writers (per-axis spacing) |
-| `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing (domain faces, outlines) |
+| `src/volume.rs` | .vti grids as viewable shapes: distance fields, EDT, volume WGSL, meshing (domain faces, outlines), the faired SDF for imports |
+| `src/import.rs` | `//! import`: .vti grids as SDF functions in a shape (parsing, cached fields, generated WGSL, the `g3d_imp` buffer) |
 | `src/fairing.rs` | smooth surfaces from binary voxels: constrained thin-plate fairing of the field (`--grow` widens the band outward) |
 | `src/topopt/mod.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
 | `src/topopt/mg.rs` | multigrid preconditioner: Galerkin coarse levels, Chebyshev/Jacobi smoothers, banded Cholesky |

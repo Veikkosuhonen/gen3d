@@ -3,6 +3,59 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: Import a .vti result into a shape (`//! import`)
+
+**Why:** an optimization result is only as exact as its voxels. Bolt holes, mounting faces and
+bosses are better as exact SDFs, so the result should combine with primitives and script SDFs in
+the Design step instead of being a dead end that can only be printed.
+
+**What:**
+- `//! import NAME file.vti [array= iso= below|above fair|no-fair grow=]` gives the shape
+  `fn NAME(p: vec3f) -> f32`. The file is looked up next to the shape, then in the working
+  directory, and is watched for reloads.
+- The field is `Volume::sdf`: for a `density` (faired by default), the same faired field Print
+  meshes, in mm. It is max'd with the signed distance to the design domain, so the result ends in
+  flat faces where it meets the domain or grid edge, with solid samples on that edge pinned half a
+  voxel inside (as `mesh` puts those vertices on the cell face). This is on the lattice padded by one
+  sample. Other arrays use the view's smooth field `sd`. `Volume::mesh` and `sdf` share the padded
+  field code (`Volume::padded`).
+- `import.rs` generates the WGSL: one storage buffer `g3d_imp` (group 0, binding 8) holding every
+  imported grid, a trilinear sampler with the volume view's outside-the-lattice lower bound, and
+  one function per import with its offset, dims, origin and spacing baked in. The compute sampler
+  (`sample_field`, so export, optimize and fields), the preview (`render`, `snapshot`) and the app
+  (including the background pipeline rebuild for parameters) bind it when the shape has imports.
+- A file without `fn map` whose imports exist gets `map` = the union of the imports, so New shape
+  plus one `//! import` line, then primitives in the app, works without writing WGSL. Without
+  `//! bounds` the bounds are the grids' lattice box; the result's `print_up` becomes `up`; `step`
+  defaults to 0.8.
+- Fields are cached per file (mtime, size and options), so a script edit doesn't redo the fairing.
+
+**Result:**
+- `bracket_editor_topopt.vti` (151×51×80) imported alone: 23.28 cm³, watertight, one body, against
+  23.35 cm³ for `export` of the .vti itself (which also Taubin-smooths). The side face of the two
+  meshes agrees within 0.02 mm everywhere. The ~0.1 mm elliptical ripple on that face (visible in
+  the raymarched preview from some angles) is in Print's faired mesh too.
+- With a sphere added, a hole subtracted and an editor box blended on, export at 0.3 mm takes 0.47 s
+  in total (4.5M samples).
+- `stand_leg_topopt.vti` (61×369×169, 3.8M samples): 1.6 s to load and render, against 0.44 s for
+  viewing the .vti; the difference is the fairing, cached after the first load.
+
+**Verified:** `import::tests::directive_parses_and_compiles` (options, bounds, watched file,
+implicit map, six error cases, compute and preview harnesses compile) and
+`imported_box_samples_on_gpu` (a binary density box, faired and not: the right sign, within 0.6 mm
+of the exact distance near the faces, about the right distance far outside the grid). The README
+example exports. A `snapshot` of the Design step shows the import with an editor primitive and its
+gizmo. The full suite passes, clippy is clean.
+
+**Still open:**
+- The import is fixed in place. Moving or rotating it means editing `map` (`leg(p - offset)`);
+  an *import* primitive kind in the editor (position, rotation, operation) would make that
+  possible with the mouse.
+- Picking in the app doesn't see the imported solid (it's not on the CPU), the same as script
+  geometry.
+- The fairing runs on load in the app's UI thread (1-2 s for large results, once per file
+  version).
+
 ## 2026-11-15: The fine stage stores only the bricks near the coarse design
 
 **Why:** plan step 6. At a 0.3 volume fraction most of the domain ends up void, and the layout
