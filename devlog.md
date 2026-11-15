@@ -3,6 +3,56 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-15: The GPU optimizer stores only the bricks around the domain
+
+**Why:** step 1–4 of `docs/sparse-grid-plan.md`: GPU memory and work should scale with the part,
+not its bounding box. The PoC showed a brick-staged stencil costs ~6% over dense.
+
+**What:**
+- Every GPU array (element arrays, vectors and element matrices on every multigrid level) is in a
+  brick layout: 64-point bricks, only those holding a node of a domain element stored (`Bricks`).
+  Coarse levels hold the parents of the level below. The dense layout is gone; readback (output,
+  checkpoints, coarse-start continuation) is scattered to the dense grid.
+- Kernels find neighbours through the level's page table and each slot's brick coordinates. The
+  fine stencils, `apply_p`, transfers, `apply_elem`/`diag_elem` and `energy` run one 64-thread
+  workgroup per brick and load the 27 neighbouring slots into workgroup memory first; `diag_l1`,
+  `assemble`, the filter, sensitivities and AM filter look up directly.
+- Bricks are 4³, or 2×8×4 (and permutations) across a 2D slab's thin axis. Kernels tagged
+  `bricks` are compiled once per shape with `BX/BY/BZ` and the tile sizes substituted
+  (`gpu_engine::BRICK_SHAPES`, replacing `apply_p`'s tile variants). WGSL sections can now be
+  `//// lib NAME`, pulled into kernels with `#include NAME KEY=VALUE`.
+- `bottom` maps the coarsest level's dense DOFs to the brick layout (`bmap`); the dense inverse
+  is unchanged.
+- `GpuMg::new` takes the fine brick set; the coarse-level and kernel tests read and write through
+  `read_dense`/`write_dense`.
+
+**Result:**
+- Workgroup memory decided the speed. Tiles sized for the largest brick shape (4.5 KB per 64
+  threads) made `apply_fine` 29.7 ms against the PoC's 24.5 (9.6M box); tiles sized per shape,
+  and 3-vectors as three f32 arrays (a vec3 takes 16 bytes there), brought it to 25.0 and
+  `apply_p` from 37.2 to ~30.8 ms (dense 30.0). Signed vs unsigned index math and a precomputed
+  neighbour table made no difference, so they weren't kept.
+- 9.6M-element box (`profile_kernels`): CG iteration 302 → 335 ms (+11%), V-cycle 267 → 298 ms;
+  `restrict` 2.0 → 4.5 ms and `prolong` 7.9 → 9.8 ms are the largest relative costs left.
+- `bench-topopt` (bracket, 99% of its box: the overhead without any sparsity): 0.048 / 0.110 /
+  0.327 → 0.052 / 0.126 / 0.381 s per iteration at 1.3 / 0.8 / 0.5 mm, identical compliances.
+  At 0.3 mm 1.70 → 1.87 s, GPU memory 409 → 449 MB (brick padding: fine level +4%, level 2 +18%).
+- `book_stand1` (`--ground slide`, domain 61% of its bricks): fine-stage memory 53 → 39 MB, run
+  12.4 → 11.6 s, compliance 3.1960 → 3.1963.
+- `stand_leg`: 44 → 57 MB, 11.0 → 11.7 s, compliance 5.7674 → 5.7672. A small grid in three
+  symmetry hierarchies: its coarse levels round up to whole bricks (level 2: 3,840 stored nodes
+  for 2,100) at 1200 B per level-2 element matrix.
+
+**Verified:** `kernels_match_cpu` now runs 12 cases (3D and slabs along each axis, domain filling
+the box or a hollow shell): every kernel within 4e-7 of the CPU. `gpu_loop_matches_cpu_loop`
+(projection, overhang, several build directions), the symmetric-quarter test and the rest pass.
+Clippy clean.
+
+**Still open:** element matrices only for bricks holding an active element (node-only bricks'
+matrices are zero) would remove most coarse-level padding. The largest grid that fits isn't
+measured. Next: the fine stage starting from the coarse design's live bricks (plan step 6), where
+sparsity also saves time.
+
 ## 2026-11-15: Sparse grid PoC: bricks and a sparse `apply_fine`
 
 **Why:** to see how the block-sparse plan (`docs/sparse-grid-plan.md`) would go before committing to

@@ -46,7 +46,7 @@ pub enum Reduce {
 }
 
 pub struct Step {
-    kernel: &'static str,
+    pipe: wgpu::ComputePipeline,
     bind: wgpu::BindGroup,
     groups: [u32; 3],
 }
@@ -69,16 +69,13 @@ pub fn dims4(n: [usize; 3]) -> [u32; 4] {
     [n[0] as u32, n[1] as u32, n[2] as u32, 0]
 }
 
-/// Kernels compiled again under another name with other values of some of their `const u32`
-/// declarations (kernel, variant, constants), substituted in the source: constant strides are
-/// measurably faster than ones passed in `Params`. (Not WGSL `override` constants: naga 30 fails to
-/// specialize `apply_p` with them, `ExpressionAlreadyInScope`.)
-type Variant = (&'static str, &'static str, &'static [(&'static str, u32)]);
-const VARIANTS: &[Variant] = &[
-    ("apply_p", "apply_p_slab_x", &[("TX", 2), ("TY", 8), ("TZ", 8)]),
-    ("apply_p", "apply_p_slab_y", &[("TX", 8), ("TY", 2), ("TZ", 8)]),
-    ("apply_p", "apply_p_slab_z", &[("TX", 8), ("TY", 8), ("TZ", 2)]),
-];
+/// Brick shapes (bricks.rs): kernels tagged `bricks` (`//// kernel NAME bricks`) are compiled once
+/// per shape, under their name plus the suffix, with the prelude's `BX`, `BY`, `BZ` set to it (and
+/// the tile sizes `HN`, `EN`, `CN` that follow from it).
+/// Constant strides are measurably faster than ones passed in `Params`. (Not WGSL `override`
+/// constants: naga 30 fails to specialize some kernels with them, `ExpressionAlreadyInScope`.)
+pub const BRICK_SHAPES: [(&str, [usize; 3]); 4] =
+    [("", [4, 4, 4]), ("@x", [2, 8, 4]), ("@y", [8, 2, 4]), ("@z", [8, 4, 2])];
 
 /// `src` with `const NAME: u32 = ...;` set to each of `constants`.
 fn with_constants(src: &str, constants: &[(&str, u32)]) -> Result<String> {
@@ -92,9 +89,78 @@ fn with_constants(src: &str, constants: &[(&str, u32)]) -> Result<String> {
     Ok(out)
 }
 
+/// The sections of the WGSL sources: lines `//// prelude`, `//// lib NAME` and `//// kernel NAME
+/// [bricks]` start one (text before the first is a comment). Returns the prelude, the libs and the
+/// kernels (name, tagged `bricks`, body).
+#[allow(clippy::type_complexity)]
+fn sections() -> Result<(String, HashMap<String, String>, Vec<(String, bool, String)>)> {
+    let mut prelude = None;
+    let mut libs = HashMap::new();
+    let mut kernels = vec![];
+    for src in SOURCES {
+        let mut head: Option<&str> = None;
+        let mut body = String::new();
+        let mut flush = |head: Option<&str>, body: &mut String| -> Result<()> {
+            let text = std::mem::take(body);
+            let Some(h) = head else { return Ok(()) };
+            let mut words = h.split_whitespace();
+            match (words.next(), words.next()) {
+                (Some("prelude"), _) => prelude = Some(text),
+                (Some("lib"), Some(name)) => {
+                    libs.insert(name.to_string(), text);
+                }
+                (Some("kernel"), Some(name)) => {
+                    let bricks = words.next() == Some("bricks");
+                    kernels.push((name.to_string(), bricks, text));
+                }
+                _ => return Err(anyhow!("bad section header `//// {h}`")),
+            }
+            Ok(())
+        };
+        for line in src.lines() {
+            if let Some(h) = line.strip_prefix("//// ") {
+                flush(head, &mut body)?;
+                head = Some(h);
+            } else {
+                body.push_str(line);
+                body.push('\n');
+            }
+        }
+        flush(head, &mut body)?;
+    }
+    Ok((prelude.ok_or_else(|| anyhow!("no prelude"))?, libs, kernels))
+}
+
+/// `body` with each line `#include LIB KEY=VALUE ...` replaced by that lib, `$KEY` set to VALUE.
+fn expand(body: &str, libs: &HashMap<String, String>) -> Result<String> {
+    let mut out = String::new();
+    for line in body.lines() {
+        match line.trim().strip_prefix("#include ") {
+            Some(rest) => {
+                let mut words = rest.split_whitespace();
+                let name = words.next().unwrap_or("");
+                let mut text = libs.get(name).ok_or_else(|| anyhow!("no lib `{name}`"))?.clone();
+                for kv in words {
+                    let (k, v) = kv
+                        .split_once('=')
+                        .ok_or_else(|| anyhow!("bad include argument `{kv}`"))?;
+                    text = text.replace(&format!("${k}"), v);
+                }
+                // libs may include others
+                out.push_str(&expand(&text, libs)?);
+            }
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub struct Engine<'g> {
     pub gpu: &'g Gpu,
-    pipes: HashMap<&'static str, wgpu::ComputePipeline>,
+    pipes: HashMap<String, wgpu::ComputePipeline>,
     pub scalars: wgpu::Buffer,
     partials: wgpu::Buffer,
     /// bytes of storage buffers allocated through `buf`/`init`
@@ -104,41 +170,40 @@ pub struct Engine<'g> {
 impl<'g> Engine<'g> {
     pub fn new(gpu: &'g Gpu) -> Result<Self> {
         let dev = &gpu.device;
-        let prelude_at = SOURCES[0]
-            .find("//// prelude")
-            .ok_or_else(|| anyhow!("mg.wgsl: no prelude"))?;
-        let prelude_end = SOURCES[0]
-            .find("//// kernel ")
-            .ok_or_else(|| anyhow!("mg.wgsl: no kernels"))?;
-        let prelude = &SOURCES[0][prelude_at + "//// prelude".len()..prelude_end];
+        let (prelude, libs, kernels) = sections()?;
         let mut pipes = HashMap::new();
-        for src in SOURCES {
-            for part in src.split("//// kernel ").skip(1) {
-                let (name, body) = part.split_once('\n').unwrap_or((part, ""));
-                let name: &'static str = name.trim();
-                let src = format!("{prelude}\n{body}");
-                // the kernel, and its variants with other values of its `override` constants
-                let variants = VARIANTS.iter().filter(|v| v.0 == name).map(|v| (v.1, v.2));
-                for (label, constants) in std::iter::once((name, &[][..])).chain(variants) {
-                    let src = with_constants(&src, constants).map_err(|e| anyhow!("kernel {label}: {e}"))?;
-                    let pipe = gpu
-                        .scoped(|| {
-                            let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
-                                label: Some(label),
-                                source: wgpu::ShaderSource::Wgsl(src.into()),
-                            });
-                            dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                                label: Some(label),
-                                layout: None,
-                                module: &module,
-                                entry_point: Some("main"),
-                                compilation_options: Default::default(),
-                                cache: None,
-                            })
+        for (name, bricks, body) in kernels {
+            let src = expand(&format!("{prelude}\n{body}"), &libs).map_err(|e| anyhow!("kernel {name}: {e}"))?;
+            let shapes = if bricks { &BRICK_SHAPES[..] } else { &BRICK_SHAPES[..1] };
+            for (suffix, b) in shapes {
+                let label = format!("{name}{suffix}");
+                let size = |d: usize| b.iter().map(|&v| (v + d) as u32).product::<u32>();
+                let constants = [
+                    ("BX", b[0] as u32),
+                    ("BY", b[1] as u32),
+                    ("BZ", b[2] as u32),
+                    ("HN", size(2)),
+                    ("EN", size(1)),
+                    ("CN", b.iter().map(|&v| (v / 2 + 2) as u32).product()),
+                ];
+                let src = with_constants(&src, &constants).map_err(|e| anyhow!("kernel {label}: {e}"))?;
+                let pipe = gpu
+                    .scoped(|| {
+                        let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some(&label),
+                            source: wgpu::ShaderSource::Wgsl(src.into()),
+                        });
+                        dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some(&label),
+                            layout: None,
+                            module: &module,
+                            entry_point: Some("main"),
+                            compilation_options: Default::default(),
+                            cache: None,
                         })
-                        .map_err(|e| anyhow!("kernel {label}: {e}"))?;
-                    pipes.insert(label, pipe);
-                }
+                    })
+                    .map_err(|e| anyhow!("kernel {label}: {e}"))?;
+                pipes.insert(label, pipe);
             }
         }
         let mut e = Engine {
@@ -206,10 +271,7 @@ impl<'g> Engine<'g> {
     /// Append a dispatch of `kernel` with parameters `p` and storage buffers bound from 1.
     pub fn step(&self, out: &mut Vec<Step>, kernel: &str, p: Params, bufs: &[&wgpu::Buffer], groups: [u32; 3]) {
         let dev = &self.gpu.device;
-        let (&kernel, pipe) = self
-            .pipes
-            .get_key_value(kernel)
-            .unwrap_or_else(|| panic!("no kernel {kernel}"));
+        let pipe = self.pipes.get(kernel).unwrap_or_else(|| panic!("no kernel {kernel}"));
         let uniform = dev.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(kernel),
             contents: bytemuck::bytes_of(&p),
@@ -230,7 +292,11 @@ impl<'g> Engine<'g> {
             layout: &pipe.get_bind_group_layout(0),
             entries: &entries,
         });
-        out.push(Step { kernel, bind, groups });
+        out.push(Step {
+            pipe: pipe.clone(),
+            bind,
+            groups,
+        });
     }
 
     /// y = a y + c x (x / w where w > 0 when `w` is given); a and c optionally times a scalar slot
@@ -368,7 +434,7 @@ impl<'g> Engine<'g> {
             let mut pass = enc.begin_compute_pass(&Default::default());
             for prog in programs {
                 for s in prog.iter() {
-                    pass.set_pipeline(&self.pipes[s.kernel]);
+                    pass.set_pipeline(&s.pipe);
                     pass.set_bind_group(0, &s.bind, &[]);
                     pass.dispatch_workgroups(s.groups[0], s.groups[1], s.groups[2]);
                 }

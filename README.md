@@ -534,8 +534,10 @@ tolerance may change. A run that finishes, or a fresh one (**Start over**), remo
   - Per iteration on an RTX 3080: 0.14 s at 1.2M elements, 1.0 s at 9.5M, 2.7 s at 22M, 5.6 s at
     44M.
   - CPU multigrid: 7.7 s at 1.2M; the old Jacobi-preconditioned CG (`--solver jacobi`): 76 s.
-  - The GPU path needs 164 B per element (`optimize` prints it), so a 10 GB card holds about 45M.
-    Past that, `optimize` says it doesn't fit. The CPU solver allows 8M (~1.2 kB each).
+  - The GPU path needs ~160 B per stored element (`optimize` prints it per domain element): it
+    stores only the 4×4×4 bricks around the domain, so a part filling a fraction of its box costs
+    about that fraction. A 10 GB card holds about 45M elements of a box-filling part. Past that,
+    `optimize` says it doesn't fit. The CPU solver allows 8M (~1.2 kB each).
 - **Shortcuts in this version:**
   - Overhang control: 45° only, and the print direction is one of the six axis directions.
   - 2D: the profile is extruded through the domain's thickest part; no per-column thickness, no
@@ -593,10 +595,10 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/fairing.rs` | smooth surfaces from binary voxels: constrained thin-plate fairing of the field (`--grow` widens the band outward) |
 | `src/topopt/mod.rs` | topology optimization: hex element, matrix-free PCG, filter, OC update |
 | `src/topopt/mg.rs` | multigrid preconditioner: Galerkin coarse levels, Chebyshev/Jacobi smoothers, banded Cholesky |
-| `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32) |
+| `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32), on block-sparse grids |
 | `src/topopt/gpu_opt.rs`, `opt.wgsl` | the optimizer loop on the GPU: stiffness, sensitivities, filter, AM filter, projection, OC |
 | `src/topopt/gpu_engine.rs` | GPU kernels as recorded dispatch programs, reductions, scalars, readback |
-| `src/topopt/bricks.rs` | block-sparse grids (proof of concept, not used by the solver yet): 4³ bricks, page and neighbour tables, gather/scatter |
+| `src/topopt/bricks.rs` | block-sparse grids for the GPU optimizer: 64-point bricks around the domain, page tables, gather/scatter, coarsening |
 | `src/topopt/output.rs` | writing the result as it runs: background writes, decimated previews, full result on Stop |
 | `src/topopt/overhang.rs` | overhang control: the AM filter (layer-by-layer smooth min/max), its adjoint, the unsupported-element count |
 | `src/topopt/plane2d.rs` | 2D optimization: projecting the problem into a one-element slab, extruding the result back onto the 3D grid |

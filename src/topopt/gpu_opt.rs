@@ -2,12 +2,16 @@
 //! energies, sensitivities, density filter, projection and the OC update. Per iteration only
 //! scalars come back (compliance, volume during the λ search, change, grey share, max
 //! displacement), plus the fields when the .vti is written. Mirrors `optimize` in mod.rs.
+//!
+//! Element arrays and vectors are block-sparse (bricks.rs): only the bricks around the domain are
+//! stored, and readback is scattered to the dense grid.
 
 use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Result, bail};
 
+use super::bricks::{self, Bricks};
 use super::gpu_engine::{Engine, NONE, Params, Reduce, Step, dims4, threads};
 use super::gpu_mg::GpuMg;
 use super::mg::MgSettings;
@@ -86,6 +90,11 @@ pub(super) fn optimize_gpu(
     assert!(m.groups.len() <= super::gpu_mg::MAX_GROUPS);
     let e = Engine::new(gpu)?;
     let elements = ne as f64 / 1e6;
+    // the bricks holding the domain's elements and nodes; `nes` elements (and nodes) stored
+    let bricks = Bricks::from_elements(p.n, bricks::shape_for(p.n), &p.domain);
+    let nes = bricks.len();
+    let v = bricks.variant();
+    let bk = |kernel: &str| format!("{kernel}{v}");
     let oom = |err: anyhow::Error| {
         anyhow::anyhow!("{err}: {elements:.1}M elements don't fit on this GPU; use a larger --voxel")
     };
@@ -96,7 +105,16 @@ pub(super) fn optimize_gpu(
             let mut out: Vec<GpuMg> = vec![];
             for (g, group) in m.groups.iter().enumerate() {
                 let free = group.free_mask();
-                let made = GpuMg::new(&e, group, &bases[g], &ke, &free, ms, out.first().map(|o| (o, g)))?;
+                let made = GpuMg::new(
+                    &e,
+                    group,
+                    &bases[g],
+                    &ke,
+                    &free,
+                    ms,
+                    out.first().map(|o| (o, g)),
+                    &bricks,
+                )?;
                 out.push(made);
             }
             Ok(out)
@@ -120,6 +138,7 @@ pub(super) fn optimize_gpu(
             d as u32 | (k as u32) << 1 | ((d && !k) as u32) << 2
         })
         .collect();
+    let flags = bricks.gather(&flags, p.n, 1, 0);
     let x0: Vec<f32> = (0..ne)
         .map(|i| {
             if let Some((x, _)) = &stage.start {
@@ -133,6 +152,9 @@ pub(super) fn optimize_gpu(
             }
         })
         .collect();
+    let x0 = bricks.gather(&x0, p.n, 1, 0.0);
+    let ne = nes;
+    let (page, coords) = mg.fine_tables();
     let f = gpu
         .alloc_scoped(|| Fields {
             flags: e.init("flags", bytemuck::cast_slice(&flags)),
@@ -153,10 +175,14 @@ pub(super) fn optimize_gpu(
         })
         .map_err(oom)?;
     drop((flags, x0));
+    let ndomain = p.domain.iter().filter(|&&d| d).count();
     println!(
-        "GPU memory: {:.0} MB ({:.0} B per element)",
+        "GPU memory: {:.0} MB ({:.0} B per domain element; {} of {} bricks stored, {:.0}% of their elements in the domain)",
         e.allocated() as f64 / 1e6,
-        e.allocated() as f64 / ne as f64
+        e.allocated() as f64 / ndomain as f64,
+        bricks.slots(),
+        bricks.page.len(),
+        100.0 * ndomain as f64 / nes as f64
     );
     let emin = s.e0 * s.emin;
     let elem = |out: &mut Vec<Step>, kernel: &str, pf: [f32; 4], m: [u32; 4], bufs: &[&wgpu::Buffer]| {
@@ -179,7 +205,13 @@ pub(super) fn optimize_gpu(
     // the mirror planes (at the grid's low faces) reflect the filter
     let mirror = (0..3).filter(|&a| m.mirror_axes()[a]).fold(0u32, |b, a| b | 1 << a);
     let filter = |out: &mut Vec<Step>, mode: u32, inp: &wgpu::Buffer, outp: &wgpu::Buffer| {
-        elem(out, "filter", rmin, [0, mode, mirror, 0], &[&f.flags, inp, outp])
+        elem(
+            out,
+            &bk("filter"),
+            rmin,
+            [0, mode, mirror, 0],
+            &[&f.flags, inp, outp, page, coords],
+        )
     };
     // the AM filter, one layer per step: forward from the plate up, the chain rule from the top down.
     // n.w: the build axis, | 4 when built towards its negative side
@@ -215,9 +247,9 @@ pub(super) fn optimize_gpu(
             for l in 0..layers {
                 e.step(
                     out,
-                    "am_fwd",
+                    &bk("am_fwd"),
                     am_params(l),
-                    &[&f.flags, &f.xtilde, &a.xhat, &a.mr],
+                    &[&f.flags, &f.xtilde, &a.xhat, &a.mr, page],
                     threads(layer),
                 );
             }
@@ -254,18 +286,22 @@ pub(super) fn optimize_gpu(
     e.dot(&mut prog_sens, &mg.ee, &mg.ce, None, ne, COMPL);
     elem(
         &mut prog_sens,
-        "sens",
+        &bk("sens"),
         material,
         [0, BETA, mirror, f.am.is_some() as u32],
-        &[&f.flags, &f.xphys, xhat, &mg.ce, &e.scalars, &f.xnew, &f.dvs],
+        &[
+            &f.flags, &f.xphys, xhat, &mg.ce, &e.scalars, &f.xnew, &f.dvs, page, coords,
+        ],
     );
     if let Some(a) = &f.am {
         for l in (0..layers).rev() {
             e.step(
                 &mut prog_sens,
-                "am_adj",
+                &bk("am_adj"),
                 am_params(l),
-                &[&f.flags, &f.xtilde, &a.xhat, &a.mr, &f.xnew, &f.dvs, &a.cc, &a.cv],
+                &[
+                    &f.flags, &f.xtilde, &a.xhat, &a.mr, &f.xnew, &f.dvs, &a.cc, &a.cv, page, coords,
+                ],
                 threads(layer),
             );
         }
@@ -290,7 +326,8 @@ pub(super) fn optimize_gpu(
     e.lin(&mut prog_accept, &f.x, &f.xnew, None, (0.0, NONE), (1.0, NONE), ne);
     // energies of every group's part of every case (summed into `ce`), and each case's largest
     // displacement on every mirror side (the groups' parts with their signs there)
-    let nn: usize = p.n.iter().map(|v| v + 1).product();
+    // stored nodes
+    let nn = nes;
     let ur = (mgs.len() > 1).then(|| e.buf("u, one mirror side", 3 * nn));
     let mut prog_energy = vec![];
     for c in 0..ncases {
@@ -373,15 +410,17 @@ pub(super) fn optimize_gpu(
     // per group: optimizer iterations since the smoothers' λmax was estimated (None: estimate next
     // time)
     let mut estimate_age: Vec<Option<usize>> = vec![None; mgs.len()];
+    // an element array, on the dense grid
+    let read_dense = |b: &wgpu::Buffer| -> Result<Vec<f32>> { Ok(bricks.scatter(&e.read_f32(b, ne)?, p.n, 1, 0.0)) };
     let snapshot = || -> Result<Snapshot> {
-        let ee = e.read_f32(&mg.ee, ne)?;
-        let ce = e.read_f32(&mg.ce, ne)?;
+        let ee = read_dense(&mg.ee)?;
+        let ce = read_dense(&mg.ce)?;
         let h3 = (p.h * p.h * p.h) as f32;
         Ok(Snapshot {
-            density: e.read_f32(&f.xused, ne)?,
+            density: read_dense(&f.xused)?,
             // x̂ (x̃) of the same densities during the run (the OC step hasn't replaced it yet); after
             // the loop it is one OC update newer than `xused`, a small difference
-            filtered: output::filtered_out(p, e.read_f32(xhat, ne)?.into_iter()),
+            filtered: output::filtered_out(p, read_dense(xhat)?.into_iter()),
             energy: ee.iter().zip(&ce).map(|(a, b)| 0.5 * a * b / h3).collect(),
             // per group, per case (the output combines them)
             disps: mgs
@@ -463,7 +502,7 @@ pub(super) fn optimize_gpu(
             } else {
                 // a preview: only the densities come back
                 output.live(Snapshot {
-                    density: e.read_f32(&f.xused, ne)?,
+                    density: read_dense(&f.xused)?,
                     filtered: vec![],
                     energy: vec![],
                     disps: vec![],
@@ -538,7 +577,7 @@ pub(super) fn optimize_gpu(
     }
     if !m.mirror_axes()[s.up.axis()] {
         let am = super::overhang::Am::new(p, m.mirror_axes(), s.up);
-        let xphys: Vec<f64> = e.read_f32(&f.xphys, ne)?.into_iter().map(f64::from).collect();
+        let xphys: Vec<f64> = read_dense(&f.xphys)?.into_iter().map(f64::from).collect();
         am.report(p, &xphys);
     }
     result.beta = beta;
@@ -552,7 +591,7 @@ pub(super) fn optimize_gpu(
     } else {
         output.wait()?;
     }
-    result.design = e.read_f32(&f.x, ne)?.into_iter().map(f64::from).collect();
+    result.design = read_dense(&f.x)?.into_iter().map(f64::from).collect();
     if !stage.quiet {
         super::print_done(&result, t_start, out);
     }

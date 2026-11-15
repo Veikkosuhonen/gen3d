@@ -140,28 +140,28 @@ Mirror planes in `filter`/`sens` keep working: mirror the coordinate, then look 
    That is about the same as the scaling plan's 164 → ~100 B per element. The two multiply, but the
    other one is less work and helps every shape, so it may be the one to do first. Sparsity also
    cuts time, which that doesn't.
-1. **`src/topopt/bricks.rs`.** PoC done (2026-11-15): the brick set and tables, gather/scatter,
-   `coarsen`, plus `apply_fine_sparse` (staged in workgroup memory): exact against the dense kernel,
-   6% slower with every brick stored, 0.85× on 14–44%-full boxes (see the devlog). The WGSL helper
-   is still copied per kernel.
-   Planned scope: The brick set: build from the domain, coarsen, page and neighbour
-   tables, gather/scatter dense ↔ slots, `index(i, j, k) -> Option<usize>`. Unit tests: round trip,
-   an all-active set matches the dense count, the coarse set covers every fine brick's children and
-   nodes. Plus the WGSL prelude helpers (`elem_slot`, `node_slot`, neighbour lookup).
-2. **Port the solver kernels, one at a time**, each checked against the CPU on small grids (sparse
-   GPU → scatter → compare), in the scaling plan's order: `apply_fine`, `diag_fine`,
-   `restrict`/`prolong`, `diag_l1`, `assemble`/`apply_elem`/`diag_elem`, `bottom`, then a full
-   MGCG solve.
-3. **Port the optimizer kernels**: `stiffness`, `sens`, `filter`, `energy`, `am_fwd`/`am_adj`, then
-   the whole iteration (`gpu_loop_matches_cpu_loop`, with and without symmetry, overhang, 2D).
-4. **Host glue**: buffer sizes from slots in `gpu_mg.rs`/`gpu_opt.rs`, load remapping, readback
-   scatter for output, checkpoints and coarse start. The dense GPU layout is removed, not kept
-   beside it: an all-active brick set is the dense case.
+1. **`src/topopt/bricks.rs`.** Done (2026-11-15). Page tables and per-slot coordinates, no
+   neighbour table: kernels load the 27 slots around their brick into workgroup memory (`nbhd` in
+   mg.wgsl). Shared WGSL goes in `//// lib` sections, pulled in by `#include`.
+2. **Port the solver kernels.** Done (2026-11-15): every level is brick-sparse. `kernels_match_cpu`
+   runs on full and shell-shaped domains, 3D and slabs: all agree with the CPU to f32 rounding.
+3. **Port the optimizer kernels.** Done (2026-11-15). `filter`/`sens`/`am_*` look neighbours up
+   through the page table; absent elements read as outside the domain.
+4. **Host glue.** Done (2026-11-15): the GPU optimizer stores the bricks of the domain; the dense
+   layout is gone. Slabs use 2×8×4-like bricks (kernels compiled per shape).
 5. **Benchmark the box sparsity.**
    - `bench-topopt` on `bracket_domain` (96% fill) bounds the lookup overhead: target ≤ 15% slower
      per iteration than today.
    - The sparse shapes from step 0: memory per *domain* element, and iteration time, before/after.
    - The largest grid that fits on the card, against today's ~45M box elements.
+
+   Partly done (2026-11-15, see the devlog): `bench-topopt` +8/+15/+17% at 1.3/0.8/0.5 mm, CG
+   iteration on a 9.6M box +11% (accepted: tuning further would be tuning for one GPU).
+   `book_stand1` 53 → 39 MB. **Coarse-level padding**: on small grids a coarse level rounds up
+   to bricks (level 2 of `stand_leg`: 3,840 stored nodes for 2,100), and level-2+ element
+   matrices cost 1200 B each, so `stand_leg` went 44 → 57 MB and the full bracket at 0.3 mm
+   409 → 449 MB. Fix if it matters: store element matrices only for bricks that hold an active
+   element (node-only bricks' matrices are zero). Largest grid: not measured yet.
 6. **The fine stage starts sparse** (see "Void"): the active set from the prolonged coarse design,
    the filter's dropped-element handling, dropped elements written as 0. Verify: compliance within
    0.5% of the full-domain run on `bracket_domain` and the shapes from step 0, with the brick count

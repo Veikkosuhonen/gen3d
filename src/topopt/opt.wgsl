@@ -1,6 +1,52 @@
 // GPU kernels for the optimizer's per-element steps (see gpu_opt.rs; mirrors the CPU code in mod.rs).
 // Uses the prelude of mg.wgsl. Element flags: bit 0 domain, bit 1 kept solid (passive), bit 2 design
-// (domain and not passive). Elements are x-fastest on a grid of P.n elements.
+// (domain and not passive). Elements are in the fine grid's brick layout (P.m.x of them stored);
+// kernels that look at neighbours get its page table and slot coordinates. Elements of absent bricks
+// read as outside the domain.
+
+//// lib elem_grid
+#include lookup NAME=fat PAGE=page
+
+// grid coordinates of stored element e
+fn elem_point(e: u32) -> vec3<i32> {
+    return vec3<i32>(coords[e / BV].xyz * bshape() + unflat(e % BV, bshape()));
+}
+
+// the domain flag of the element at p (with the mirror planes P.m.z reflecting it), or false
+// outside the grid
+fn in_domain(p: vec3<i32>) -> bool {
+    if any(p >= vec3<i32>(P.n.xyz)) { return false; }
+    let g = fat(p, nbricks(P.n.xyz));
+    return g != NONE && (flags[g] & 1u) != 0u;
+}
+
+// the mirror image of p in the planes P.m.z (bits x, y, z) at the grid's low faces
+fn mirror(p: vec3<i32>) -> vec3<i32> {
+    var q = p;
+    for (var a = 0u; a < 3u; a++) {
+        if q[a] < 0 && ((P.m.z >> a) & 1u) != 0u { q[a] = -q[a] - 1; }
+    }
+    return q;
+}
+
+// the filter's weight sum at stored element e (Σ rmin - distance over domain elements within rmin
+// = P.g.z)
+fn weight_sum(e: u32) -> f32 {
+    let p = elem_point(e);
+    let rmin = P.g.z;
+    let r = i32(ceil(rmin));
+    var s = 0.0;
+    for (var dk = -r; dk <= r; dk++) {
+        for (var dj = -r; dj <= r; dj++) {
+            for (var di = -r; di <= r; di++) {
+                let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
+                if w <= 0.0 { continue; }
+                if in_domain(mirror(p + vec3<i32>(di, dj, dk))) { s += w; }
+            }
+        }
+    }
+    return s;
+}
 
 //// kernel stiffness
 // ee = (E_min + x^p (E0 - E_min)) h on the domain, 0 elsewhere. P.f = (E_min, E0, p, h)
@@ -22,12 +68,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     ee[e] = v;
 }
 
-//// kernel sens
+//// kernel sens bricks
 // Compliance and volume sensitivities of the design elements through the projection, divided by
 // the filter weight sums (ready for the filter's transpose); 0 elsewhere. With the AM filter
 // (P.m.w = 1) not divided: `am_adj` continues the chain rule and divides. `xtilde` is the
 // projection's input (x̂ with the AM filter).
-// P.f = (E_min, E0, p, h), P.g.y = η, P.g.z = rmin, β = S[P.m.y]
+// P.f = (E_min, E0, p, h), P.g.y = η, P.g.z = rmin, β = S[P.m.y], mirror planes P.m.z
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
 @group(0) @binding(2) var<storage, read> xphys: array<f32>;
 @group(0) @binding(3) var<storage, read> xtilde: array<f32>;
@@ -35,36 +81,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(5) var<storage, read> S: array<f32>;
 @group(0) @binding(6) var<storage, read_write> dcs: array<f32>;
 @group(0) @binding(7) var<storage, read_write> dvs: array<f32>;
+@group(0) @binding(8) var<storage, read> page: array<u32>;
+@group(0) @binding(9) var<storage, read> coords: array<vec4<u32>>;
 
-// the filter's weight sum at element e (Σ rmin - distance over domain elements within rmin)
-fn weight_sum(e: u32) -> f32 {
-    let n = vec3<i32>(P.n.xyz);
-    let ie = i32(e);
-    let p = vec3<i32>(ie % n.x, (ie / n.x) % n.y, ie / (n.x * n.y));
-    let rmin = P.g.z;
-    let r = i32(ceil(rmin));
-    var s = 0.0;
-    let mir = P.m.z;
-    for (var dk = -r; dk <= r; dk++) {
-        var k = p.z + dk;
-        if k < 0 && (mir & 4u) != 0u { k = -k - 1; }
-        if k < 0 || k >= n.z { continue; }
-        for (var dj = -r; dj <= r; dj++) {
-            var j = p.y + dj;
-            if j < 0 && (mir & 2u) != 0u { j = -j - 1; }
-            if j < 0 || j >= n.y { continue; }
-            for (var di = -r; di <= r; di++) {
-                var i = p.x + di;
-                if i < 0 && (mir & 1u) != 0u { i = -i - 1; }
-                if i < 0 || i >= n.x { continue; }
-                let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
-                if w <= 0.0 { continue; }
-                if (flags[u32((k * n.y + j) * n.x + i)] & 1u) != 0u { s += w; }
-            }
-        }
-    }
-    return s;
-}
+#include elem_grid
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
@@ -92,7 +112,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     dvs[e] = dv;
 }
 
-//// kernel filter
+//// kernel filter bricks
 // Cone filter over domain elements within P.f.x voxels (weights rmin - distance). P.m.y: 0 the raw
 // weighted sum on domain elements; 1 densities: kept-solid 1, domain the weighted mean, else 0.
 // P.m.z: axes (bits x, y, z) whose low face is a mirror plane: neighbours past it are the mirror
@@ -100,13 +120,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
 @group(0) @binding(2) var<storage, read> inp: array<f32>;
 @group(0) @binding(3) var<storage, read_write> outp: array<f32>;
+@group(0) @binding(4) var<storage, read> page: array<u32>;
+@group(0) @binding(5) var<storage, read> coords: array<vec4<u32>>;
+
+#include elem_grid
 
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
     let e = flat(wg, nwg, li);
-    let n = vec3<i32>(P.n.xyz);
-    if e >= u32(n.x * n.y * n.z) { return; }
+    if e >= P.m.x { return; }
     let f = flags[e];
     if (f & 1u) == 0u {
         outp[e] = 0.0;
@@ -116,28 +139,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         outp[e] = 1.0;
         return;
     }
-    let ie = i32(e);
-    let p = vec3<i32>(ie % n.x, (ie / n.x) % n.y, ie / (n.x * n.y));
+    let p = elem_point(e);
+    let n = vec3<i32>(P.n.xyz);
+    let nb = nbricks(P.n.xyz);
     let rmin = P.f.x;
     let r = i32(ceil(rmin));
     var s = 0.0;
     var ws = 0.0;
-    let mir = P.m.z;
     for (var dk = -r; dk <= r; dk++) {
-        var k = p.z + dk;
-        if k < 0 && (mir & 4u) != 0u { k = -k - 1; }
-        if k < 0 || k >= n.z { continue; }
         for (var dj = -r; dj <= r; dj++) {
-            var j = p.y + dj;
-            if j < 0 && (mir & 2u) != 0u { j = -j - 1; }
-            if j < 0 || j >= n.y { continue; }
             for (var di = -r; di <= r; di++) {
-                var i = p.x + di;
-                if i < 0 && (mir & 1u) != 0u { i = -i - 1; }
-                if i < 0 || i >= n.x { continue; }
                 let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
                 if w <= 0.0 { continue; }
-                let m = u32((k * n.y + j) * n.x + i);
+                let q = mirror(p + vec3<i32>(di, dj, dk));
+                if any(q >= n) { continue; }
+                let m = fat(q, nb);
+                if m == NONE { continue; }
                 if (flags[m] & 1u) != 0u {
                     s += w * inp[m];
                     ws += w;
@@ -200,7 +217,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     xphys[e] = (tanh(beta * eta) + tanh(beta * (v - eta))) / (tanh(beta * eta) + tanh(beta * (1.0 - eta)));
 }
 
-//// kernel am_fwd
+//// kernel am_fwd bricks
 // The AM filter (overhang.rs) on layer l = P.m.y (in build order): printed densities xi (design
 // elements: smin(x, smax of the supports' xi in the layer below), kept-solid 1, else 0; x itself on
 // the plate layer P.m.w and before) and per element its supports' largest xi m and r = Σ (xi / m)^P
@@ -209,6 +226,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(2) var<storage, read> x: array<f32>;
 @group(0) @binding(3) var<storage, read_write> xi: array<f32>;
 @group(0) @binding(4) var<storage, read_write> mr: array<vec2<f32>>;
+@group(0) @binding(5) var<storage, read> page: array<u32>;
+
+#include lookup NAME=fat PAGE=page
 
 // The build axis b = P.n.w & 3, built towards -b when P.n.w & 4. Layers l in build order, each
 // element in a layer at lateral (u, v) along the two other axes (in order).
@@ -225,6 +245,7 @@ fn lat_dims() -> vec2<i32> {
     return vec2<i32>(n[a.x], n[a.y]);
 }
 
+// the stored element at lateral c of layer l, or NONE
 fn elem_at(c: vec2<i32>, l: u32) -> u32 {
     let n = vec3<i32>(P.n.xyz);
     let b = P.n.w & 3u;
@@ -235,7 +256,14 @@ fn elem_at(c: vec2<i32>, l: u32) -> u32 {
     var w = i32(l);
     if (P.n.w & 4u) != 0u { w = n[b] - 1 - w; }
     p[b] = w;
-    return u32((p.z * n.y + p.y) * n.x + p.x);
+    return fat(p, nbricks(P.n.xyz));
+}
+
+// xi at lateral c of layer l (0 when not stored)
+fn xi_at(c: vec2<i32>, l: u32) -> f32 {
+    let g = elem_at(c, l);
+    if g == NONE { return 0.0; }
+    return xi[g];
 }
 
 // support st (0..5: below, -u, +u, -v, +v) of lateral position c: its position, or x = -1. The
@@ -271,6 +299,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let nl = lat_dims();
     let c = vec2<i32>(i32(t) % nl.x, i32(t) / nl.x);
     let e = elem_at(c, l);
+    if e == NONE { return; }
     let f = flags[e];
     var v = 0.0;
     var m = 0.0;
@@ -283,13 +312,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         } else {
             for (var st = 0u; st < 5u; st++) {
                 let q = support(c, st);
-                if q.x >= 0 { m = max(m, xi[elem_at(q, l - 1u)]); }
+                if q.x >= 0 { m = max(m, xi_at(q, l - 1u)); }
             }
             var b = 0.0;
             if m > 0.0 {
                 for (var st = 0u; st < 5u; st++) {
                     let q = support(c, st);
-                    if q.x >= 0 { r += powp(xi[elem_at(q, l - 1u)] / m, P.f.x); }
+                    if q.x >= 0 { r += powp(xi_at(q, l - 1u) / m, P.f.x); }
                 }
                 b = pow(m, P.f.w) * pow(r, P.f.y);
             }
@@ -303,7 +332,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     mr[e] = vec2<f32>(m, r);
 }
 
-//// kernel am_adj
+//// kernel am_adj bricks
 // The AM filter's chain rule on layer l = P.m.y, run from the last layer back (overhang.rs's
 // `sensitivities`): dc and dv hold df/dxi of the design elements and become df/dx divided by the
 // filter weight sums (ready for the density filter's transpose, as `sens` leaves them without the
@@ -318,6 +347,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(6) var<storage, read_write> dv: array<f32>;
 @group(0) @binding(7) var<storage, read_write> cc: array<f32>;
 @group(0) @binding(8) var<storage, read_write> cv: array<f32>;
+@group(0) @binding(9) var<storage, read> page: array<u32>;
+@group(0) @binding(10) var<storage, read> coords: array<vec4<u32>>;
+
+#include elem_grid
 
 // The build axis b = P.n.w & 3, built towards -b when P.n.w & 4. Layers l in build order, each
 // element in a layer at lateral (u, v) along the two other axes (in order).
@@ -334,6 +367,7 @@ fn lat_dims() -> vec2<i32> {
     return vec2<i32>(n[a.x], n[a.y]);
 }
 
+// the stored element at lateral c of layer l, or NONE
 fn elem_at(c: vec2<i32>, l: u32) -> u32 {
     let n = vec3<i32>(P.n.xyz);
     let b = P.n.w & 3u;
@@ -344,7 +378,14 @@ fn elem_at(c: vec2<i32>, l: u32) -> u32 {
     var w = i32(l);
     if (P.n.w & 4u) != 0u { w = n[b] - 1 - w; }
     p[b] = w;
-    return u32((p.z * n.y + p.y) * n.x + p.x);
+    return fat(p, nbricks(P.n.xyz));
+}
+
+// xi at lateral c of layer l (0 when not stored)
+fn xi_at(c: vec2<i32>, l: u32) -> f32 {
+    let g = elem_at(c, l);
+    if g == NONE { return 0.0; }
+    return xi[g];
 }
 
 // support st (0..5: below, -u, +u, -v, +v) of lateral position c: its position, or x = -1. The
@@ -371,36 +412,6 @@ fn powp(v: f32, e: f32) -> f32 {
     return select(0.0, pow(v, e), v > 0.0);
 }
 
-// the density filter's weight sum at element e (as in `sens`)
-fn weight_sum(e: u32) -> f32 {
-    let n = vec3<i32>(P.n.xyz);
-    let ie = i32(e);
-    let p = vec3<i32>(ie % n.x, (ie / n.x) % n.y, ie / (n.x * n.y));
-    let rmin = P.g.z;
-    let r = i32(ceil(rmin));
-    var s = 0.0;
-    let mir = P.m.z;
-    for (var dk = -r; dk <= r; dk++) {
-        var k = p.z + dk;
-        if k < 0 && (mir & 4u) != 0u { k = -k - 1; }
-        if k < 0 || k >= n.z { continue; }
-        for (var dj = -r; dj <= r; dj++) {
-            var j = p.y + dj;
-            if j < 0 && (mir & 2u) != 0u { j = -j - 1; }
-            if j < 0 || j >= n.y { continue; }
-            for (var di = -r; di <= r; di++) {
-                var i = p.x + di;
-                if i < 0 && (mir & 1u) != 0u { i = -i - 1; }
-                if i < 0 || i >= n.x { continue; }
-                let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
-                if w <= 0.0 { continue; }
-                if (flags[u32((k * n.y + j) * n.x + i)] & 1u) != 0u { s += w; }
-            }
-        }
-    }
-    return s;
-}
-
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
@@ -411,6 +422,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let nl = lat_dims();
     let c = vec2<i32>(i32(t) % nl.x, i32(t) / nl.x);
     let e = elem_at(c, l);
+    if e == NONE { return; }
     let f = flags[e];
     if (f & 4u) == 0u {
         dc[e] = 0.0;
@@ -439,6 +451,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             }
             if mult == 0.0 { continue; }
             let a = elem_at(q, l + 1u);
+            if a == NONE { continue; }
             let m = mr[a].x;
             if m <= 0.0 { continue; }
             let w = mult * powp(xi[e] / m, P.f.x - 1.0);
