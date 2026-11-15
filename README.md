@@ -596,6 +596,7 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32) |
 | `src/topopt/gpu_opt.rs`, `opt.wgsl` | the optimizer loop on the GPU: stiffness, sensitivities, filter, AM filter, projection, OC |
 | `src/topopt/gpu_engine.rs` | GPU kernels as recorded dispatch programs, reductions, scalars, readback |
+| `src/topopt/bricks.rs` | block-sparse grids (proof of concept, not used by the solver yet): 4³ bricks, page and neighbour tables, gather/scatter |
 | `src/topopt/output.rs` | writing the result as it runs: background writes, decimated previews, full result on Stop |
 | `src/topopt/overhang.rs` | overhang control: the AM filter (layer-by-layer smooth min/max), its adjoint, the unsupported-element count |
 | `src/topopt/plane2d.rs` | 2D optimization: projecting the problem into a one-element slab, extruding the result back onto the 3D grid |

@@ -140,7 +140,11 @@ Mirror planes in `filter`/`sens` keep working: mirror the coordinate, then look 
    That is about the same as the scaling plan's 164 → ~100 B per element. The two multiply, but the
    other one is less work and helps every shape, so it may be the one to do first. Sparsity also
    cuts time, which that doesn't.
-1. **`src/topopt/bricks.rs`.** The brick set: build from the domain, coarsen, page and neighbour
+1. **`src/topopt/bricks.rs`.** PoC done (2026-11-15): the brick set and tables, gather/scatter,
+   `coarsen`, plus `apply_fine_sparse` (staged in workgroup memory): exact against the dense kernel,
+   6% slower with every brick stored, 0.85× on 14–44%-full boxes (see the devlog). The WGSL helper
+   is still copied per kernel.
+   Planned scope: The brick set: build from the domain, coarsen, page and neighbour
    tables, gather/scatter dense ↔ slots, `index(i, j, k) -> Option<usize>`. Unit tests: round trip,
    an all-active set matches the dense count, the coarse set covers every fine brick's children and
    nodes. Plus the WGSL prelude helpers (`elem_slot`, `node_slot`, neighbour lookup).

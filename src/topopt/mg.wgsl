@@ -121,6 +121,149 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     }
 }
 
+//// kernel apply_fine_sparse
+// `apply_fine` on a block-sparse grid (bricks.rs, PoC): 4³ bricks, values slot-major (slot · 64 +
+// local, local x-fastest), `nbr` the 27 neighbour slots of each slot (NONE: absent, reads as 0).
+// One 64-thread workgroup per slot (P.m.y slots): it stages the brick's nodes with a one-node halo
+// (6³) of u and its elements with a one-element halo on the − sides (5³) of ee in workgroup memory,
+// then each thread applies K at its node as `apply_fine`.
+@group(0) @binding(1) var<storage, read> ee: array<f32>;
+@group(0) @binding(2) var<storage, read> free: array<u32>;
+@group(0) @binding(3) var<storage, read> ke: array<f32>;
+@group(0) @binding(4) var<storage, read> u: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+@group(0) @binding(6) var<storage, read> nbr: array<u32>;
+
+var<workgroup> su: array<vec3<f32>, 216>;
+var<workgroup> se: array<f32, 125>;
+
+// sparse index of local point q (each axis in -4..7) of slot `slot`'s brick, or NONE
+fn brick_index(slot: u32, q: vec3<i32>) -> u32 {
+    let bo = (q + vec3<i32>(4)) / 4 - vec3<i32>(1);
+    let d = vec3<u32>(bo + vec3<i32>(1));
+    let nb = nbr[slot * 27u + d.x + 3u * d.y + 9u * d.z];
+    if nb == NONE { return NONE; }
+    let l = vec3<u32>(q - 4 * bo);
+    return nb * 64u + l.x + 4u * l.y + 16u * l.z;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let slot = wg_flat(wg, nwg);
+    if slot >= P.m.y { return; }
+    for (var s = li; s < 216u; s += 64u) {
+        let q = vec3<i32>(i32(s % 6u), i32((s / 6u) % 6u), i32(s / 36u)) - vec3<i32>(1);
+        let g = brick_index(slot, q);
+        var v = vec3<f32>(0.0);
+        if g != NONE { v = vec3<f32>(u[3u * g], u[3u * g + 1u], u[3u * g + 2u]); }
+        su[s] = v;
+    }
+    for (var s = li; s < 125u; s += 64u) {
+        let q = vec3<i32>(i32(s % 5u), i32((s / 5u) % 5u), i32(s / 25u)) - vec3<i32>(1);
+        let g = brick_index(slot, q);
+        var v = 0.0;
+        if g != NONE { v = ee[g]; }
+        se[s] = v;
+    }
+    workgroupBarrier();
+    let node = slot * 64u + li;
+    let l = vec3<u32>(li % 4u, (li / 4u) % 4u, li / 16u);
+    let fm = free[node];
+    var acc = vec3<f32>(0.0);
+    if fm != 0u {
+        // this node in the halo tiles: u at l + 1 (6³), the element at l - d at l + 1 - d (5³)
+        let h = (l.x + 1u) + 6u * (l.y + 1u) + 36u * (l.z + 1u);
+        let he = (l.x + 1u) + 5u * (l.y + 1u) + 25u * (l.z + 1u);
+        for (var a = 0u; a < 8u; a++) {
+            let di = a & 1u;
+            let dj = (a >> 1u) & 1u;
+            let dk = (a >> 2u) & 1u;
+            let s = se[he - di - 5u * dj - 25u * dk];
+            if s == 0.0 { continue; }
+            let base = h - di - 6u * dj - 36u * dk;
+            let u0 = su[base];
+            for (var c = 1u; c < 8u; c++) {
+                let um = su[base + (c & 1u) + 6u * ((c >> 1u) & 1u) + 36u * ((c >> 2u) & 1u)] - u0;
+                let r = (3u * a) * 24u + 3u * c;
+                acc.x += s * dot(vec3<f32>(ke[r], ke[r + 1u], ke[r + 2u]), um);
+                acc.y += s * dot(vec3<f32>(ke[r + 24u], ke[r + 25u], ke[r + 26u]), um);
+                acc.z += s * dot(vec3<f32>(ke[r + 48u], ke[r + 49u], ke[r + 50u]), um);
+            }
+        }
+        acc *= free3(fm);
+    }
+    if P.m.x == 1u {
+        y[3u * node] -= acc.x;
+        y[3u * node + 1u] -= acc.y;
+        y[3u * node + 2u] -= acc.z;
+    } else {
+        y[3u * node] = acc.x;
+        y[3u * node + 1u] = acc.y;
+        y[3u * node + 2u] = acc.z;
+    }
+}
+
+//// kernel apply_fine_sparse_direct
+// `apply_fine_sparse` without workgroup memory: each thread looks its elements and their nodes up
+// through `nbr` (the 8 element lookups, and the element's other nodes off its node 0).
+@group(0) @binding(1) var<storage, read> ee: array<f32>;
+@group(0) @binding(2) var<storage, read> free: array<u32>;
+@group(0) @binding(3) var<storage, read> ke: array<f32>;
+@group(0) @binding(4) var<storage, read> u: array<f32>;
+@group(0) @binding(5) var<storage, read_write> y: array<f32>;
+@group(0) @binding(6) var<storage, read> nbr: array<u32>;
+
+fn brick_index(slot: u32, q: vec3<i32>) -> u32 {
+    let bo = (q + vec3<i32>(4)) / 4 - vec3<i32>(1);
+    let d = vec3<u32>(bo + vec3<i32>(1));
+    let nb = nbr[slot * 27u + d.x + 3u * d.y + 9u * d.z];
+    if nb == NONE { return NONE; }
+    let l = vec3<u32>(q - 4 * bo);
+    return nb * 64u + l.x + 4u * l.y + 16u * l.z;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let slot = wg_flat(wg, nwg);
+    if slot >= P.m.y { return; }
+    let node = slot * 64u + li;
+    let l = vec3<i32>(i32(li % 4u), i32((li / 4u) % 4u), i32(li / 16u));
+    let fm = free[node];
+    var acc = vec3<f32>(0.0);
+    if fm != 0u {
+        for (var a = 0u; a < 8u; a++) {
+            let d = vec3<i32>(i32(a & 1u), i32((a >> 1u) & 1u), i32((a >> 2u) & 1u));
+            let e0 = l - d;
+            let ge = brick_index(slot, e0);
+            if ge == NONE { continue; }
+            let s = ee[ge];
+            if s == 0.0 { continue; }
+            // an element with stiffness has all its nodes stored
+            let u0 = vec3<f32>(u[3u * ge], u[3u * ge + 1u], u[3u * ge + 2u]);
+            for (var c = 1u; c < 8u; c++) {
+                let m = brick_index(slot, e0 + vec3<i32>(i32(c & 1u), i32((c >> 1u) & 1u), i32((c >> 2u) & 1u)));
+                let um = vec3<f32>(u[3u * m], u[3u * m + 1u], u[3u * m + 2u]) - u0;
+                let r = (3u * a) * 24u + 3u * c;
+                acc.x += s * dot(vec3<f32>(ke[r], ke[r + 1u], ke[r + 2u]), um);
+                acc.y += s * dot(vec3<f32>(ke[r + 24u], ke[r + 25u], ke[r + 26u]), um);
+                acc.z += s * dot(vec3<f32>(ke[r + 48u], ke[r + 49u], ke[r + 50u]), um);
+            }
+        }
+        acc *= free3(fm);
+    }
+    if P.m.x == 1u {
+        y[3u * node] -= acc.x;
+        y[3u * node + 1u] -= acc.y;
+        y[3u * node + 2u] -= acc.z;
+    } else {
+        y[3u * node] = acc.x;
+        y[3u * node + 1u] = acc.y;
+        y[3u * node + 2u] = acc.z;
+    }
+}
+
 //// kernel diag_fine
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
 @group(0) @binding(2) var<storage, read> free: array<u32>;

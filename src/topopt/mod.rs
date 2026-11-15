@@ -36,6 +36,7 @@ use crate::shape::Shape;
 use output::Snapshot;
 use symmetry::Model;
 
+mod bricks;
 mod checkpoint;
 mod gpu_engine;
 mod gpu_mg;

@@ -3,6 +3,49 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-15: Sparse grid PoC: bricks and a sparse `apply_fine`
+
+**Why:** to see how the block-sparse plan (`docs/sparse-grid-plan.md`) would go before committing to
+it. Its main risk is the lookup overhead in the stencil kernels.
+
+**What:**
+- `src/topopt/bricks.rs` (plan step 1): the brick set from active elements (a brick is stored when
+  it holds a node of an active element), page table, 27-slot neighbour table, gather/scatter dense ↔
+  slot-major with any width, `index`, `coarsen`. Not wired into the solver yet.
+- Two sparse ports of `apply_fine` in `mg.wgsl`, one 64-thread workgroup per 4³ brick:
+  `apply_fine_sparse` stages the brick's u with a one-node halo (6³) and ee with a one-element halo
+  on the − sides (5³) in workgroup memory, the same pattern as `apply_p`. `apply_fine_sparse_direct`
+  looks every element and node up through the neighbour table.
+
+**Result** (M1 Pro, `profile_sparse_apply`; the dense kernel early-outs on clamped/out-of-domain
+nodes and skips elements with ee = 0):
+
+| shape | domain fill | stored bricks | dense | staged | direct |
+|---|---|---|---|---|---|
+| full box 200×120×400 | 100% | 100% | 23.0 ms | 24.5 ms (1.06×) | 26.6 ms (1.15×) |
+| hollow ball 256³ | 41% | 44% | 21.1 ms | 18.0 ms (0.85×) | 19.7 ms (0.93×) |
+| table 256³ | 11% | 14% | 6.3 ms | 5.3 ms (0.85×) | 5.7 ms (0.91×) |
+
+- Overhead when every brick is stored: 6% with staging, inside the plan's 15% target. Staging is the
+  way to port the stencil kernels.
+- Brick waste: 75–94% of stored elements are domain elements; tables cost 1.8–2.1 B per stored element.
+- **Box sparsity saves memory, not much time.** The dense stencil kernels already skip the space
+  outside the domain cheaply, and the CG iteration is ~95% stencils (level-0 smoother 55 ms and
+  level-1 smoother 66 ms of a 302 ms iteration; the fine `lin`/`dot` are 2 ms each). On the table,
+  memory would be 14% of today's for 0.85× the stencil time.
+- **Void sparsity (plan step 6) saves time too**: void elements inside the domain have E_min
+  stiffness and free nodes, so the dense kernels do full work on them. The sparse kernel costs the
+  same per stored node as the dense one per box node (~2.4 ns), so dropped bricks are time saved.
+
+**Verified:** `sparse_apply_matches_dense`: both sparse kernels, scattered back, match the dense
+kernel exactly on three shell-shaped grids. Unit tests for round trip, all-active = dense, and
+coarse coverage. Clippy clean.
+
+**Still open:** everything past step 1 and the first kernel: `cheb_fine`, `diag_fine`,
+`restrict`/`prolong`, `apply_p` (the largest kernel, across two layouts), the assembled levels, the
+coarsest solve, the optimizer kernels and host glue. 2D slabs need a per-axis brick extent (with 4³
+bricks a 1-element slab stores 2 of 4 node layers).
+
 ## 2026-11-15: `apply_p` tiles for 2D slabs
 
 **Why:** the smoother change's `apply_p` (level 1's mat-vec, one workgroup per 8×4×4 tile of nodes)
