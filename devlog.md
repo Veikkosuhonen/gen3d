@@ -3,6 +3,19 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: Fine elements' clamped-node mask from their free axes
+
+**Why:** `diag_l1` (5 ms of the 17 ms multigrid setup, 9.6M box) and level-2 `assemble` looked
+every fine element's 8 nodes up twice: `fine_free` for their free axes, then `fine_mask` again for
+the clamped-node mask that indexes the Pᵀ ke P table.
+
+**What:** `clamped_mask(fm)` derives the mask from `fine_free`'s result (node b is clamped unless
+its three free bits are set). `fine_mask` is gone.
+
+**Result** (RTX 3080, GPU ms): `diag_l1` 5.0 → 3.0, setup program 17.0 → 14.6.
+
+**Verified:** full suite (`kernels_match_cpu` has supports and rollers on its grids).
+
 ## 2026-11-16: Coarse-level mat-vec in two passes (per element, then per node)
 
 **Why:** `apply_elem` on level 2 took ~1.05 ms per call for 173K nodes (6 ns per node, against

@@ -259,15 +259,12 @@ fn stencil(li: u32, with_u: bool, with_dg: bool) -> Kd {
 
 //// lib fine_free
 // Fine element f's node masks (with `lookup` fat on the fine grid's page table).
-// clamped-node mask: bit b set when its local node b is not free on all axes (the table's index;
-// elements with partly free nodes don't use the table, see `fine_free`)
-fn fine_mask(f: vec3<i32>, nb: vec3<u32>) -> u32 {
+// clamped-node mask from `fine_free`'s result fm: bit b set when its local node b is not free on
+// all axes (the table's index; elements with partly free nodes don't use the table)
+fn clamped_mask(fm: u32) -> u32 {
     var m = 0u;
     for (var b = 0u; b < 8u; b++) {
-        let g = fat(f + vec3<i32>(vec3<u32>(b & 1u, (b >> 1u) & 1u, (b >> 2u) & 1u)), nb);
-        var fv = 0u;
-        if g != NONE { fv = free[g]; }
-        if fv != 7u { m |= 1u << b; }
+        if ((fm >> (3u * b)) & 7u) != 7u { m |= 1u << b; }
     }
     return m;
 }
@@ -573,7 +570,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                 }
                 acc += w * v;
             } else {
-                let base = (fine_mask(f, nbf) * 8u + c) * 576u + (3u * a) * 25u;
+                let base = (clamped_mask(fm) * 8u + c) * 576u + (3u * a) * 25u;
                 acc += w * vec3<f32>(T[base], T[base + 25u], T[base + 50u]);
             }
         }
@@ -866,8 +863,8 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
             if w != 0.0 {
                 fm = fine_free(vec3<i32>(f), nbf);
                 if (fm >> 31u) == 0u {
+                    off = (clamped_mask(fm) * 8u + c1) * 576u;
                     fm = 0u;
-                    off = (fine_mask(vec3<i32>(f), nbf) * 8u + c1) * 576u;
                 }
             }
         }
