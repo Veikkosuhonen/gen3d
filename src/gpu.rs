@@ -134,25 +134,40 @@ impl Gpu {
 
     /// Copy `size` bytes of `src` back to the CPU.
     pub fn read_buffer(&self, src: &wgpu::Buffer, size: u64) -> Result<Vec<u8>> {
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+        let mut data = vec![0u8; size as usize];
+        self.read_into(src, &self.staging(size), &mut data)?;
+        Ok(data)
+    }
+
+    /// A buffer to read back through (`read_into`), of `size` bytes.
+    pub fn staging(&self, size: u64) -> wgpu::Buffer {
+        self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        })
+    }
+
+    /// Copy the first `dst.len()` bytes of `src` into `dst`, through `staging` (`Gpu::staging`, at
+    /// least that large; reusable). Straight from the mapped range: reading a large buffer back
+    /// spent more time allocating staging buffers and copying through intermediate vectors than
+    /// on the transfer itself.
+    pub fn read_into(&self, src: &wgpu::Buffer, staging: &wgpu::Buffer, dst: &mut [u8]) -> Result<()> {
+        let size = dst.len() as u64;
         let mut enc = self.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+        enc.copy_buffer_to_buffer(src, 0, staging, 0, size);
         self.queue.submit([enc.finish()]);
         let (tx, rx) = std::sync::mpsc::channel();
-        staging.map_async(wgpu::MapMode::Read, .., move |r| {
+        staging.map_async(wgpu::MapMode::Read, ..size, move |r| {
             let _ = tx.send(r);
         });
         self.device
             .poll(wgpu::PollType::wait_indefinitely())
             .map_err(|e| anyhow!("gpu poll failed: {e}"))?;
         rx.recv()?.map_err(|e| anyhow!("buffer map failed: {e}"))?;
-        let data = staging.get_mapped_range(..).map_err(|e| anyhow!("{e:?}"))?.to_vec();
+        dst.copy_from_slice(&staging.get_mapped_range(..size).map_err(|e| anyhow!("{e:?}"))?);
         staging.unmap();
-        Ok(data)
+        Ok(())
     }
 }

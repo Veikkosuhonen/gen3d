@@ -3,6 +3,27 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: GPU readback straight into the destination, staging reused
+
+**Why:** timing `export`'s sampling (vase at 0.15 mm, 292M samples in 254 MB slabs): the SDF
+kernel took ~1 ms per slab and the PCIe copy 0.011 s, but each slab's readback took 0.11-0.13 s.
+Creating and dropping a 254 MB staging buffer cost ~0.05 s, `to_vec` of the mapped range 0.053 s,
+and the copy from that vector into the volume another 0.024 s.
+
+**What:** `Gpu::read_into(src, staging, dst)` copies from the mapped range into the caller's slice,
+and `Gpu::staging` makes a staging buffer to reuse. `read_buffer` goes through them. The sampler
+keeps one staging buffer for all slabs and reads into the volume. `Engine::read_f32` reads into its
+`Vec<f32>` (before: `to_vec`, then a cast copy).
+
+Tried and not kept: a sampler workgroup of 8 (z) × 4 × 2 so that a warp's stores are contiguous.
+The kernel is ~1 ms per slab either way.
+
+**Result** (RTX 3080): `export` sampling vase 0.15 mm 1.20 → 0.80 s, gyroid_cube 0.15 mm 0.29 →
+0.21 s, meshes identical. Optimizer output (`bench-topopt` 0.3 mm `io`) 0.012 → 0.010 s per
+iteration.
+
+**Verified:** full suite, both exports (same volume and triangle count), `render` of knob.
+
 ## 2026-11-16: Density filter over a host-built neighbour list
 
 **Why:** timestamps of the optimizer's programs (a temporary hook, not kept) showed the density

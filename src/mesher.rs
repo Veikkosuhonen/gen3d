@@ -180,6 +180,7 @@ pub fn sample_field(shape: &Shape, grid: &Grid, func: &str, comps: usize, gpu: &
 
     let layer = ny * nz * comps;
     let mut vol = vec![0f32; nx * layer];
+    let staging = gpu.staging(buf_size);
     for x0 in (0..nx).step_by(slab) {
         let sx = slab.min(nx - x0);
         let u = SampleUniforms {
@@ -195,8 +196,11 @@ pub fn sample_field(shape: &Shape, grid: &Grid, func: &str, comps: usize, gpu: &
             pass.dispatch_workgroups(sx.div_ceil(4) as u32, ny.div_ceil(4) as u32, nz.div_ceil(4) as u32);
         }
         gpu.queue.submit([enc.finish()]);
-        let bytes = gpu.read_buffer(&out, sx as u64 * layer_bytes)?;
-        vol[x0 * layer..(x0 + sx) * layer].copy_from_slice(bytemuck::cast_slice(&bytes));
+        gpu.read_into(
+            &out,
+            &staging,
+            bytemuck::cast_slice_mut(&mut vol[x0 * layer..(x0 + sx) * layer]),
+        )?;
     }
     Ok(vol)
 }

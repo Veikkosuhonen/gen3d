@@ -539,8 +539,13 @@ impl<'g> Engine<'g> {
     }
 
     pub fn read_f32(&self, b: &wgpu::Buffer, len: usize) -> Result<Vec<f32>> {
-        let bytes = self.gpu.read_buffer(b, (len * 4) as u64)?;
-        Ok(bytemuck::cast_slice(&bytes).to_vec())
+        let mut out = vec![0f32; len];
+        self.gpu.read_into(
+            b,
+            &self.gpu.staging((len * 4) as u64),
+            bytemuck::cast_slice_mut(&mut out),
+        )?;
+        Ok(out)
     }
 
     pub fn read_scalars(&self) -> Result<Vec<f32>> {
