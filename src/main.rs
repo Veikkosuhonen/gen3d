@@ -341,7 +341,8 @@ enum Cmd {
         #[arg(long, default_value_t = 100.0)]
         force: f64,
         /// the part stands on the ground: the bottom of the domain is supported, held vertically
-        /// only (slide) or in all directions (grip)
+        /// only (slide; a few small patches, 4 mm in radius, are also held sideways so it can't
+        /// slide or spin away) or in all directions (grip)
         #[arg(long, value_enum, default_value_t = topopt::Ground::None)]
         ground: topopt::Ground,
         /// Young's modulus in MPa (PLA ~3500)

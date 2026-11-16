@@ -112,7 +112,7 @@ pub enum Ground {
     #[default]
     None,
     /// stands on a slippery surface: held vertically only, free to slide and spread sideways (the
-    /// least pins against sliding and spinning are added)
+    /// least pins against sliding and spinning are added, each a patch of `PIN_PATCH_MM`)
     Slide,
     /// stands on a grippy surface (or is glued down): held in all directions
     Grip,
@@ -592,8 +592,17 @@ fn crop_cells(v: &[f32], n: [usize; 3], a: [usize; 3], b: [usize; 3]) -> Vec<f32
     out
 }
 
+/// Radius of the patch of supported nodes held around each pin (mm; at least 1.5 elements, so a
+/// pin holds its neighbours on coarse grids too).
+pub const PIN_PATCH_MM: f64 = 4.0;
+
 /// Pin the least nodes that keep the part from moving (with mirror planes, their mirror images
-/// too), then check that the supports hold it.
+/// too), then check that the supports hold it. Each pin holds the supported nodes within
+/// `PIN_PATCH_MM` of it, not the node alone: on a slide ground the pins carry a rocked load case's
+/// whole sideways force, and through a single node only the few elements around it resist the part
+/// sliding. That mode was then so soft (300 mm displacements under 100 N on a 0.9 m stand) that
+/// the GPU solver's f32 multigrid stalled on it at some element sizes, and the optimizer saw a
+/// point load at each pin.
 fn pin(p: &mut Problem, mirror: [bool; 3]) -> Result<()> {
     let pts = p.nodes();
     let mut pins = stabilize(p);
@@ -609,16 +618,33 @@ fn pin(p: &mut Problem, mirror: [bool; 3]) -> Result<()> {
             }
         }
     }
+    let r = PIN_PATCH_MM.max(1.5 * p.h);
+    let held: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i] != 0).collect();
     for (i, axes) in pins {
-        p.fixed[i] |= axes;
         let q = p.node_pos(i);
+        let patch: Vec<usize> = held
+            .iter()
+            .copied()
+            .filter(|&j| {
+                let o = p.node_pos(j);
+                (0..3).map(|c| (o[c] - q[c]).powi(2)).sum::<f64>() <= r * r * (1.0 + 1e-9)
+            })
+            .collect();
+        for &j in &patch {
+            p.fixed[j] |= axes;
+        }
+        p.fixed[i] |= axes;
         let names: String = (0..3)
             .filter(|c| axes >> c & 1 == 1)
             .map(|c| ['X', 'Y', 'Z'][c])
             .collect();
         println!(
-            "pinned the node at ({:.1}, {:.1}, {:.1}) in {names}: the supports alone let the part move",
-            q[0], q[1], q[2]
+            "pinned {} node{} around ({:.1}, {:.1}, {:.1}) in {names}: the supports alone let the part move",
+            patch.len().max(1),
+            if patch.len() > 1 { "s" } else { "" },
+            q[0],
+            q[1],
+            q[2]
         );
     }
     if rigid_rank(p) < 6 {
@@ -2542,8 +2568,16 @@ pub(super) mod tests {
         let bottom = p.node_pos(p.fixed.iter().position(|f| *f != 0).unwrap())[2];
         let held: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i] != 0).collect();
         assert!(held.iter().all(|&i| p.fixed[i] & 4 != 0 && p.node_pos(i)[2] == bottom));
-        let pinned: usize = held.iter().map(|&i| (p.fixed[i] & 3).count_ones() as usize).sum();
-        assert_eq!(pinned, 3, "X/Y pins");
+        // three pins (X and Y at one, the other axis at another), each a patch of the nodes within
+        // PIN_PATCH_MM (at least 1.5 elements: here 3 mm, so the pin and its 4 or 8 neighbours)
+        let pinned: Vec<usize> = held.iter().copied().filter(|&i| p.fixed[i] & 3 != 0).collect();
+        assert!((3..=27).contains(&pinned.len()), "{} pinned nodes", pinned.len());
+        let near = |i: usize, j: usize| {
+            let (a, b) = (p.node_pos(i), p.node_pos(j));
+            (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>().sqrt() <= 4.0 + 1e-9
+        };
+        // every pinned node is in some pin's patch: next to another pinned node
+        assert!(pinned.iter().all(|&i| pinned.iter().any(|&j| j != i && near(i, j))));
         assert_eq!(rigid_rank(&p), 6);
         std::fs::remove_dir_all(&dir).ok();
     }
