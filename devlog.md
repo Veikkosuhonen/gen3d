@@ -3,6 +3,39 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-17: Keep a mirrored design symmetric past the coarse start
+
+**Why:** `iphone_stand` (mirror in X, 0.6 mm, slide ground) lost its symmetry at iteration 36, the
+first on the fine grid, and that iteration took 24 s (2,732 CG its, compliance 3.4e4, 292 mm max
+displacement, against 1.77 and 0.1 s on the coarse grid just before). Two bugs:
+- A box face at x = ±7.5 mm lies exactly on a column of 0.6 mm cell centres. The SDF there came
+  out as +4.8e-7 on one side and -9.5e-7 on the mirror side (f32 rounding), so 6,256 cells broke
+  the domain's symmetry. `symmetry::reduce` refused it ("the domain isn't symmetric about the X
+  plane") and the fine grid was solved whole, with nothing to keep it symmetric. Its pin patches
+  were lopsided too (88 vs 75 nodes). The 1.2 mm coarse grid happened to miss the face.
+- `prolong_design` read the coarse design on the reduced (half) grid as if it covered the whole
+  fine grid. The fine grid's other half started at volfrac-or-void, and the live-brick stage
+  fixed most of it void, hence the near-singular first solve.
+
+**What:**
+- `snap_mirrored`: scalar fields sampled in `setup` (the domain, void, keep, support and load
+  regions) are made exactly symmetric where mirror pairs differ by at most 1e-3 elements. They get
+  the mean. Genuinely asymmetric fields (a script `map` isn't mirrored) still make `reduce` refuse.
+- `prolong_design` takes the coarse model's mirror axes and reads fine cells on the other side of a
+  plane at their mirror image.
+
+**Result:** `iphone_stand` at 0.6 mm: the fine grid is reduced (88/88-node pins). Iteration 36:
+0.4 s, 68 CG its, compliance 1.80. The whole run took 18.1 s (76 iterations, compliance 1.567),
+down from 88 s (119 iterations, asymmetric). The prolongation fix alone (snapping off, so fine grid
+solved whole): iteration 36 0.8 s, compliance 1.80, final 1.5675.
+
+**Verified:** new tests `snapping_evens_out_rounding_across_mirror_planes` and
+`prolonged_design_mirrors_a_reduced_coarse_design`, full suite, clippy.
+
+**Still open:** the broken run ended at a lower compliance (1.20) than the symmetric one (1.57).
+With 5 rocked load cases, an asymmetric design may genuinely be stiffer, or it is a different
+local optimum. Not investigated.
+
 ## 2026-11-16: Stop a stalled CG solve after 1,000 iterations without progress
 
 **Why:** a near-singular system (the single-node pins above) made the GPU solver run to its

@@ -542,6 +542,29 @@ fn x_fastest(v: &[f32], d: [usize; 3], comps: usize) -> Vec<f32> {
     out
 }
 
+/// Make the x-fastest scalar samples `v` on a `d` grid that is symmetric about its middle on the
+/// `mirror` axes exactly symmetric where they nearly are: a mirrored pair within `tol` of each
+/// other both get their mean. A surface through a row of sample points (a box face on a cell
+/// centre) otherwise lands on either side of 0 by f32 rounding, differently on the two sides, and
+/// one cell row breaks the domain's symmetry (and with it `symmetry::reduce`). Genuinely
+/// asymmetric fields (a script `map`, which isn't mirrored) stay as they are.
+fn snap_mirrored(v: &mut [f32], d: [usize; 3], mirror: [bool; 3], tol: f32) {
+    for a in (0..3).filter(|&a| mirror[a]) {
+        let stride = [1, d[0], d[0] * d[1]][a];
+        for i in 0..v.len() {
+            let t = (i / stride) % d[a];
+            if 2 * t + 1 >= d[a] {
+                continue;
+            }
+            let m = i + (d[a] - 1 - 2 * t) * stride;
+            if v[i] != v[m] && (v[i] - v[m]).abs() <= tol {
+                let mean = 0.5 * (v[i] + v[m]);
+                (v[i], v[m]) = (mean, mean);
+            }
+        }
+    }
+}
+
 /// An axis by name: "x", "y" or "z" (any case) → 0, 1, 2.
 pub fn parse_axis(s: &str) -> Option<usize> {
     ["x", "y", "z"].iter().position(|a| a.eq_ignore_ascii_case(s.trim()))
@@ -712,8 +735,11 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         origin: origin.map(|o| o + 0.5 * h),
         step: h,
     };
+    // scalar fields on a cell or node grid, symmetric about the mirror planes up to rounding
     let at = |grid: &Grid, func: &str| -> Result<Vec<f32>> {
-        Ok(x_fastest(&sample_field(shape, grid, func, 1, gpu)?, grid.dims, 1))
+        let mut v = x_fastest(&sample_field(shape, grid, func, 1, gpu)?, grid.dims, 1);
+        snap_mirrored(&mut v, grid.dims, mirror, 1e-3 * h as f32);
+        Ok(v)
     };
     let inside = |sdf: &[f32], void: &Option<Vec<f32>>| -> Vec<bool> {
         (0..sdf.len())
@@ -777,7 +803,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     let active = p.active_nodes();
     p.fixed = vec![0; active.len()];
     for spec in &supports {
-        let r = x_fastest(&sample_field(shape, &nodes, &spec.func, 1, gpu)?, pts, 1);
+        let r = at(&nodes, &spec.func)?;
         let mut hit = 0;
         for i in 0..active.len() {
             if active[i] && r[i] < 0.0 {
@@ -815,7 +841,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
                 (0..nn).map(|i| [0, 1, 2].map(|c| v[3 * i + c] as f64)).collect()
             }
             Some(d) => {
-                let r = x_fastest(&sample_field(shape, &nodes, &spec.func, 1, gpu)?, pts, 1);
+                let r = at(&nodes, &spec.func)?;
                 let d = d.map(|c| c as f64);
                 let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
                 if l == 0.0 {
@@ -1468,7 +1494,7 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
                 print_done(&rc, t_start, out);
                 return Ok(rc);
             }
-            let x = prolong_design(coarse.p(), &rc.design, fine.p(), s.volfrac);
+            let x = prolong_design(coarse.p(), coarse.mirror_axes(), &rc.design, fine.p(), s.volfrac);
             println!("fine grid: continuing from the coarse design");
             earlier = rc.stats;
             Stage {
@@ -1501,9 +1527,11 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
 /// Design variables on `fine` from those on `coarse` (each cropped on its own, so their origins
 /// may differ): trilinear in the coarse cell
 /// centres, over the coarse domain cells only. Kept-solid elements get 1, others outside the domain 0.
-fn prolong_design(coarse: &Problem, xc: &[f64], fine: &Problem, volfrac: f64) -> Vec<f64> {
+/// `mirror`: the axes on which `coarse` is one side of a mirror plane at its low face (a reduced
+/// model, see `symmetry.rs`); fine cells on the other side read their mirror image, so a fine
+/// grid solved whole (its domain not symmetric) gets the whole design, not one half of it.
+fn prolong_design(coarse: &Problem, mirror: [bool; 3], xc: &[f64], fine: &Problem, volfrac: f64) -> Vec<f64> {
     let [cx, cy, cz] = coarse.n;
-    let r = fine.h / coarse.h;
     let [fx, fy, _] = fine.n;
     (0..fine.domain.len())
         .map(|e| {
@@ -1518,8 +1546,12 @@ fn prolong_design(coarse: &Problem, xc: &[f64], fine: &Problem, volfrac: f64) ->
             let mut base = [0isize; 3];
             let mut t = [0.0; 3];
             for c in 0..3 {
-                let pos = fine.origin[c] - coarse.origin[c];
-                let u = (pos / fine.h + ijk[c] as f64 + 0.5) * r - 0.5;
+                // the fine centre relative to the coarse grid's low face (mirrored onto its side)
+                let mut pos = fine.origin[c] + (ijk[c] as f64 + 0.5) * fine.h - coarse.origin[c];
+                if mirror[c] {
+                    pos = pos.abs();
+                }
+                let u = pos / coarse.h - 0.5;
                 base[c] = u.floor() as isize;
                 t[c] = u - u.floor();
             }
@@ -2052,7 +2084,7 @@ pub(super) mod tests {
         let mut coarse = grid([4, 2, 2], 2.0);
         let mut fine = grid([8, 4, 4], 1.0);
         let xc: Vec<f64> = (0..16).map(|e| 0.1 + 0.2 * (e % 4) as f64).collect();
-        let x = prolong_design(&coarse, &xc, &fine, 0.3);
+        let x = prolong_design(&coarse, [false; 3], &xc, &fine, 0.3);
         // inside, linear in x: fine centres 1.5 .. 5.5 lie between coarse centres 1 .. 7
         for i in 0..8 {
             let want = (0.1 + 0.2 * ((i as f64 + 0.5) / 2.0 - 0.5)).clamp(0.1, 0.7);
@@ -2063,7 +2095,7 @@ pub(super) mod tests {
         coarse.domain[3] = false;
         fine.passive[1] = true;
         fine.domain[2] = false;
-        let x = prolong_design(&coarse, &xc, &fine, 0.3);
+        let x = prolong_design(&coarse, [false; 3], &xc, &fine, 0.3);
         // fine 6 (centre 6.5) sits between coarse 2 and the removed 3: all of coarse 2's value
         assert!((x[6] - 0.5).abs() < 1e-12, "{}", x[6]);
         // fine 7 has no coarse domain cell nearby: volfrac
@@ -2071,7 +2103,39 @@ pub(super) mod tests {
         assert_eq!((x[1], x[2]), (1.0, 0.0));
         // no coarse domain cell nearby: volfrac
         coarse.domain.fill(false);
-        assert_eq!(prolong_design(&coarse, &xc, &fine, 0.3)[0], 0.3);
+        assert_eq!(prolong_design(&coarse, [false; 3], &xc, &fine, 0.3)[0], 0.3);
+    }
+
+    /// Samples that differ across a mirror plane only by rounding become equal; real differences
+    /// and axes without a plane stay.
+    #[test]
+    fn snapping_evens_out_rounding_across_mirror_planes() {
+        // 4x2x1, mirrored in x: pairs (0, 3) and (1, 2) per row
+        let mut v = vec![4.8e-7, 1.0, 1.0, -9.5e-7, 0.5, -2.0, 2.0, 0.5];
+        snap_mirrored(&mut v, [4, 2, 1], [true, false, false], 1e-4);
+        assert!(v[0] == v[3] && v[0] < 0.0, "{v:?}");
+        assert_eq!(&v[1..3], &[1.0, 1.0]);
+        assert_eq!(&v[4..], &[0.5, -2.0, 2.0, 0.5]);
+        let mut w = vec![1e-7, -1e-7];
+        snap_mirrored(&mut w, [1, 2, 1], [true, false, false], 1e-4);
+        assert_eq!(w, vec![1e-7, -1e-7]);
+    }
+
+    /// A coarse design on one side of a mirror plane (a reduced model) fills a fine grid solved
+    /// whole on both sides, mirrored.
+    #[test]
+    fn prolonged_design_mirrors_a_reduced_coarse_design() {
+        // coarse: x in [0, 8) at h = 2 (the plane at x = 0); fine: x in [-8, 8) at h = 1
+        let coarse = grid([4, 2, 2], 2.0);
+        let mut fine = grid([16, 4, 4], 1.0);
+        fine.origin[0] = -8.0;
+        let xc: Vec<f64> = (0..16).map(|e| 0.1 + 0.2 * (e % 4) as f64).collect();
+        let x = prolong_design(&coarse, [true, false, false], &xc, &fine, 0.3);
+        for i in 0..8 {
+            assert!((x[i] - x[15 - i]).abs() < 1e-12, "i {i}: {} vs {}", x[i], x[15 - i]);
+            assert!(x[i] != 0.3, "i {i}: no value from the coarse design");
+        }
+        assert!((x[8] - 0.1).abs() < 1e-12 && (x[15] - 0.7).abs() < 1e-12, "{x:?}");
     }
 
     /// A beam on supports at both ends of its bottom, symmetric about the middle planes x and y
