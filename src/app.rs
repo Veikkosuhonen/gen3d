@@ -153,36 +153,6 @@ fn drag3(ui: &mut egui::Ui, v: &mut [f32; 3], speed: f64, suffix: &str) -> bool 
     changed
 }
 
-/// Settings of the Optimize step (`gen3d optimize` flags).
-struct OptUi {
-    volfrac: f64,
-    iters: usize,
-    /// None = `topopt::auto_voxel`
-    voxel: Option<f32>,
-    force: f64,
-    rmin: f64,
-    /// Heaviside projection (crisp 0/1 designs)
-    projection: bool,
-    ground: Ground,
-    /// overhang control: printable along +z without support material
-    overhang: bool,
-}
-
-impl Default for OptUi {
-    fn default() -> Self {
-        OptUi {
-            volfrac: 0.3,
-            iters: 150,
-            voxel: None,
-            force: 100.0,
-            rmin: 1.5,
-            projection: true,
-            ground: Ground::None,
-            overhang: true,
-        }
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Supports {
     /// whatever the profile says
@@ -384,7 +354,8 @@ struct App {
     design_fields: Vec<Field>,
     params: Vec<Param>,
     edit: EditUi,
-    opt: OptUi,
+    /// Settings of the Optimize step (saved to the sidecar when a run starts)
+    opt: prims::OptSettings,
     print: PrintUi,
     /// the side of the part that faces up on the printer: the build direction of Optimize's overhang
     /// control, and how Print turns the mesh (`--up`)
@@ -941,7 +912,7 @@ impl App {
             design_fields: vec![],
             params: vec![],
             edit: EditUi::default(),
-            opt: OptUi::default(),
+            opt: prims::OptSettings::default(),
             print: PrintUi::default(),
             up: Up::PlusZ,
             plane2d: None,
@@ -1028,7 +999,14 @@ impl App {
         self.error = None;
         self.param_error = None;
         self.notice = None;
+        // the settings of the shape's last run, else the session's (with an automatic element size)
         self.opt.voxel = None;
+        if let Some(o) = prims::load_file(&prims::sidecar(&self.shown))
+            .ok()
+            .and_then(|f| f.meta.optimize)
+        {
+            self.opt = o;
+        }
         self.print.voxel = None;
         self.print.decimate = None;
         self.print.profile = None;
@@ -2772,7 +2750,31 @@ impl App {
         if resume {
             a.push("--resume".into());
         }
+        // before the job starts, so it reads the sidecar as it will stay
+        self.save_opt();
         self.opt_job.start("optimize", a, result);
+    }
+
+    /// Keep the Optimize settings with the shape (in its sidecar), so reopening it restores them.
+    /// A script shape without a sidecar keeps them for the session only.
+    fn save_opt(&mut self) {
+        let Some(shape) = &self.design_shape else { return };
+        if !shape.editor || shape.sidecar_opt == Some(self.opt) {
+            return;
+        }
+        let path = shape.prims_path();
+        let meta = prims::Meta {
+            optimize: Some(self.opt),
+            ..shape.sidecar_meta()
+        };
+        if let Err(e) = prims::save(&path, &shape.prims, &shape.mirror, meta) {
+            self.notice = Some(format!("{e:#}"));
+            return;
+        }
+        self.mtimes.insert(path.clone(), mtime(&path));
+        if let Some(s) = &mut self.design_shape {
+            s.sidecar_opt = Some(self.opt);
+        }
     }
 
     fn gcode_summary(&mut self, p: &Path) -> Vec<(String, String)> {

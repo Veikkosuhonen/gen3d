@@ -120,6 +120,13 @@ sides and a support or loaded region gets its twin. A load keeps its direction o
 (the same push over both; its force is spread over both). The bounds become symmetric about the planes.
 The script's own `map` is not mirrored. A new plane goes through the middle of the bounds.
 
+**Optimize settings** (`"optimize": {"volfrac": 0.3, "iters": 150, "force": 100, "rmin": 1.5,
+"projection": true, "ground": "none", "overhang": true}`, plus `"voxel"` when the element size isn't
+automatic): the app saves the Optimize step's settings here each time it starts a run and restores them
+when the shape is opened again. A missing field takes its default. Only the app reads them; `gen3d
+optimize` takes its settings from its flags. A script shape without a `.prims.json` keeps them for the
+session only.
+
 ### Importing a result into a shape (`//! import`)
 
 To combine an optimization result (or any `.vti` grid) with exact SDFs, import it. There are two ways:

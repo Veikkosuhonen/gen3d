@@ -104,7 +104,8 @@ pub struct Settings {
 
 /// How the bottom of the design domain is supported (`--ground`). The optimizer decides where the
 /// part touches down: the supported nodes may end up under empty space.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Ground {
     /// no ground: only the fixed regions hold the part
     #[default]

@@ -3,6 +3,32 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: Keep the app's Optimize settings with the shape
+
+**Why:** material, iterations, element size, filter radius, projection, ground and overhang were
+session state: reopening a shape (or restarting the app) reset them, so a tuned run couldn't be
+repeated without re-entering everything.
+
+**What:**
+- `prims::OptSettings` replaces the app's `OptUi` (same fields, same defaults) and is serde: the
+  sidecar gets an optional `"optimize"` object, `Meta::optimize`, `Shape::sidecar_opt`. Fields
+  default individually (`#[serde(default)]`), and out-of-range or non-finite values from a
+  hand-edited file fall back to the defaults. `Ground` serializes lowercase (`"none"`, `"slide"`,
+  `"grip"`). `"voxel"` is only written when the element size is set by hand (absent = automatic).
+- `start_optimize` saves them (`save_opt`, like `save_up` / `save_plane2d`) before launching the job,
+  and only when they differ from what's saved. `open_design` restores them from the sidecar; a shape
+  without saved settings keeps the session's, with the element size back to automatic as before.
+- Script shapes without a sidecar are not converted into editor shapes for this: their settings stay
+  per session. The CLI doesn't read them.
+
+**Result:** reopening an editor shape shows the settings of its last run.
+
+**Verified:** the sidecar round-trip test now saves and loads non-default settings (volfrac, voxel,
+ground, projection) along with `up` and `2d`. Full suite passes, clippy clean.
+
+**Still open:** settings changed without starting a run aren't kept. Script shapes have no place to
+keep them (no `//!` directives for these).
+
 ## 2026-11-16: Import primitives: move and rotate a result in the editor
 
 **Why:** an `//! import`ed result stays where it was optimized; moving it meant editing `map`.

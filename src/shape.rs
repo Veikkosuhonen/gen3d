@@ -46,6 +46,8 @@ pub struct Shape {
     pub plane2d: Option<usize>,
     /// The sidecar's own `"2d"`.
     pub sidecar_plane2d: Option<usize>,
+    /// The sidecar's saved Optimize settings (from the last run started in the app).
+    pub sidecar_opt: Option<prims::OptSettings>,
     /// Whether the editor's code is part of `source` (the sidecar file exists).
     pub editor: bool,
     /// Whether the script itself defines `fn map` (without one, the primitives are the shape).
@@ -109,6 +111,7 @@ impl Shape {
             sidecar_up: None,
             plane2d: None,
             sidecar_plane2d: None,
+            sidecar_opt: None,
             editor: false,
             script_map: true,
             base_bounds: ([-50.0, -50.0, 0.0], [50.0, 50.0, 100.0]),
@@ -140,6 +143,7 @@ impl Shape {
         prims::Meta {
             up: self.sidecar_up,
             plane2d: self.sidecar_plane2d,
+            optimize: self.sidecar_opt,
         }
     }
 
@@ -812,6 +816,7 @@ pub fn load_shape(path: &Path, defines: &[(String, f64)]) -> Result<Shape> {
             let file = prims::load_file(&sidecar)?;
             (shape.prims, shape.mirror) = (file.prims, file.mirror);
             (shape.sidecar_up, shape.sidecar_plane2d) = (file.meta.up, file.meta.plane2d);
+            shape.sidecar_opt = file.meta.optimize;
             if file.meta.up.is_some() {
                 shape.up = file.meta.up;
             }

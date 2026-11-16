@@ -377,6 +377,9 @@ struct PrimFile {
     /// optimize in 2D along this axis ('x', 'y' or 'z'); absent = 3D
     #[serde(default, rename = "2d", skip_serializing_if = "Option::is_none")]
     plane2d: Option<char>,
+    /// the Optimize step's settings of the last run started from the app; absent = defaults
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    optimize: Option<OptSettings>,
     #[serde(default)]
     prims: Vec<Prim>,
 }
@@ -389,17 +392,74 @@ pub struct Sidecar {
 }
 
 /// A sidecar's shape-wide settings besides the primitives and mirror planes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Meta {
     /// the side printed up
     pub up: Option<crate::mesh::Up>,
     /// optimize in 2D, projected along this axis (0 x, 1 y, 2 z)
     pub plane2d: Option<usize>,
+    /// the Optimize step's settings, saved when a run starts
+    pub optimize: Option<OptSettings>,
 }
 
 impl From<Option<crate::mesh::Up>> for Meta {
     fn from(up: Option<crate::mesh::Up>) -> Meta {
-        Meta { up, plane2d: None }
+        Meta { up, ..Meta::default() }
+    }
+}
+
+/// The Optimize step's settings (`gen3d optimize` flags). A field missing from the file takes its
+/// default.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OptSettings {
+    pub volfrac: f64,
+    pub iters: usize,
+    /// None = `topopt::auto_voxel`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voxel: Option<f32>,
+    pub force: f64,
+    pub rmin: f64,
+    /// Heaviside projection (crisp 0/1 designs)
+    pub projection: bool,
+    pub ground: crate::topopt::Ground,
+    /// overhang control: printable along the chosen up without support material
+    pub overhang: bool,
+}
+
+impl Default for OptSettings {
+    fn default() -> Self {
+        OptSettings {
+            volfrac: 0.3,
+            iters: 150,
+            voxel: None,
+            force: 100.0,
+            rmin: 1.5,
+            projection: true,
+            ground: crate::topopt::Ground::None,
+            overhang: true,
+        }
+    }
+}
+
+impl OptSettings {
+    /// Out-of-range or non-finite values (a hand-edited file) replaced by the defaults.
+    fn sanitized(mut self) -> Self {
+        let d = OptSettings::default();
+        if !(self.volfrac > 0.0 && self.volfrac < 1.0) {
+            self.volfrac = d.volfrac;
+        }
+        if self.iters == 0 {
+            self.iters = d.iters;
+        }
+        self.voxel = self.voxel.filter(|v| v.is_finite() && *v > 0.0);
+        if !(self.force.is_finite() && self.force >= 0.0) {
+            self.force = d.force;
+        }
+        if !(self.rmin.is_finite() && self.rmin > 0.0) {
+            self.rmin = d.rmin;
+        }
+        self
     }
 }
 
@@ -490,7 +550,11 @@ pub fn load_file(path: &Path) -> Result<Sidecar> {
     Ok(Sidecar {
         prims,
         mirror,
-        meta: Meta { up: file.up, plane2d },
+        meta: Meta {
+            up: file.up,
+            plane2d,
+            optimize: file.optimize.map(OptSettings::sanitized),
+        },
     })
 }
 
@@ -501,6 +565,7 @@ pub fn save(path: &Path, prims: &[Prim], mirror: &Mirror, meta: impl Into<Meta>)
         mirror: *mirror,
         up: meta.up,
         plane2d: meta.plane2d.map(|a| ['x', 'y', 'z'][a]),
+        optimize: meta.optimize,
         prims: prims.to_vec(),
     };
     let mut text = serde_json::to_string_pretty(&file)?;
@@ -1201,15 +1266,26 @@ mod tests {
         let mut hole = Prim::new(Kind::Cylinder, "hole".into(), [12.0, 0.0, 5.0], 1.0);
         hole.op = Op::Subtract;
         let mirror: Mirror = [Some(1.0), None, None];
+        let opt = OptSettings {
+            volfrac: 0.2,
+            voxel: Some(0.7),
+            ground: crate::topopt::Ground::Slide,
+            projection: false,
+            ..OptSettings::default()
+        };
         let meta = Meta {
             up: Some(crate::mesh::Up::MinusX),
             plane2d: Some(1),
+            optimize: Some(opt),
         };
         save(&sidecar(&p), &[b.clone(), hole], &mirror, meta).unwrap();
         assert!(std::fs::read_to_string(sidecar(&p)).unwrap().contains("\"2d\": \"y\""));
         let file = load_file(&sidecar(&p)).unwrap();
         assert_eq!((file.prims.len(), file.mirror), (2, mirror));
-        assert_eq!(file.meta, meta, "the print orientation and 2D axis are saved");
+        assert_eq!(
+            file.meta, meta,
+            "the print orientation, 2D axis and optimizer settings are saved"
+        );
 
         let s = load_shape(&p, &[]).unwrap();
         assert_eq!(s.up, Some(crate::mesh::Up::MinusX));
