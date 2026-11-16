@@ -672,6 +672,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 // computed on the fly from the fine grid (P.n = fine grid, `page` its page table; the output is
 // level 2); otherwise they are stored matrices (P.n = the child level's grid, `page` its page
 // table, P.m.y its stored elements).
+// Level 2 is linear in the fine weights E_e h: fine elements without a clamped or partly free node
+// add E_e h · T2[c2 · 8 + c1] (`free_level2_table`, precomputed P_c2ᵀ T[0, c1] P_c2, upper
+// triangles), and only level-1 children holding another fine element (near supports, rollers and
+// symmetry planes) take the product K P, Pᵀ (K P) through workgroup memory, as stored children do.
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
 @group(0) @binding(2) var<storage, read> free: array<u32>;
 @group(0) @binding(3) var<storage, read> T: array<f32>;
@@ -680,6 +684,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 #include ke BIND=6
 @group(0) @binding(7) var<storage, read> page: array<u32>;
 @group(0) @binding(8) var<storage, read> coords: array<vec4<u32>>;
+@group(0) @binding(9) var<storage, read> T2: array<f32>;
 
 #include lookup NAME=fat PAGE=page
 #include fine_free
@@ -687,8 +692,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 var<workgroup> K: array<f32, 576>;
 var<workgroup> KP: array<f32, 576>;
 // virtual children: per fine element under this coarse element (index c2 · 8 + c1), its E_e h and
-// the offset of its table matrix, loaded once rather than once per matrix entry
+// the offset of its table matrix, loaded once rather than once per matrix entry. FW: the weight
+// when it takes the product path, FW2: when it adds its T2 matrix (0 otherwise).
 var<workgroup> FW: array<f32, 64>;
+var<workgroup> FW2: array<f32, 64>;
+// bit c2: level-1 child c2 takes the product path (stored children: all); FBU its uniform copy
+var<workgroup> FB: atomic<u32>;
+var<workgroup> FBU: u32;
 var<workgroup> FT: array<u32, 64>;
 // per fine element: its nodes' free axes when one is partly free (`fine_free`), else 0
 var<workgroup> FM: array<u32, 64>;
@@ -768,9 +778,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                 }
             }
         }
-        FW[li] = w;
+        let slow = w != 0.0 && (fm != 0u || off >= 8u * 576u);
+        FW[li] = select(0.0, w, slow);
+        FW2[li] = select(w, 0.0, slow);
         FT[li] = off;
         FM[li] = fm;
+        if slow { atomicOr(&FB, 1u << c2); }
     } else if li < 8u {
         let lc = 2u * cp + vec3<u32>(li & 1u, (li >> 1u) & 1u, (li >> 2u) & 1u);
         var g = NONE;
@@ -778,69 +791,114 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         CI[li] = g;
     }
     workgroupBarrier();
-    var acc: array<f32, 9>;
-    for (var t = 0u; t < 9u; t++) { acc[t] = 0.0; }
-    for (var c2 = 0u; c2 < 8u; c2++) {
-        // the child's matrix
-        for (var t = 0u; t < 9u; t++) {
-            let idx = li + 64u * t;
-            var s = 0.0;
+    if li == 0u { FBU = select(0xffu, atomicLoad(&FB), virt); }
+    let fb = workgroupUniformLoad(&FBU);
+    // this thread's upper-triangle entries k = li + 64 t (t < 5, k < 300): row and column
+    var rr: array<u32, 5>;
+    var cc: array<u32, 5>;
+    for (var t = 0u; t < 5u; t++) {
+        let k = li + 64u * t;
+        var start = 0u;
+        rr[t] = 0u;
+        for (var r = 0u; r < 24u; r++) {
+            if k < start + 24u - r { rr[t] = r; break; }
+            start += 24u - r;
+        }
+        cc[t] = rr[t] + k - start;
+    }
+    // stored children: their upper triangles, all loaded before any is used (the loads are
+    // scattered, entry-major: in flight together they overlap)
+    var kc: array<f32, 40>;
+    if !virt {
+        for (var c2 = 0u; c2 < 8u; c2++) {
+            let g = CI[c2];
+            for (var t = 0u; t < 5u; t++) {
+                let k = li + 64u * t;
+                var v = 0.0;
+                if k < 300u && g != NONE { v = child[k * P.m.y + g]; }
+                kc[c2 * 5u + t] = v;
+            }
+        }
+    }
+    if fb != 0u {
+        var acc: array<f32, 9>;
+        for (var t = 0u; t < 9u; t++) { acc[t] = 0.0; }
+        for (var c2 = 0u; c2 < 8u; c2++) {
+            if ((fb >> c2) & 1u) == 0u { continue; }
+            // the child's matrix
             if virt {
-                for (var c1 = 0u; c1 < 8u; c1++) {
-                    let w = FW[c2 * 8u + c1];
-                    if w != 0.0 {
-                        let fm = FM[c2 * 8u + c1];
-                        if fm != 0u {
-                            s += w * partial_entry(c1, fm, idx);
-                        } else {
-                            s += w * T[FT[c2 * 8u + c1] + idx];
+                for (var t = 0u; t < 9u; t++) {
+                    let idx = li + 64u * t;
+                    var s = 0.0;
+                    for (var c1 = 0u; c1 < 8u; c1++) {
+                        let w = FW[c2 * 8u + c1];
+                        if w != 0.0 {
+                            let fm = FM[c2 * 8u + c1];
+                            if fm != 0u {
+                                s += w * partial_entry(c1, fm, idx);
+                            } else {
+                                s += w * T[FT[c2 * 8u + c1] + idx];
+                            }
                         }
                     }
+                    K[idx] = s;
                 }
             } else {
-                let g = CI[c2];
-                if g != NONE { s = child[sym(idx / 24u, idx % 24u) * P.m.y + g]; }
+                for (var t = 0u; t < 5u; t++) {
+                    if li + 64u * t < 300u {
+                        let v = kc[c2 * 5u + t];
+                        K[rr[t] * 24u + cc[t]] = v;
+                        K[cc[t] * 24u + rr[t]] = v;
+                    }
+                }
             }
-            K[idx] = s;
-        }
-        workgroupBarrier();
-        // KP = K P
-        for (var t = 0u; t < 9u; t++) {
-            let idx = li + 64u * t;
-            let r = idx / 24u;
-            let col = idx % 24u;
-            let b = col / 3u;
-            let jj = col % 3u;
-            var s = 0.0;
-            for (var a = 0u; a < 8u; a++) {
-                s += K[r * 24u + 3u * a + jj] * PW[(c2 * 8u + a) * 8u + b];
+            workgroupBarrier();
+            // KP = K P
+            for (var t = 0u; t < 9u; t++) {
+                let idx = li + 64u * t;
+                let r = idx / 24u;
+                let col = idx % 24u;
+                let b = col / 3u;
+                let jj = col % 3u;
+                var s = 0.0;
+                for (var a = 0u; a < 8u; a++) {
+                    s += K[r * 24u + 3u * a + jj] * PW[(c2 * 8u + a) * 8u + b];
+                }
+                KP[idx] = s;
             }
-            KP[idx] = s;
-        }
-        workgroupBarrier();
-        // acc += Pᵀ KP
-        for (var t = 0u; t < 9u; t++) {
-            let idx = li + 64u * t;
-            let row = idx / 24u;
-            let col = idx % 24u;
-            let b = row / 3u;
-            let ii = row % 3u;
-            var s = 0.0;
-            for (var a = 0u; a < 8u; a++) {
-                s += PW[(c2 * 8u + a) * 8u + b] * KP[(3u * a + ii) * 24u + col];
+            workgroupBarrier();
+            // acc += Pᵀ KP
+            for (var t = 0u; t < 9u; t++) {
+                let idx = li + 64u * t;
+                let row = idx / 24u;
+                let col = idx % 24u;
+                let b = row / 3u;
+                let ii = row % 3u;
+                var s = 0.0;
+                for (var a = 0u; a < 8u; a++) {
+                    s += PW[(c2 * 8u + a) * 8u + b] * KP[(3u * a + ii) * 24u + col];
+                }
+                acc[t] += s;
             }
-            acc[t] += s;
+            workgroupBarrier();
         }
+        // to K, for the upper-triangle pass below
+        for (var t = 0u; t < 9u; t++) { K[li + 64u * t] = acc[t]; }
         workgroupBarrier();
     }
-    // upper triangle, entry-major, like apply_elem reads it
-    for (var t = 0u; t < 9u; t++) {
-        let idx = li + 64u * t;
-        let row = idx / 24u;
-        let col = idx % 24u;
-        if row <= col {
-            out[sym(row, col) * nce + ce] = acc[t];
+    // upper triangle, entry-major, like apply_elem reads it: entry k = sym(row, col)
+    for (var t = 0u; t < 5u; t++) {
+        let k = li + 64u * t;
+        if k >= 300u { continue; }
+        var s = 0.0;
+        if virt {
+            for (var e = 0u; e < 64u; e++) {
+                let w = FW2[e];
+                if w != 0.0 { s += w * T2[e * 300u + k]; }
+            }
         }
+        if fb != 0u { s += K[rr[t] * 24u + cc[t]]; }
+        out[k * nce + ce] = s;
     }
 }
 

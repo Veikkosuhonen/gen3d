@@ -433,6 +433,30 @@ pub(super) fn masked_ptkp_table(ke: &[[f64; 24]; 24]) -> Vec<f64> {
     t
 }
 
+/// Level-2 contributions of fully free fine elements: for each level-1 child c2 of a level-2
+/// element and fine child c1 of that, P_c2ᵀ T[0, c1] P_c2 (`masked_ptkp_table`'s mask-0 matrices,
+/// `table`), as upper triangles (300 entries, row-major, `sym` in mg.wgsl), at (c2 · 8 + c1) · 300.
+/// A level-2 element whose fine elements have no clamped node is then Σ E_e h · this.
+pub(super) fn free_level2_table(table: &[f64]) -> Vec<f64> {
+    let mut t = vec![0.0; 64 * 300];
+    for c2 in 0..8 {
+        let w = child_weights(c2);
+        for c1 in 0..8 {
+            let mut m = [0.0; 576];
+            add_ptkp(&table[576 * c1..576 * c1 + 576], &w, 1.0, &mut m);
+            let out = &mut t[(c2 * 8 + c1) * 300..][..300];
+            let mut k = 0;
+            for r in 0..24 {
+                for c in r..24 {
+                    out[k] = m[r * 24 + c];
+                    k += 1;
+                }
+            }
+        }
+    }
+    t
+}
+
 /// Cost of the exact solve on a grid of `n` elements (for choosing the number of levels).
 pub(super) fn direct_cost(n: [usize; 3]) -> f64 {
     direct_flops(n)

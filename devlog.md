@@ -3,6 +3,42 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: Level-2 assembly from a precomputed table; stored children loaded up front
+
+**Why:** with the NVIDIA tuning (entry below), `assemble` was 35 of the multigrid setup's 40 ms
+(9.6M-element box), 31 ms of it level 2. The setup runs every optimizer iteration.
+
+**What:**
+- Level 2 is linear in the fine weights E_e h. For the 64 (level-1 child c2, fine child c1)
+  positions, `mg::free_level2_table` precomputes P_c2ᵀ T[0, c1] P_c2 on the host (f64, upper
+  triangles, 77 KB). A level-2 element is Σ E_e h · that over its fine elements without a clamped
+  or partly free node. Only level-1 children holding such an element (near supports, rollers,
+  symmetry planes) still go through K P and Pᵀ (K P) in workgroup memory. The workgroup learns
+  which ones through a workgroup atomic, read back with `workgroupUniformLoad` so the branch
+  around the barriers stays uniform.
+- Stored children (levels ≥ 3) load their 300 upper-triangle entries, all 8 children before any
+  is used (40 loads in flight per thread instead of 9 per barrier), and mirror them into K. Before,
+  they read all 576 entries, each upper entry twice.
+- Every level writes its upper triangle from 5 entries per thread instead of 9 with half idle.
+
+**Result** (RTX 3080, `profile_kernels`, GPU ms):
+
+| | before | after |
+|---|---|---|
+| `assemble` level 2 | 31.1 | 6.1-7.1 |
+| `assemble` level 3 | 6.8-7.4 | 3.9 |
+| setup program | 39.8 | 17.0 |
+
+`bench-topopt` 0.3 mm: setup 0.030 → 0.024 s per iteration, iteration 0.185 → 0.179 s; compliances
+identical at every size.
+
+**Verified:** full suite (74), including `kernels_match_cpu` (level matrices within 4e-7 of the
+CPU on 12 grids, with supports, so both paths run) and `gpu_loop_matches_cpu_loop`. Clippy clean.
+
+**Still open:** level 2's T2 reads (64 × 300 per element) are now its cost; several coarse elements
+per workgroup would share them. `diag_l1` (5 ms) and level 2 both redo the page lookups of every
+fine element's 8 nodes (`fine_free`, `fine_mask`), which depend only on `free`.
+
 ## 2026-11-16: GPU kernel profiles per vendor; NVIDIA: unrolled loops, `ke` as a uniform
 
 **Why:** the optimizer's kernels were tuned on an M1 Pro; the primary target is now consumer NVIDIA

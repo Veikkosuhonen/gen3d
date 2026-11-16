@@ -119,6 +119,8 @@ pub(super) struct GpuMg<'a> {
     free: wgpu::Buffer,
     ke: wgpu::Buffer,
     table: wgpu::Buffer,
+    /// `mg::free_level2_table`
+    table2: wgpu::Buffer,
     pub(super) ce: wgpu::Buffer,
     diag: Vec<wgpu::Buffer>,
     /// element matrices, levels ≥ 2 (index = level)
@@ -209,7 +211,9 @@ impl<'a> GpuMg<'a> {
         let buf = |label: &str, len: usize| e.buf(label, len);
         let init = |label: &str, data: &[u8]| e.init(label, data);
         let ke32: Vec<f32> = ke.iter().flatten().map(|&v| v as f32).collect();
-        let table: Vec<f32> = mg::masked_ptkp_table(ke).iter().map(|&v| v as f32).collect();
+        let table64 = mg::masked_ptkp_table(ke);
+        let table2: Vec<f32> = mg::free_level2_table(&table64).iter().map(|&v| v as f32).collect();
+        let table: Vec<f32> = table64.iter().map(|&v| v as f32).collect();
         let free32: Vec<u32> = free.iter().map(|&f| f as u32).collect();
         let free32 = levels[0].gather(&free32, p.n.map(|v| v + 1), 1, 0);
         let lens: Vec<usize> = levels.iter().map(|b| 3 * b.len()).collect();
@@ -288,6 +292,7 @@ impl<'a> GpuMg<'a> {
             free: init("free", bytemuck::cast_slice(&free32)),
             ke: share(|o| &o.ke, &|| e.init_uniform("ke", bytemuck::cast_slice(&ke32))),
             table: share(|o| &o.table, &|| init("ptkp table", bytemuck::cast_slice(&table))),
+            table2: share(|o| &o.table2, &|| init("level 2 table", bytemuck::cast_slice(&table2))),
             ce: share(|o| &o.ce, &|| buf("ce", ne)),
             // level 0's diagonal isn't kept (the smoother works it out, `cheb_fine`): only the λmax
             // estimate needs it, between solves, in CG's p
@@ -567,6 +572,7 @@ impl<'a> GpuMg<'a> {
                     &self.ke,
                     &self.pages[cl],
                     &self.coords[l],
+                    &self.table2,
                 ],
                 groups(self.bricks[l].len()),
             );
