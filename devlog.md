@@ -3,6 +3,35 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: Coarse-level mat-vec in two passes (per element, then per node)
+
+**Why:** `apply_elem` on level 2 took ~1.05 ms per call for 173K nodes (6 ns per node, against
+0.13 for the fine stencil): ~4.3 of a 29 ms CG iteration (9.6M box). Each thread (one per node)
+read the matrices of its 8 elements, so each 1.2 KB element matrix was fetched by 8 threads in
+different workgroups. That is ~4× the 208 MB that reading them once would cost.
+
+**What:**
+- `elem_ku`: one thread per stored element computes K_e u_e (24 values) from its upper-triangle
+  3×3 blocks, each used for both of its blocks, with each matrix read once and coalesced (the
+  layout is already entry-major). `elem_gather`: one thread per node sums its rows of its 8
+  elements' results and writes y (or y −= for the smoother).
+- The 24 values per element go to level 0's residual (CG's q), dead during coarse levels as for
+  level 1's `apply_p`. A level-2 element covers ~64 fine nodes, so it fits with room to spare
+  (`GpuMg::ye`; its own buffer otherwise): no extra memory (bracket 0.3 mm: 461 MB either way).
+- `Tuning::elem_two_pass`: on for `nvidia`/`generic`, off for `apple`, which keeps the
+  one-pass kernel (the per-element 24-vectors need unrolled loops to stay in registers).
+- Tried first: 2-8 threads per node in the one-pass kernel (each over some of its elements, a
+  workgroup-memory sum): at best 4.1 → 3.2 ms. Not kept.
+
+**Result** (RTX 3080, GPU ms per CG iteration): level 2 4.29 → 1.56 (`elem_ku` 0.36 per call,
+near the 0.27 ms that reading the matrices once from DRAM takes), all coarse levels 4.83 → 2.03.
+CG iteration 29.1 → 27.0 ms wall clock. `bench-topopt --voxels 0.3 --iters 8`: solve 0.125 →
+0.117 s, iteration 0.185 → 0.170 s, compliance identical.
+
+**Verified:** full suite on both the `nvidia` and the `apple` profile (two-pass and one-pass
+kernels against the CPU in `kernels_match_cpu`, the optimizer loop in
+`gpu_loop_matches_cpu_loop`). Clippy clean.
+
 ## 2026-11-16: `restrict` stages the fine nodes in workgroup memory
 
 **Why:** after the NVIDIA tuning, the level 0 → 1 restriction took ~1 ms per call (5 per CG

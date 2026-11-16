@@ -21,6 +21,11 @@ pub struct Tuning {
     /// loops its offsets are constants: NVIDIA reads them from the constant bank as FMA operands
     /// instead of issuing one load per entry, which made the fine stencils 2.5-3× faster.
     pub ke_uniform: bool,
+    /// Levels ≥ 2 apply their element matrices in two passes: K_e u_e per element (each matrix
+    /// read once, coalesced), then a per-node sum. The one-pass kernel reads each matrix from its
+    /// 8 nodes' threads, which on the RTX 3080 meant ~4× the minimum DRAM traffic. Needs unrolled
+    /// loops (per-element 24-vectors in registers).
+    pub elem_two_pass: bool,
 }
 
 impl Tuning {
@@ -29,6 +34,7 @@ impl Tuning {
         profile: "nvidia",
         unbounded_loops: true,
         ke_uniform: true,
+        elem_two_pass: true,
     };
 
     /// Apple silicon: the settings tuned on an M1 Pro.
@@ -36,6 +42,7 @@ impl Tuning {
         profile: "apple",
         unbounded_loops: false,
         ke_uniform: false,
+        elem_two_pass: false,
     };
 
     /// Anything else (AMD, Intel, software): the NVIDIA settings, which only remove overhead.
@@ -94,6 +101,7 @@ impl Tuning {
             match k.trim() {
                 "unbounded_loops" => self.unbounded_loops = flag()?,
                 "ke_uniform" => self.ke_uniform = flag()?,
+                "elem_two_pass" => self.elem_two_pass = flag()?,
                 _ => bail!("unknown key `{k}`"),
             }
         }
@@ -105,8 +113,8 @@ impl std::fmt::Display for Tuning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} (unbounded_loops={}, ke_uniform={})",
-            self.profile, self.unbounded_loops as u8, self.ke_uniform as u8
+            "{} (unbounded_loops={}, ke_uniform={}, elem_two_pass={})",
+            self.profile, self.unbounded_loops as u8, self.ke_uniform as u8, self.elem_two_pass as u8
         )
     }
 }

@@ -131,6 +131,10 @@ pub(super) struct GpuMg<'a> {
     /// smoother scratch (residual, direction), smoothed levels
     lr: Vec<wgpu::Buffer>,
     ld: Vec<wgpu::Buffer>,
+    /// K_e u_e per element of levels ≥ 2 (`Tuning::elem_two_pass`): level 0's residual (CG's q)
+    /// when it holds 24 values per element of each, as is usual (a level-2 element covers 64 fine
+    /// ones), else its own buffer
+    ye: wgpu::Buffer,
     r: wgpu::Buffer,
     z: wgpu::Buffer,
     p: wgpu::Buffer,
@@ -266,6 +270,12 @@ impl<'a> GpuMg<'a> {
         let q = share(|o| &o.q, &|| buf("cg q", nf));
         let z = share(|o| &o.z, &|| buf("cg z", nf));
         let p_ = share(|o| &o.p, &|| buf("cg p", nf));
+        let ye_len = (2..=last).map(|l| 24 * levels[l].len()).max().unwrap_or(0);
+        let ye = if !e.tuning.elem_two_pass || ye_len <= nf {
+            q.clone()
+        } else {
+            buf("element K u", ye_len)
+        };
         let (pages, coords) = match shared {
             Some(o) => (o.pages.clone(), o.coords.clone()),
             None => levels
@@ -313,6 +323,7 @@ impl<'a> GpuMg<'a> {
             ld: (0..last)
                 .map(|l| if l == 0 { z.clone() } else { buf("d", len(l)) })
                 .collect(),
+            ye,
             r: share(|o| &o.r, &|| buf("cg r", nf)),
             z,
             p: p_,
@@ -488,6 +499,34 @@ impl<'a> GpuMg<'a> {
                     self.bgroups(0),
                 );
                 self.restrict(out, 0, kpu, y, sub);
+            }
+            _ if self.e.tuning.elem_two_pass => {
+                // per element K_e u_e, then per node the sum: in level 0's residual (`ye`), free
+                // here as for level 1
+                let ye = &self.ye;
+                let ne = self.bricks[l].len() as u32;
+                self.e.step(
+                    out,
+                    &self.k("elem_ku"),
+                    Params {
+                        n: self.pn(l),
+                        m: [0, ne, 0, 0],
+                        ..Default::default()
+                    },
+                    &[self.mats[l].as_ref().unwrap(), u, ye, &self.pages[l], &self.coords[l]],
+                    self.bgroups(l),
+                );
+                self.e.step(
+                    out,
+                    &self.k("elem_gather"),
+                    Params {
+                        n: self.pn(l),
+                        m: [sub as u32, ne, 0, 0],
+                        ..Default::default()
+                    },
+                    &[ye, y, &self.pages[l], &self.coords[l]],
+                    self.bgroups(l),
+                );
             }
             _ => self.e.step(
                 out,

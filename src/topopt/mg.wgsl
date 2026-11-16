@@ -637,6 +637,97 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     }
 }
 
+//// kernel elem_ku bricks
+// `apply_elem` in two passes, first: ye_e = K_e u_e per stored element (one thread each), so that
+// each element matrix is read once and coalesced (entry-major), rather than by each of its 8
+// nodes' threads. ye is entry-major too: ye[i · P.m.y + e], i < 24. 3×3 blocks (a, b ≥ a) of
+// the upper triangle, each used for both of its blocks.
+@group(0) @binding(1) var<storage, read> mats: array<f32>;
+@group(0) @binding(2) var<storage, read> u: array<f32>;
+@group(0) @binding(3) var<storage, read_write> ye: array<f32>;
+@group(0) @binding(4) var<storage, read> page: array<u32>;
+@group(0) @binding(5) var<storage, read> coords: array<vec4<u32>>;
+
+#include nbhd NAME=nl PAGE=page
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let slot = wg_flat(wg, nwg);
+    if slot >= P.n.w { return; }
+    nl_load(coords[slot].xyz, nbricks(P.n.xyz), li);
+    workgroupBarrier();
+    let e = slot * BV + li;
+    let ne = P.m.y;
+    let l = vec3<i32>(unflat(li, bshape()));
+    var ue: array<vec3<f32>, 8>;
+    var ya: array<vec3<f32>, 8>;
+    for (var b = 0u; b < 8u; b++) {
+        let m = nl_at(l + vec3<i32>(vec3<u32>(b & 1u, (b >> 1u) & 1u, (b >> 2u) & 1u)));
+        var v = vec3<f32>(0.0);
+        if m != NONE { v = vec3<f32>(u[3u * m], u[3u * m + 1u], u[3u * m + 2u]); }
+        ue[b] = v;
+        ya[b] = vec3<f32>(0.0);
+    }
+    for (var a = 0u; a < 8u; a++) {
+        for (var b = a; b < 8u; b++) {
+            // block (a, b): rows 3a + i, columns 3b + j
+            let c0 = vec3<f32>(mats[sym(3u * a, 3u * b) * ne + e], mats[sym(3u * a + 1u, 3u * b) * ne + e],
+                               mats[sym(3u * a + 2u, 3u * b) * ne + e]);
+            let c1 = vec3<f32>(mats[sym(3u * a, 3u * b + 1u) * ne + e], mats[sym(3u * a + 1u, 3u * b + 1u) * ne + e],
+                               mats[sym(3u * a + 2u, 3u * b + 1u) * ne + e]);
+            let c2 = vec3<f32>(mats[sym(3u * a, 3u * b + 2u) * ne + e], mats[sym(3u * a + 1u, 3u * b + 2u) * ne + e],
+                               mats[sym(3u * a + 2u, 3u * b + 2u) * ne + e]);
+            let blk = mat3x3<f32>(c0, c1, c2);
+            ya[a] += blk * ue[b];
+            if b != a { ya[b] += transpose(blk) * ue[a]; }
+        }
+    }
+    for (var a = 0u; a < 8u; a++) {
+        ye[(3u * a) * ne + e] = ya[a].x;
+        ye[(3u * a + 1u) * ne + e] = ya[a].y;
+        ye[(3u * a + 2u) * ne + e] = ya[a].z;
+    }
+}
+
+//// kernel elem_gather bricks
+// `apply_elem`'s second pass: y = Σ over a node's (up to 8) elements of their ye rows for it
+// (y -= when P.m.x == 1). P.m.y: the level's stored elements.
+@group(0) @binding(1) var<storage, read> ye: array<f32>;
+@group(0) @binding(2) var<storage, read_write> y: array<f32>;
+@group(0) @binding(3) var<storage, read> page: array<u32>;
+@group(0) @binding(4) var<storage, read> coords: array<vec4<u32>>;
+
+#include nbhd NAME=nl PAGE=page
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let slot = wg_flat(wg, nwg);
+    if slot >= P.n.w { return; }
+    nl_load(coords[slot].xyz, nbricks(P.n.xyz), li);
+    workgroupBarrier();
+    let node = slot * BV + li;
+    let ne = P.m.y;
+    let l = vec3<i32>(unflat(li, bshape()));
+    var acc = vec3<f32>(0.0);
+    for (var a = 0u; a < 8u; a++) {
+        // this node is local node a of the element whose first node is l - a's bits
+        let e = nl_at(l - vec3<i32>(vec3<u32>(a & 1u, (a >> 1u) & 1u, (a >> 2u) & 1u)));
+        if e == NONE { continue; }
+        acc += vec3<f32>(ye[(3u * a) * ne + e], ye[(3u * a + 1u) * ne + e], ye[(3u * a + 2u) * ne + e]);
+    }
+    if P.m.x == 1u {
+        y[3u * node] -= acc.x;
+        y[3u * node + 1u] -= acc.y;
+        y[3u * node + 2u] -= acc.z;
+    } else {
+        y[3u * node] = acc.x;
+        y[3u * node + 1u] = acc.y;
+        y[3u * node + 2u] = acc.z;
+    }
+}
+
 //// kernel diag_elem bricks
 // diag(K) of a level stored as element matrices (as `apply_elem`)
 @group(0) @binding(1) var<storage, read> mats: array<f32>;
