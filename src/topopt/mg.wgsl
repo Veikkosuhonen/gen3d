@@ -77,6 +77,8 @@ const BV: u32 = 64u;
 const HN: u32 = 216u;
 const EN: u32 = 125u;
 const CN: u32 = 64u;
+// and the fine nodes under a coarse brick, (2B + 1)³ (`restrict`)
+const RN: u32 = 729u;
 
 fn bshape() -> vec3<u32> {
     return vec3<u32>(BX, BY, BZ);
@@ -908,7 +910,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 // grid (P.m.y == 1, its diagonal isn't stored) its per-node free axes: with E_min > 0 a free DOF has
 // a positive diagonal. One workgroup per stored coarse brick (`page`: the fine grid's, `coords`:
 // the coarse grid's): the fine nodes 2c - 1 .. 2c + 1 of its nodes c lie in the 3×3×3 fine bricks
-// around fine brick 2b.
+// around fine brick 2b, and are staged in workgroup memory first.
 @group(0) @binding(1) var<storage, read> r: array<f32>;
 @group(0) @binding(2) var<storage, read> mask: array<u32>;
 @group(0) @binding(3) var<storage, read_write> rc: array<f32>;
@@ -924,6 +926,11 @@ fn keep(node: u32) -> vec3<f32> {
                      f32(bitcast<f32>(mask[q + 2u]) > 0.0));
 }
 
+// the fine nodes under the brick, 2c - 1 .. 2c + 1 for its nodes c (2B + 1 per axis), times keep
+var<workgroup> srx: array<f32, RN>;
+var<workgroup> sry: array<f32, RN>;
+var<workgroup> srz: array<f32, RN>;
+
 @compute @workgroup_size(64)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
         @builtin(local_invocation_index) li: u32) {
@@ -931,17 +938,30 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     if slot >= P.n.w { return; }
     nf_load(2u * coords[slot].xyz, nbricks(P.n.xyz), li);
     workgroupBarrier();
+    // staged with neighbouring threads on neighbouring fine nodes, rather than each thread
+    // gathering its 27 (scattered, stride 2)
+    let rs = 2u * bshape() + vec3<u32>(1u);
+    for (var s = li; s < rs.x * rs.y * rs.z; s += BV) {
+        let g = nf_at(vec3<i32>(unflat(s, rs)) - vec3<i32>(1));
+        var v = vec3<f32>(0.0);
+        if g != NONE {
+            let q = 3u * g;
+            v = keep(g) * vec3<f32>(r[q], r[q + 1u], r[q + 2u]);
+        }
+        srx[s] = v.x;
+        sry[s] = v.y;
+        srz[s] = v.z;
+    }
+    workgroupBarrier();
     let m = slot * BV + li;
-    let c2 = 2 * vec3<i32>(unflat(li, bshape()));
+    let base = flat3(2u * unflat(li, bshape()), rs);
     var acc = vec3<f32>(0.0);
-    for (var dk = -1; dk <= 1; dk++) {
-        for (var dj = -1; dj <= 1; dj++) {
-            for (var di = -1; di <= 1; di++) {
-                let g = nf_at(c2 + vec3<i32>(di, dj, dk));
-                if g == NONE { continue; }
-                let w = select(0.5, 1.0, di == 0) * select(0.5, 1.0, dj == 0) * select(0.5, 1.0, dk == 0);
-                let q = 3u * g;
-                acc += w * keep(g) * vec3<f32>(r[q], r[q + 1u], r[q + 2u]);
+    for (var dk = 0u; dk < 3u; dk++) {
+        for (var dj = 0u; dj < 3u; dj++) {
+            for (var di = 0u; di < 3u; di++) {
+                let w = select(0.5, 1.0, di == 1u) * select(0.5, 1.0, dj == 1u) * select(0.5, 1.0, dk == 1u);
+                let i = base + di + rs.x * (dj + rs.y * dk);
+                acc += w * vec3<f32>(srx[i], sry[i], srz[i]);
             }
         }
     }

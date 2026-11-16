@@ -194,6 +194,7 @@ impl<'g> Engine<'g> {
                     ("HN", size(2)),
                     ("EN", size(1)),
                     ("CN", b.iter().map(|&v| (v / 2 + 2) as u32).product()),
+                    ("RN", b.iter().map(|&v| (2 * v + 1) as u32).product()),
                 ];
                 let src = with_constants(&src, &constants).map_err(|e| anyhow!("kernel {label}: {e}"))?;
                 let pipe = gpu

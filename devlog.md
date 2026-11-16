@@ -3,6 +3,28 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: `restrict` stages the fine nodes in workgroup memory
+
+**Why:** after the NVIDIA tuning, the level 0 → 1 restriction took ~1 ms per call (5 per CG
+iteration, 4.9 ms of 30), about as long as a whole fine stencil for a much simpler kernel. Each
+thread gathered its 27 fine nodes itself: stride-2 addresses across the 3×3×3 fine bricks, plus a
+separate load per component and for the mask, so a warp's loads touched many sectors each.
+
+**What:** one workgroup per coarse brick first stages the fine nodes under it, (2B + 1)³ (9³ for 4³
+bricks; tile size `RN`, set per brick shape like the other tiles), times the DOF mask, with
+neighbouring threads on neighbouring fine nodes. Then each thread sums its 27 taps from the tile.
+
+**Result** (RTX 3080, GPU ms): `restrict` 0 → 1 1.0 → 0.4 per call (4.9 → 2.0 per CG iteration),
+1 → 2 0.25 → 0.08. CG iteration (9.6M box) 31 → 28.7 ms wall clock. `bench-topopt --voxels 0.3
+--iters 8`: solve 0.136 → 0.125 s per iteration, compliance identical. Not a tuning switch: the
+coalesced loads help any GPU.
+
+**Verified:** full suite, including `kernels_match_cpu` (restrict on 12 grids, slabs included).
+
+**Still open:** tried and dropped the same day: the fine stencils reading their 27 neighbours into
+registers once instead of 8 × 8 tile reads (`cheb_fine` 7.0 → 8.0 ms, likely occupancy lost to
+registers), and two bricks per workgroup for `restrict` (slower).
+
 ## 2026-11-16: Level-2 assembly from a precomputed table; stored children loaded up front
 
 **Why:** with the NVIDIA tuning (entry below), `assemble` was 35 of the multigrid setup's 40 ms
