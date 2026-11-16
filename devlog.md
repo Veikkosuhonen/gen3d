@@ -3,6 +3,27 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: Density filter over a host-built neighbour list
+
+**Why:** timestamps of the optimizer's programs (a temporary hook, not kept) showed the density
+filter at 0.49 of the 0.67 ms of each OC bisection step (2.8M-element bracket at 0.3 mm; ~17
+steps per iteration), and 1.07 ms of the sensitivity program: ~9.4 ms of each iteration's 16 ms
+update. Each element looped over the (2r + 1)³ cube around it (125 offsets for rmin = 1.5), with a
+`sqrt` per offset, to find the 19 inside rmin. `r` is a runtime value, so nothing unrolled.
+
+**What:** the host lists the offsets with a positive weight (and the weights, f64 → f32) in the
+loop order of `weight_sums`. The kernel reads them from a small storage buffer (`offs`, the count in
+P.m.w): every thread reads the same entry, a broadcast.
+
+**Result** (RTX 3080, `bench-topopt --voxels 0.3 --iters 8`): update 0.016 → 0.011 s per
+iteration, iteration 0.170 → 0.159 s, compliance identical.
+
+**Verified:** full suite (`gpu_loop_matches_cpu_loop`, `symmetric_quarter_matches_the_whole_gpu`
+with mirror planes, `live_bricks_match_the_whole_domain`).
+
+**Still open:** each OC bisection step is a GPU round trip running the filter. Fewer steps (a
+better root finder) or the bisection on the GPU would cut the rest of the update.
+
 ## 2026-11-16: Fine elements' clamped-node mask from their free axes
 
 **Why:** `diag_l1` (5 ms of the 17 ms multigrid setup, 9.6M box) and level-2 `assemble` looked

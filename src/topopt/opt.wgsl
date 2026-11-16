@@ -88,13 +88,16 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 // Cone filter over domain elements within P.f.x voxels (weights rmin - distance). P.m.y: 0 the raw
 // weighted sum on domain elements; 1 densities: kept-solid 1, domain the weighted mean, else 0.
 // P.m.z: axes (bits x, y, z) whose low face is a mirror plane: neighbours past it are the mirror
-// images (index -i - 1). Densities divide by the weight sums `wsum`.
+// images (index -i - 1). Densities divide by the weight sums `wsum`. The P.m.w neighbours within
+// rmin come from the host (`offs`: offset, weight), rather than looping over the whole cube around
+// rmin and skipping those outside (19 of 125 for rmin = 1.5).
 @group(0) @binding(1) var<storage, read> flags: array<u32>;
 @group(0) @binding(2) var<storage, read> inp: array<f32>;
 @group(0) @binding(3) var<storage, read_write> outp: array<f32>;
 @group(0) @binding(4) var<storage, read> page: array<u32>;
 @group(0) @binding(5) var<storage, read> coords: array<vec4<u32>>;
 @group(0) @binding(6) var<storage, read> wsum: array<f32>;
+@group(0) @binding(7) var<storage, read> offs: array<vec4<f32>>;
 
 #include elem_grid
 
@@ -115,21 +118,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     let p = elem_point(e);
     let n = vec3<i32>(P.n.xyz);
     let nb = nbricks(P.n.xyz);
-    let rmin = P.f.x;
-    let r = i32(ceil(rmin));
     var s = 0.0;
-    for (var dk = -r; dk <= r; dk++) {
-        for (var dj = -r; dj <= r; dj++) {
-            for (var di = -r; di <= r; di++) {
-                let w = rmin - sqrt(f32(di * di + dj * dj + dk * dk));
-                if w <= 0.0 { continue; }
-                let q = mirror(p + vec3<i32>(di, dj, dk));
-                if any(q >= n) { continue; }
-                let m = fat(q, nb);
-                if m == NONE { continue; }
-                if (flags[m] & 1u) != 0u { s += w * inp[m]; }
-            }
-        }
+    for (var i = 0u; i < P.m.w; i++) {
+        let o = offs[i];
+        let q = mirror(p + vec3<i32>(o.xyz));
+        if any(q >= n) { continue; }
+        let m = fat(q, nb);
+        if m == NONE { continue; }
+        if (flags[m] & 1u) != 0u { s += o.w * inp[m]; }
     }
     if P.m.y == 1u { s /= wsum[e]; }
     outp[e] = s;

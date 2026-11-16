@@ -322,13 +322,27 @@ pub(super) fn optimize_gpu(
     // filter: mode 0 raw sums, 1 densities
     // the mirror planes (at the grid's low faces) reflect the filter
     let mirror = (0..3).filter(|&a| m.mirror_axes()[a]).fold(0u32, |b, a| b | 1 << a);
+    // the neighbours within rmin, in the loop order of `weight_sums`: (offset, weight)
+    let r = s.rmin.ceil() as i32;
+    let mut offsets: Vec<[f32; 4]> = vec![];
+    for dk in -r..=r {
+        for dj in -r..=r {
+            for di in -r..=r {
+                let wt = s.rmin - ((di * di + dj * dj + dk * dk) as f64).sqrt();
+                if wt > 0.0 {
+                    offsets.push([di as f32, dj as f32, dk as f32, wt as f32]);
+                }
+            }
+        }
+    }
+    let offsets_buf = e.init("filter offsets", bytemuck::cast_slice(&offsets));
     let filter = |out: &mut Vec<Step>, mode: u32, inp: &wgpu::Buffer, outp: &wgpu::Buffer| {
         elem(
             out,
             &bk("filter"),
             rmin,
-            [0, mode, mirror, 0],
-            &[&f.flags, inp, outp, page, coords, &f.wsum],
+            [0, mode, mirror, offsets.len() as u32],
+            &[&f.flags, inp, outp, page, coords, &f.wsum, &offsets_buf],
         )
     };
     // the AM filter, one layer per step: forward from the plate up, the chain rule from the top down.
