@@ -3,6 +3,62 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: Stop a stalled CG solve after 1,000 iterations without progress
+
+**Why:** a near-singular system (the single-node pins above) made the GPU solver run to its
+20,000-iteration cap, minutes per solve on large grids, for a solution no better than it had after
+a few hundred.
+
+**What:** `GpuMg::solve` keeps the best residual so far. When 1,000 iterations (`STALL_ITS`)
+pass without the residual norm falling below 0.9 of it, the solve stops with a warning
+(`CG stalled at relative residual …`) and the optimizer continues with the current solution, as
+it did at the cap.
+
+**Result:** with single-node pins forced back on (`table stand` 3.4 mm), the first iteration took
+1.4 s instead of 23 s. The second converged normally (56 CG its).
+
+**Verified:** full suite, and `bench-topopt` unchanged (no solve comes near the window).
+
+## 2026-11-16: Slide-ground pins hold a patch, not a node
+
+**Why:** `table stand` (slide ground, 5 rocked load cases) took 23 s before its first iteration
+at 1.7 mm and over 130 s at 1.6 mm, though 1.8 mm took 0.4 s. The time was the first solve on the
+coarse-start grid (3.4 / 3.2 mm): CG wandered at a relative residual of 2-30 until its
+20,000-iteration cap, only in the load parts with a sideways force. The pins against sliding and
+spinning were single nodes, so sliding the part was resisted only by the few elements around
+them. At the starting density (0.15) that gave a 300 mm max displacement under 100 N, a mode so
+soft that the f32 GPU multigrid stalled on it at some element sizes:
+- The CPU (f64) multigrid solved the same 3.4 mm problem in 54 CG iterations. With `--ground grip`
+  every size converged in 48-84 (6.5 mm max displacement).
+- Which sizes stalled came down to ~1e-7 differences in the coarse levels. The level-2 table
+  (`cd92647`, earlier today) moved them: before it 3.4 mm converged, after it 3.4 and 3.8 mm
+  stalled. The old level-2 path stalled too, at 3.2 and 2.8 mm.
+
+**What:** each pin (and its mirror images) holds its axes at every supported node within
+`PIN_PATCH_MM` = 4 mm, and at least 1.5 elements, so a coarse grid's pin still holds its
+neighbours. The log reports `pinned N nodes around (x, y, z) in XY`. This is also better physics:
+the optimizer no longer sees the sideways reaction as a point load at a node.
+
+**Result** (`table stand`, `--volfrac 0.15 --ground slide`, first solve, `--no-coarse-start`):
+
+| element size | before | after |
+|---|---|---|
+| 3.8 mm | 20,072 CG its, 19 s | 56, 0.1 s |
+| 3.4 mm | 20,072, 23 s | 60, 0.2 s |
+| 3.2 mm | 40,132, 128 s | 160, 0.7 s |
+| 3.0 mm | 148, 0.4 s | 132, 0.4 s |
+| 2.8 mm | 20,080, 31 s | 84, 0.3 s |
+
+The user's runs: 1.7 mm's first iteration 22.8 → 0.6 s, 1.6 mm's 130 → 0.9 s. Max displacement at
+the start is ~100 mm instead of 300 (the slide is still soft against grip's 6.5 mm, as it should
+be).
+
+**Verified:** full suite. `ground_weight_and_rocking` now checks that the pinned nodes form patches
+rather than counting 3 pinned DOFs. `bench-topopt` (no ground) unchanged.
+
+**Still open:** the patch size is fixed in mm, not tied to the part's footprint. A tiny part on a
+slide ground gets most of its footprint pinned.
+
 ## 2026-11-16: GPU readback straight into the destination, staging reused
 
 **Why:** timing `export`'s sampling (vase at 0.15 mm, 292M samples in 254 MB slabs): the SDF

@@ -53,6 +53,10 @@ const SYM: usize = 300;
 
 /// CG iterations between convergence checks.
 const CHECK_EVERY: usize = 4;
+/// CG iterations without the residual falling below 0.9 of its best (norm) after which a solve is
+/// given up as stalled. A near-singular system (before pin patches: a slide ground's sliding
+/// held by single nodes) left the f32 solver wandering until its 20,000-iteration cap.
+const STALL_ITS: usize = 1000;
 
 // scalar slots
 const RR: u32 = 0;
@@ -977,6 +981,8 @@ impl<'a> GpuMg<'a> {
         }
         let mut its = 0;
         let batch: Vec<&[Step]> = vec![&self.iter[c]; CHECK_EVERY];
+        // the best residual so far and when it was reached (`STALL_ITS`)
+        let (mut best, mut best_at) = (rr0, 0);
         while its < maxit {
             self.e.run(&batch)?;
             its += CHECK_EVERY;
@@ -987,6 +993,16 @@ impl<'a> GpuMg<'a> {
                 return Err(Diverged(rr).into());
             }
             if rr <= target {
+                break;
+            }
+            if rr < 0.81 * best {
+                (best, best_at) = (rr, its);
+            } else if its - best_at >= STALL_ITS {
+                println!(
+                    "warning: CG stalled at relative residual {:.1e} (target {tol:.0e}) after {its} iterations; \
+                     continuing with this solution",
+                    (rr as f64 / self.ff[c]).sqrt()
+                );
                 break;
             }
         }
