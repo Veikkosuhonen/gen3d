@@ -58,7 +58,8 @@ pub fn create(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, log
     }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("gen3d"),
-        required_features: wgpu::Features::empty(),
+        // timestamps for the optimizer's kernel profiles (`Engine::profile`), when available
+        required_features: adapter.features() & wgpu::Features::TIMESTAMP_QUERY,
         required_limits: adapter.limits(),
         ..Default::default()
     }))

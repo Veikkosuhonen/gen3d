@@ -119,6 +119,24 @@ fn $NAME(p: vec3<i32>, nb: vec3<u32>) -> u32 {
     return in_slot(s, p);
 }
 
+//// lib ke_uniform
+// The 24×24 element matrix at binding $BIND (`#include ke BIND=n`), as a uniform or a storage buffer
+// (`Tuning::ke_uniform`). Uniform data comes from the constant cache, and once the loops unroll its
+// offsets are constants (on NVIDIA, operands of the FMAs themselves) instead of one load
+// instruction per entry. `kv(i)` is entry i (row-major).
+@group(0) @binding($BIND) var<uniform> ke: array<vec4<f32>, 144>;
+
+fn kv(i: u32) -> f32 {
+    return ke[i >> 2u][i & 3u];
+}
+
+//// lib ke_storage
+@group(0) @binding($BIND) var<storage, read> ke: array<f32>;
+
+fn kv(i: u32) -> f32 {
+    return ke[i];
+}
+
 //// lib nbhd
 // The slots of the 3×3×3 bricks around brick b0 of the grid with page table $PAGE, in workgroup
 // memory: every thread calls `$NAME_load` (then a barrier); `$NAME_at(q)` is then the sparse index of
@@ -221,7 +239,7 @@ fn stencil(li: u32, with_u: bool, with_dg: bool) -> Kd {
         if s == 0.0 { continue; }
         if with_dg {
             let rd = (3u * a) * 25u;
-            r.dg += s * vec3<f32>(ke[rd], ke[rd + 25u], ke[rd + 50u]);
+            r.dg += s * vec3<f32>(kv(rd), kv(rd + 25u), kv(rd + 50u));
         }
         if !with_u { continue; }
         let base = h - di - sy * dj - sz * dk;
@@ -229,9 +247,9 @@ fn stencil(li: u32, with_u: bool, with_dg: bool) -> Kd {
         for (var c = 1u; c < 8u; c++) {
             let um = su(base + (c & 1u) + sy * ((c >> 1u) & 1u) + sz * ((c >> 2u) & 1u)) - u0;
             let rr = (3u * a) * 24u + 3u * c;
-            r.ku.x += s * dot(vec3<f32>(ke[rr], ke[rr + 1u], ke[rr + 2u]), um);
-            r.ku.y += s * dot(vec3<f32>(ke[rr + 24u], ke[rr + 25u], ke[rr + 26u]), um);
-            r.ku.z += s * dot(vec3<f32>(ke[rr + 48u], ke[rr + 49u], ke[rr + 50u]), um);
+            r.ku.x += s * dot(vec3<f32>(kv(rr), kv(rr + 1u), kv(rr + 2u)), um);
+            r.ku.y += s * dot(vec3<f32>(kv(rr + 24u), kv(rr + 25u), kv(rr + 26u)), um);
+            r.ku.z += s * dot(vec3<f32>(kv(rr + 48u), kv(rr + 49u), kv(rr + 50u)), um);
         }
     }
     return r;
@@ -276,7 +294,7 @@ fn fine_free(f: vec3<i32>, nb: vec3<u32>) -> u32 {
 // stored brick, from tiles in workgroup memory (`fine_stage`).
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
 @group(0) @binding(2) var<storage, read> free: array<u32>;
-@group(0) @binding(3) var<storage, read> ke: array<f32>;
+#include ke BIND=3
 @group(0) @binding(4) var<storage, read> u: array<f32>;
 @group(0) @binding(5) var<storage, read_write> y: array<f32>;
 @group(0) @binding(6) var<storage, read> page: array<u32>;
@@ -316,7 +334,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 // diag(K) on the fine grid (0 on clamped DOFs), as `apply_fine`.
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
 @group(0) @binding(2) var<storage, read> free: array<u32>;
-@group(0) @binding(3) var<storage, read> ke: array<f32>;
+#include ke BIND=3
 @group(0) @binding(4) var<storage, read_write> d: array<f32>;
 @group(0) @binding(5) var<storage, read> page: array<u32>;
 @group(0) @binding(6) var<storage, read> coords: array<vec4<u32>>;
@@ -354,7 +372,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(1) var<storage, read> S: array<f32>;
 @group(0) @binding(2) var<storage, read> ee: array<f32>;
 @group(0) @binding(3) var<storage, read> free: array<u32>;
-@group(0) @binding(4) var<storage, read> ke: array<f32>;
+#include ke BIND=4
 @group(0) @binding(5) var<storage, read> x: array<f32>;
 @group(0) @binding(6) var<storage, read> b: array<f32>;
 @group(0) @binding(7) var<storage, read_write> d: array<f32>;
@@ -409,7 +427,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 // D keeps the free DOFs.
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
 @group(0) @binding(2) var<storage, read> free: array<u32>;
-@group(0) @binding(3) var<storage, read> ke: array<f32>;
+#include ke BIND=3
 @group(0) @binding(4) var<storage, read> uc: array<f32>;
 @group(0) @binding(5) var<storage, read_write> y: array<f32>;
 @group(0) @binding(6) var<storage, read> page: array<u32>;
@@ -508,7 +526,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(2) var<storage, read> free: array<u32>;
 @group(0) @binding(3) var<storage, read> T: array<f32>;
 @group(0) @binding(4) var<storage, read_write> d: array<f32>;
-@group(0) @binding(5) var<storage, read> ke: array<f32>;
+#include ke BIND=5
 @group(0) @binding(6) var<storage, read> page: array<u32>;
 @group(0) @binding(7) var<storage, read> coords: array<vec4<u32>>;
 
@@ -547,7 +565,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
                         if pb == 0.0 { continue; }
                         for (var x = 0u; x < 3u; x++) {
                             let free_both = ((fm >> (3u * n1 + x)) & (fm >> (3u * n2 + x)) & 1u) == 1u;
-                            if free_both { v[x] += pa * ke[(3u * n1 + x) * 24u + 3u * n2 + x] * pb; }
+                            if free_both { v[x] += pa * kv((3u * n1 + x) * 24u + 3u * n2 + x) * pb; }
                         }
                     }
                 }
@@ -659,7 +677,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 @group(0) @binding(3) var<storage, read> T: array<f32>;
 @group(0) @binding(4) var<storage, read> child: array<f32>;
 @group(0) @binding(5) var<storage, read_write> out: array<f32>;
-@group(0) @binding(6) var<storage, read> ke: array<f32>;
+#include ke BIND=6
 @group(0) @binding(7) var<storage, read> page: array<u32>;
 @group(0) @binding(8) var<storage, read> coords: array<vec4<u32>>;
 
@@ -674,8 +692,6 @@ var<workgroup> FW: array<f32, 64>;
 var<workgroup> FT: array<u32, 64>;
 // per fine element: its nodes' free axes when one is partly free (`fine_free`), else 0
 var<workgroup> FM: array<u32, 64>;
-// ke, for those elements' per-axis masked products
-var<workgroup> KE: array<f32, 576>;
 // stored children: their indices (NONE: none)
 var<workgroup> CI: array<u32, 8>;
 
@@ -694,7 +710,7 @@ fn partial_entry(c1: u32, fm: u32, idx: u32) -> f32 {
         if pa == 0.0 { continue; }
         for (var n2 = 0u; n2 < 8u; n2++) {
             if ((fm >> (3u * n2 + y)) & 1u) == 0u { continue; }
-            v += pa * KE[(3u * n + x) * 24u + 3u * n2 + y] * PW[(c1 * 8u + n2) * 8u + b];
+            v += pa * kv((3u * n + x) * 24u + 3u * n2 + y) * PW[(c1 * 8u + n2) * 8u + b];
         }
     }
     return v;
@@ -732,9 +748,6 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         PW[i] = wgt(i / 64u, (i / 8u) % 8u, i % 8u);
     }
     if virt {
-        for (var t = 0u; t < 9u; t++) {
-            KE[li + 64u * t] = ke[li + 64u * t];
-        }
         // thread li loads fine element c1 = li % 8 of level-1 child c2 = li / 8
         let c2 = li / 8u;
         let c1 = li % 8u;
@@ -1103,7 +1116,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
 // ce = u_eᵀ ke u_e per fine element with stiffness (added to ce when P.m.x == 1). One workgroup per
 // stored brick, u staged on the brick and a one-node halo on its + sides.
 @group(0) @binding(1) var<storage, read> ee: array<f32>;
-@group(0) @binding(2) var<storage, read> ke: array<f32>;
+#include ke BIND=2
 @group(0) @binding(3) var<storage, read> u: array<f32>;
 @group(0) @binding(4) var<storage, read_write> ce: array<f32>;
 @group(0) @binding(5) var<storage, read> page: array<u32>;
@@ -1143,7 +1156,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
         }
         for (var r = 0u; r < 24u; r++) {
             var row = 0.0;
-            for (var q = 0u; q < 24u; q++) { row += ke[r * 24u + q] * ue[q]; }
+            for (var q = 0u; q < 24u; q++) { row += kv(r * 24u + q) * ue[q]; }
             s += ue[r] * row;
         }
     }

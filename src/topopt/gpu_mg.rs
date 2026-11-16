@@ -286,7 +286,7 @@ impl<'a> GpuMg<'a> {
             smoother: s.smoother,
             ee: share(|o| &o.ee, &|| buf("ee", ne)),
             free: init("free", bytemuck::cast_slice(&free32)),
-            ke: share(|o| &o.ke, &|| init("ke", bytemuck::cast_slice(&ke32))),
+            ke: share(|o| &o.ke, &|| e.init_uniform("ke", bytemuck::cast_slice(&ke32))),
             table: share(|o| &o.table, &|| init("ptkp table", bytemuck::cast_slice(&table))),
             ce: share(|o| &o.ce, &|| buf("ce", ne)),
             // level 0's diagonal isn't kept (the smoother works it out, `cheb_fine`): only the λmax
@@ -1306,5 +1306,20 @@ mod tests {
         g.vcycle(&mut prog, 0, &g.r, &g.z);
         time("V-cycle", &prog);
         time("CG iteration", &g.iter[0]);
+        // GPU time per kernel (timestamps), over 4 runs
+        for (what, prog) in [("setup program", &g.setup), ("CG iteration", &g.iter[0])] {
+            let reps = 4;
+            let batch: Vec<&[Step]> = vec![prog; reps];
+            if let Some(rows) =
+                g.e.profile(&batch, std::env::var_os("PROFILE_BY_SIZE").is_some())
+                    .unwrap()
+            {
+                let total: f64 = rows.iter().map(|r| r.2).sum();
+                eprintln!("GPU time per {what}, by kernel ({:.2} ms in all):", total / reps as f64);
+                for (name, n, ms) in rows {
+                    eprintln!("{name:>24}: {:7.3} ms ({:>3} dispatches)", ms / reps as f64, n / reps);
+                }
+            }
+        }
     }
 }

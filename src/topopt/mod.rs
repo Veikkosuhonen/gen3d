@@ -46,6 +46,7 @@ mod output;
 mod overhang;
 mod plane2d;
 mod symmetry;
+pub mod tuning;
 
 /// Linear solver for K u = f.
 #[derive(Clone, Copy, Debug)]

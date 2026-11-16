@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow};
 use wgpu::util::DeviceExt;
 
+use super::tuning::Tuning;
 use crate::gpu::Gpu;
 
 const SOURCES: [&str; 2] = [include_str!("mg.wgsl"), include_str!("opt.wgsl")];
@@ -46,6 +47,9 @@ pub enum Reduce {
 }
 
 pub struct Step {
+    /// the kernel's name (with its brick-shape suffix), for `profile`
+    #[cfg_attr(not(test), allow(dead_code))]
+    name: String,
     pipe: wgpu::ComputePipeline,
     bind: wgpu::BindGroup,
     groups: [u32; 3],
@@ -160,6 +164,8 @@ fn expand(body: &str, libs: &HashMap<String, String>) -> Result<String> {
 
 pub struct Engine<'g> {
     pub gpu: &'g Gpu,
+    #[allow(dead_code)]
+    pub tuning: Tuning,
     pipes: HashMap<String, wgpu::ComputePipeline>,
     pub scalars: wgpu::Buffer,
     partials: wgpu::Buffer,
@@ -170,7 +176,10 @@ pub struct Engine<'g> {
 impl<'g> Engine<'g> {
     pub fn new(gpu: &'g Gpu) -> Result<Self> {
         let dev = &gpu.device;
-        let (prelude, libs, kernels) = sections()?;
+        let tuning = Tuning::detect(&gpu.adapter.get_info())?;
+        let (prelude, mut libs, kernels) = sections()?;
+        let ke = if tuning.ke_uniform { "ke_uniform" } else { "ke_storage" };
+        libs.insert("ke".into(), libs[ke].clone());
         let mut pipes = HashMap::new();
         for (name, bricks, body) in kernels {
             let src = expand(&format!("{prelude}\n{body}"), &libs).map_err(|e| anyhow!("kernel {name}: {e}"))?;
@@ -189,10 +198,19 @@ impl<'g> Engine<'g> {
                 let src = with_constants(&src, &constants).map_err(|e| anyhow!("kernel {label}: {e}"))?;
                 let pipe = gpu
                     .scoped(|| {
-                        let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        let desc = wgpu::ShaderModuleDescriptor {
                             label: Some(&label),
                             source: wgpu::ShaderSource::Wgsl(src.into()),
-                        });
+                        };
+                        let module = if tuning.unbounded_loops {
+                            let mut checks = wgpu::ShaderRuntimeChecks::checked();
+                            checks.force_loop_bounding = false;
+                            // SAFETY: our own kernels, whose loops all end (fixed trip counts, or
+                            // bounded by grid sizes); buffer bounds checks stay on.
+                            unsafe { dev.create_shader_module_trusted(desc, checks) }
+                        } else {
+                            dev.create_shader_module(desc)
+                        };
                         dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                             label: Some(&label),
                             layout: None,
@@ -208,6 +226,7 @@ impl<'g> Engine<'g> {
         }
         let mut e = Engine {
             gpu,
+            tuning,
             pipes,
             scalars: dev.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("scalars"),
@@ -258,6 +277,19 @@ impl<'g> Engine<'g> {
         b
     }
 
+    /// A buffer holding `data` that kernels can bind as uniform or storage (`ke`, see `Tuning`).
+    pub fn init_uniform(&self, label: &str, data: &[u8]) -> wgpu::Buffer {
+        self.allocated.set(self.allocated.get() + data.len() as u64);
+        let b = self.gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: data.len() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.gpu.queue.write_buffer(&b, 0, data);
+        b
+    }
+
     pub fn write_f32(&self, b: &wgpu::Buffer, data: &[f32]) {
         self.gpu.queue.write_buffer(b, 0, bytemuck::cast_slice(data));
     }
@@ -293,6 +325,7 @@ impl<'g> Engine<'g> {
             entries: &entries,
         });
         out.push(Step {
+            name: kernel.to_string(),
             pipe: pipe.clone(),
             bind,
             groups,
@@ -441,6 +474,67 @@ impl<'g> Engine<'g> {
             }
         }
         self.gpu.queue.submit([enc.finish()]);
+    }
+
+    /// GPU time per kernel over `programs` (one compute pass per dispatch, timestamps around each),
+    /// summed by kernel name (and workgroup count when `by_size`): (name, dispatches, ms), slowest
+    /// first. None without timestamp queries.
+    #[cfg(test)]
+    pub fn profile(&self, programs: &[&[Step]], by_size: bool) -> Result<Option<Vec<(String, usize, f64)>>> {
+        let dev = &self.gpu.device;
+        if !dev.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+            return Ok(None);
+        }
+        let steps: Vec<&Step> = programs.iter().flat_map(|p| p.iter()).collect();
+        let mut totals: HashMap<String, (usize, f64)> = HashMap::new();
+        let period = self.gpu.queue.get_timestamp_period() as f64;
+        // query sets hold at most 4096 queries: 2 per dispatch
+        for chunk in steps.chunks(2048) {
+            let n = 2 * chunk.len() as u32;
+            let set = dev.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("profile"),
+                ty: wgpu::QueryType::Timestamp,
+                count: n,
+            });
+            let resolve = dev.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("profile resolve"),
+                size: n as u64 * 8,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let mut enc = dev.create_command_encoder(&Default::default());
+            for (i, s) in chunk.iter().enumerate() {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: &set,
+                        beginning_of_pass_write_index: Some(2 * i as u32),
+                        end_of_pass_write_index: Some(2 * i as u32 + 1),
+                    }),
+                });
+                pass.set_pipeline(&s.pipe);
+                pass.set_bind_group(0, &s.bind, &[]);
+                pass.dispatch_workgroups(s.groups[0], s.groups[1], s.groups[2]);
+            }
+            enc.resolve_query_set(&set, 0..n, &resolve, 0);
+            self.gpu.queue.submit([enc.finish()]);
+            let bytes = self.gpu.read_buffer(&resolve, n as u64 * 8)?;
+            let ts: &[u64] = bytemuck::cast_slice(&bytes);
+            for (i, s) in chunk.iter().enumerate() {
+                let ms = ts[2 * i + 1].saturating_sub(ts[2 * i]) as f64 * period * 1e-6;
+                let key = if by_size {
+                    format!("{} [{}]", s.name, s.groups.iter().product::<u32>())
+                } else {
+                    s.name.clone()
+                };
+                let e = totals.entry(key).or_default();
+                e.0 += 1;
+                e.1 += ms;
+            }
+        }
+        let mut out: Vec<_> = totals.into_iter().map(|(k, (n, ms))| (k, n, ms)).collect();
+        out.sort_by(|a, b| b.2.total_cmp(&a.2));
+        Ok(Some(out))
     }
 
     pub fn read_f32(&self, b: &wgpu::Buffer, len: usize) -> Result<Vec<f32>> {

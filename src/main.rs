@@ -776,6 +776,11 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let shape = load_shape(&shape, &[])?;
             let gpu = gpu::headless()?;
+            println!(
+                "GPU: {}, kernel tuning {}",
+                gpu.adapter.get_info().name,
+                topopt::tuning::Tuning::detect(&gpu.adapter.get_info())?
+            );
             let dir = std::env::temp_dir().join(format!("gen3d-bench-{}", std::process::id()));
             std::fs::create_dir_all(&dir)?;
             let mut rows = vec![];

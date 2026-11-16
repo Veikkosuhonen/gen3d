@@ -3,6 +3,53 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-16: GPU kernel profiles per vendor; NVIDIA: unrolled loops, `ke` as a uniform
+
+**Why:** the optimizer's kernels were tuned on an M1 Pro; the primary target is now consumer NVIDIA
+(RTX 3080). Wall-clock timing of whole programs was too noisy to tell kernels apart (the same
+`apply level 0` measured 3.8-5.4 ms run to run).
+
+**What:**
+- `Engine::profile`: GPU time per kernel from timestamp queries (one pass per dispatch), summed by
+  kernel or by kernel and dispatch size. `profile_kernels` prints it for the setup program and a
+  CG iteration. The device now requests `TIMESTAMP_QUERY` when the adapter has it.
+- `src/topopt/tuning.rs`: `Tuning`, the hardware-dependent kernel choices, picked by PCI vendor
+  (`nvidia`, `apple`, `generic`), forced with `GEN3D_GPU_PROFILE`, single fields overridden with
+  `GEN3D_GPU_TUNE="key=value,..."`. `bench-topopt` prints it.
+- `unbounded_loops`: kernels compiled with `create_shader_module_trusted` without wgpu's loop
+  bounding (bounds checks stay on), so the driver can unroll them, as the SDF shaders already were.
+- `ke_uniform`: the 24×24 element matrix bound as a uniform (`array<vec4<f32>, 144>`, read through
+  `kv(i)`, WGSL libs `ke_uniform` / `ke_storage`) in the fine stencils, `apply_p`, `diag_l1`,
+  `assemble` (its workgroup copy `KE` is gone) and `energy`.
+- `apple` keeps the old settings (both off); `nvidia` and `generic` turn both on.
+
+**Result** (RTX 3080, `profile_kernels`, 9.6M-element box, GPU ms per CG iteration by kernel):
+
+| kernel | before | either alone | both |
+|---|---|---|---|
+| `apply_p` (×4) | 17.1 | ~17 / 21.8 | 7.0 |
+| `cheb_fine` (×5) | 16.4 | ~16 / 23.0 | 6.5 |
+| `apply_fine` | 4.0 | ~3.8 / 5.2 | 1.4 |
+| CG iteration | 53 | 53 / 65 | 30.4 |
+| setup program (`assemble`, `diag_l1`) | 56.8 | | 39.8 |
+
+- Either change alone does nothing or makes things worse: uniform `ke` with dynamic indices costs
+  a component select per read. Unrolled, the offsets are constants and NVIDIA takes `ke` from the
+  constant bank as FMA operands. Before, the stencils issued ~500 `ke` loads per node and were
+  bound by load/store issue, not bandwidth: `cheb_fine` moved ~550 MB in 3.3 ms, ~170 GB/s of 760.
+- Turning bounds checks off too changed nothing measurable, so they stay on.
+- `bench-topopt` (bracket), s per iteration, `apple` → `nvidia` profile on the same GPU:
+  1.3 mm 0.018 → 0.015, 0.8 mm 0.028 → 0.019, 0.5 mm 0.071 → 0.050, 0.3 mm 0.286 → 0.185
+  (solve 0.198 → 0.121, update 0.027 → 0.015). Compliances identical.
+
+**Verified:** full suite on the `nvidia` profile (74 tests, including `kernels_match_cpu` and
+`gpu_loop_matches_cpu_loop`), and `profile_kernels` on both profiles. A new test covers parsing the
+overrides. Clippy clean.
+
+**Still open:** the `apple` profile is the old behaviour, unmeasured with these options on an M1.
+Two bricks per 64-thread workgroup (more resident threads per SM under Ampere's 16-block limit)
+made `restrict` slower in a quick test (4.9 → 8.4 ms), so it wasn't kept.
+
 ## 2026-11-16: Keep the app's Optimize settings with the shape
 
 **Why:** material, iterations, element size, filter radius, projection, ground and overhang were

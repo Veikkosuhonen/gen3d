@@ -626,6 +626,15 @@ CG iterations per solve. `optimize` prints the same split on each iteration line
 for experiments: `--smoother chebyshev|jacobi`, `--sweeps`, `--omega`, `--emin`, `--cg-tol`,
 `--fixed-cg-tol`.
 
+GPU kernel tuning: the optimizer's kernels take a few hardware-dependent choices from a profile
+(`src/topopt/tuning.rs`), picked by GPU vendor: `nvidia` (measured on an RTX 3080, the primary
+target), `apple` (the M1 Pro settings) or `generic`. `GEN3D_GPU_PROFILE=nvidia|apple|generic`
+forces one; `GEN3D_GPU_TUNE="key=value,..."` overrides single fields (e.g.
+`GEN3D_GPU_TUNE=ke_uniform=0`). `bench-topopt` prints the profile in use. For the GPU time of each
+kernel in a CG iteration and the multigrid setup (timestamp queries), run
+`cargo test --release profile_kernels -- --ignored --nocapture` (`PROFILE_BY_SIZE=1` splits each
+kernel by dispatch size, i.e. by level).
+
 `snapshot` draws the app's window into a PNG without opening one (same GPU path), to check the UI
 headlessly. It can open a step (`--step`), the optimized result in Print (`--result`), the Open
 dialog (`--browser`), or select a primitive (`--select N`).
@@ -652,7 +661,8 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/topopt/mg.rs` | multigrid preconditioner: Galerkin coarse levels, Chebyshev/Jacobi smoothers, banded Cholesky |
 | `src/topopt/gpu_mg.rs`, `mg.wgsl` | the same MGCG on the GPU (f32), on block-sparse grids |
 | `src/topopt/gpu_opt.rs`, `opt.wgsl` | the optimizer loop on the GPU: stiffness, sensitivities, filter, AM filter, projection, OC |
-| `src/topopt/gpu_engine.rs` | GPU kernels as recorded dispatch programs, reductions, scalars, readback |
+| `src/topopt/gpu_engine.rs` | GPU kernels as recorded dispatch programs, reductions, scalars, readback, per-kernel timestamp profile |
+| `src/topopt/tuning.rs` | hardware profiles for the GPU kernels (NVIDIA, Apple, generic) and their env overrides |
 | `src/topopt/bricks.rs` | block-sparse grids for the GPU optimizer: 64-point bricks around the domain, page tables, gather/scatter, coarsening |
 | `src/topopt/output.rs` | writing the result as it runs: background writes, decimated previews, full result on Stop |
 | `src/topopt/overhang.rs` | overhang control: the AM filter (layer-by-layer smooth min/max), its adjoint, the unsupported-element count |
