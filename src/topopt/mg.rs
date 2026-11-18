@@ -882,6 +882,7 @@ mod tests {
             fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]],
             cases: vec![1],
+            contact: vec![],
             extrude: None,
         };
         let [nx, ny, _] = p.nodes();

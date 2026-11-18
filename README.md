@@ -483,6 +483,25 @@ combination of theirs. Rocking gives 5 cases (upright, ±X, ±Y) but only 3 solv
 primitive's force is spread over its own nodes. A script's `field_load` is load case 1 and uses
 `--force` (the app's "script load"). The result has `displacement` for the first case and `displacement_<case>` for the others.
 
+**Ground** (`--ground`, *Stands on the ground* in the app): the bottom layer of the design domain
+rests on a table or floor, and the optimizer picks where the part touches down.
+- `slide`: the ground pushes up only and the part is free to slide and spread sideways. A few small
+  patches (4 mm radius) are pinned sideways so it can't slide or spin away.
+- `grip`: where the part touches down it is held in all directions (no slip).
+- `glued`: held in all directions everywhere, and the ground can pull (glued, screwed or bolted).
+
+`slide` and `grip` are contact: the ground only pushes. Each load case has its own set of nodes
+touching down: after a solve, nodes the ground would have to pull down lift off, lifted nodes that
+sank below the ground touch down again, and the case is solved again until the set settles (at most
+8 solves per case and iteration; each iteration starts from the last one's sets, so after the first
+few most cases take one solve). The iteration line shows the solves and the touching nodes per case.
+With contact every case is solved (none is a combination of others), and mirror symmetry is used only
+when every case is symmetric. Before running, each case is checked against tipping: for each
+separate piece of the domain, its load must press on the ground inside the piece's footprint (the
+centre of pressure inside the convex hull of its ground nodes), or the run stops with the case and
+the piece. A stand made of separate legs needs each leg to stand on its own. *The GPU solver doesn't
+do contact yet: it holds the ground both ways, as `glued`, with a note.*
+
 Script and primitives combine: when primitives use a role, the script's own `field_fixed`,
 `field_load` or `field_keep` (if any) is renamed and wrapped, so the field is the script's region plus
 the primitives'. Overlays, `export --format vti` and the Optimize step see the combined fields.
@@ -668,5 +687,6 @@ dialog (`--browser`), or select a primitive (`--select N`).
 | `src/topopt/overhang.rs` | overhang control: the AM filter (layer-by-layer smooth min/max), its adjoint, the unsupported-element count |
 | `src/topopt/plane2d.rs` | 2D optimization: projecting the problem into a one-element slab, extruding the result back onto the 3D grid |
 | `src/topopt/symmetry.rs` | mirror symmetry: the reduced model (one side), load parts per symmetric/antisymmetric pattern, expanding the fields back |
+| `src/topopt/contact.rs` | a ground that only pushes: the per-load-case set of touching nodes (active set), updated from reactions and displacements |
 | `src/topopt/checkpoint.rs` | stop and resume: the `.resume` checkpoint next to the result |
 | `src/wgsl/sdf.wgsl` | the SDF library |

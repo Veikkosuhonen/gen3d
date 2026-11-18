@@ -38,6 +38,7 @@ use symmetry::Model;
 
 mod bricks;
 mod checkpoint;
+mod contact;
 mod gpu_engine;
 mod gpu_mg;
 mod gpu_opt;
@@ -104,7 +105,9 @@ pub struct Settings {
 }
 
 /// How the bottom of the design domain is supported (`--ground`). The optimizer decides where the
-/// part touches down: the supported nodes may end up under empty space.
+/// part touches down: the supported nodes may end up under empty space. `Slide` and `Grip` are
+/// contact: the ground only pushes, and a node it would have to pull down lifts off (solved per load
+/// case, see `Contact`). `Glued` holds both ways.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ground {
@@ -114,8 +117,11 @@ pub enum Ground {
     /// stands on a slippery surface: held vertically only, free to slide and spread sideways (the
     /// least pins against sliding and spinning are added, each a patch of `PIN_PATCH_MM`)
     Slide,
-    /// stands on a grippy surface (or is glued down): held in all directions
+    /// stands on a grippy surface: where it touches down, held in all directions (no slip); it
+    /// can lift off
     Grip,
+    /// glued or bolted down: held in all directions, and the ground can pull
+    Glued,
 }
 
 impl Ground {
@@ -124,7 +130,22 @@ impl Ground {
             Ground::None => "none",
             Ground::Slide => "slide",
             Ground::Grip => "grip",
+            Ground::Glued => "glued",
         }
+    }
+
+    /// The axes a ground node is held along while it touches down.
+    fn axes(self) -> u8 {
+        match self {
+            Ground::None => 0,
+            Ground::Slide => 4,
+            Ground::Grip | Ground::Glued => 7,
+        }
+    }
+
+    /// Whether the ground only pushes (contact: nodes can lift off).
+    pub fn contact(self) -> bool {
+        matches!(self, Ground::Slide | Ground::Grip)
     }
 }
 
@@ -152,6 +173,10 @@ pub struct Problem {
     /// per node: the clamped axes, bit c for axis c (only nodes of domain elements); 7 = fully
     /// clamped, a single bit = a roller (held along that axis only)
     pub fixed: Vec<u8>,
+    /// per node: the axes a contact ground holds it along while it touches down (empty, or 0 on
+    /// every node, without one). Each load case decides which of these nodes touch: the ground
+    /// pushes on them (+Z), the others are free and above it (see `Contact`).
+    pub contact: Vec<u8>,
     /// per load case, per node: force (N)
     pub loads: Vec<Vec<[f64; 3]>>,
     /// the load cases' numbers, in the order of `loads`
@@ -194,6 +219,11 @@ impl Problem {
         std::array::from_fn(|c| self.origin[c] + ijk[c] as f64 * self.h)
     }
 
+    /// Whether a contact ground holds some nodes (see `contact`).
+    pub(crate) fn has_contact(&self) -> bool {
+        self.contact.iter().any(|c| *c != 0)
+    }
+
     /// Per node: the free axes (bit c for axis c), 0 for nodes without stiffness.
     fn free_mask(&self) -> Vec<u8> {
         let active = self.active_nodes();
@@ -208,6 +238,13 @@ impl Problem {
     /// taken in order; one is solved when its load (on free DOFs) is not within 1e-6 of the span of
     /// the cases solved before it.
     fn load_basis(&self) -> LoadBasis {
+        // with contact each case has its own supports: no case is a combination of others
+        if self.has_contact() {
+            return LoadBasis {
+                solved: (0..self.loads.len()).collect(),
+                cases: (0..self.loads.len()).map(CaseSolve::Solved).collect(),
+            };
+        }
         let free = self.free_mask();
         let g: Vec<Vec<f64>> = self
             .loads
@@ -676,6 +713,196 @@ fn pin(p: &mut Problem, mirror: [bool; 3]) -> Result<()> {
     Ok(())
 }
 
+/// `pin`, with the contact ground counted as holding (each case keeps part of it touching down).
+/// The pins are added to `fixed`; the ground's own axes stay in `contact`.
+fn pin_with_contact(p: &mut Problem, mirror: [bool; 3]) -> Result<()> {
+    if p.contact.is_empty() {
+        return pin(p, mirror);
+    }
+    let base = p.fixed.clone();
+    for (f, c) in p.fixed.iter_mut().zip(&p.contact) {
+        *f |= c;
+    }
+    pin(p, mirror)?;
+    for i in 0..p.fixed.len() {
+        // a pin never needs a ground axis (the ground already held it)
+        p.fixed[i] = base[i] | (p.fixed[i] & !p.contact[i]);
+        p.contact[i] &= !p.fixed[i];
+    }
+    Ok(())
+}
+
+/// With only a contact ground holding the part, each load case must press each body of the
+/// domain (its connected pieces: a stand may be separate legs) down inside its footprint: the
+/// vertical reactions balance the load's tipping moment, so the point they act through (the centre
+/// of pressure) must lie inside the convex hull of the body's ground nodes. Otherwise the body
+/// tips over whatever the design (or, for a net upward load, lifts off).
+fn check_tipping(p: &Problem) -> Result<()> {
+    let ground: Vec<usize> = (0..p.contact.len()).filter(|&i| p.contact[i] & 4 != 0).collect();
+    let Some(&first) = ground.first() else {
+        return Ok(());
+    };
+    let z0 = p.node_pos(first)[2];
+    let body = node_bodies(p);
+    let nbodies = body.iter().filter_map(|b| *b).max().map_or(0, |b| b + 1);
+    let hulls: Vec<Vec<[f64; 2]>> = (0..nbodies)
+        .map(|b| {
+            convex_hull(ground.iter().filter(|&&i| body[i] == Some(b)).map(|&i| {
+                let q = p.node_pos(i);
+                [q[0], q[1]]
+            }))
+        })
+        .collect();
+    let which = |b: usize| {
+        if nbodies == 1 {
+            "the part".to_string()
+        } else {
+            let lo = hulls[b]
+                .iter()
+                .fold([f64::MAX; 2], |a, q| [a[0].min(q[0]), a[1].min(q[1])]);
+            let hi = hulls[b]
+                .iter()
+                .fold([f64::MIN; 2], |a, q| [a[0].max(q[0]), a[1].max(q[1])]);
+            format!(
+                "the piece of the domain standing on ({:.0}..{:.0}, {:.0}..{:.0} mm) (the domain is {nbodies} \
+                 separate pieces, each must stand on its own)",
+                lo[0], hi[0], lo[1], hi[1]
+            )
+        }
+    };
+    for (c, l) in p.cases.iter().zip(&p.loads) {
+        let mut f = vec![[0.0; 3]; nbodies];
+        let mut m = vec![[0.0; 2]; nbodies];
+        for (i, v) in l.iter().enumerate() {
+            let Some(b) = body[i].filter(|_| *v != [0.0; 3]) else {
+                continue;
+            };
+            let q = p.node_pos(i);
+            let r = [q[0], q[1], q[2] - z0];
+            for k in 0..3 {
+                f[b][k] += v[k];
+            }
+            m[b][0] += r[1] * v[2] - r[2] * v[1];
+            m[b][1] += r[2] * v[0] - r[0] * v[2];
+        }
+        for b in 0..nbodies {
+            let fb = f[b];
+            let fnorm = (fb[0] * fb[0] + fb[1] * fb[1] + fb[2] * fb[2]).sqrt();
+            if fnorm == 0.0 {
+                continue;
+            }
+            let rz = -fb[2];
+            if rz <= 1e-9 * fnorm || hulls[b].is_empty() {
+                bail!(
+                    "load case {c} pulls {} up off the ground (the ground only pushes): point it down, add a \
+                     fixed support, or use --ground glued",
+                    which(b)
+                );
+            }
+            // the reactions' moment about the origin on the ground plane cancels the load's
+            let cop = [m[b][1] / rz, -m[b][0] / rz];
+            if !inside_hull(&hulls[b], cop, 0.5 * p.h) {
+                bail!(
+                    "load case {c} tips over {}: its load presses on the ground at ({:.1}, {:.1}) mm, outside \
+                     the footprint. Push less sideways (a smaller rocking share), widen the base, join the \
+                     pieces, add a fixed support, or use --ground glued",
+                    which(b),
+                    cop[0],
+                    cop[1],
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Per node: the connected piece of the domain it belongs to (elements sharing a node are
+/// connected), numbered from 0; `None` for nodes of no domain element.
+fn node_bodies(p: &Problem) -> Vec<Option<usize>> {
+    let nn: usize = p.nodes().iter().product();
+    let mut parent: Vec<usize> = (0..nn).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let [ex, ey, ez] = p.n;
+    for k in 0..ez {
+        for j in 0..ey {
+            for i in 0..ex {
+                if !p.domain[(k * ey + j) * ex + i] {
+                    continue;
+                }
+                let a = root(&mut parent, p.node(i, j, k));
+                for b in 1..8 {
+                    let r = root(&mut parent, p.node(i + (b & 1), j + (b >> 1 & 1), k + (b >> 2 & 1)));
+                    parent[r] = a;
+                }
+            }
+        }
+    }
+    let active = p.active_nodes();
+    let mut id = vec![usize::MAX; nn];
+    let mut next = 0;
+    (0..nn)
+        .map(|i| {
+            if !active[i] {
+                return None;
+            }
+            let r = root(&mut parent, i);
+            if id[r] == usize::MAX {
+                id[r] = next;
+                next += 1;
+            }
+            Some(id[r])
+        })
+        .collect()
+}
+
+/// Convex hull of 2D points, counter-clockwise (monotone chain).
+fn convex_hull(pts: impl Iterator<Item = [f64; 2]>) -> Vec<[f64; 2]> {
+    let mut v: Vec<[f64; 2]> = pts.collect();
+    v.sort_by(|a, b| a[0].total_cmp(&b[0]).then(a[1].total_cmp(&b[1])));
+    v.dedup();
+    if v.len() < 3 {
+        return v;
+    }
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    let mut h: Vec<[f64; 2]> = vec![];
+    for pass in 0..2 {
+        let start = h.len();
+        let it: Box<dyn Iterator<Item = &[f64; 2]>> = if pass == 0 {
+            Box::new(v.iter())
+        } else {
+            Box::new(v.iter().rev())
+        };
+        for &q in it {
+            while h.len() >= start + 2 && cross(h[h.len() - 2], h[h.len() - 1], q) <= 0.0 {
+                h.pop();
+            }
+            h.push(q);
+        }
+        h.pop();
+    }
+    h
+}
+
+/// Whether `q` lies inside the counter-clockwise hull `h`, at least `margin` from its edges (a
+/// degenerate hull, a line or a point, contains nothing).
+fn inside_hull(h: &[[f64; 2]], q: [f64; 2], margin: f64) -> bool {
+    if h.len() < 3 {
+        return false;
+    }
+    (0..h.len()).all(|k| {
+        let (a, b) = (h[k], h[(k + 1) % h.len()]);
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        (dx * (q[1] - a[1]) - dy * (q[0] - a[0])) / len >= margin
+    })
+}
+
 /// Sample the shape's domain and boundary-condition fields on the element grid (with
 /// `Settings::plane2d`: then projected into a 2D slab, see `plane2d.rs`).
 pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
@@ -798,6 +1025,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         fixed: vec![],
         loads: vec![],
         cases: vec![],
+        contact: vec![],
         extrude: None,
     };
     let active = p.active_nodes();
@@ -821,14 +1049,30 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     }
     if s.ground != Ground::None {
         let n = ground_nodes(&p, &active);
-        let axes = if s.ground == Ground::Grip { 7 } else { 4 };
-        for &i in &n {
-            p.fixed[i] |= axes;
+        let axes = s.ground.axes();
+        if s.ground.contact() {
+            p.contact = vec![0; active.len()];
+            for &i in &n {
+                p.contact[i] = axes & !p.fixed[i];
+            }
+        } else {
+            for &i in &n {
+                p.fixed[i] |= axes;
+            }
         }
-        println!("ground ({}): {} nodes on the bottom layer", s.ground.name(), n.len());
+        println!(
+            "ground ({}): {} nodes on the bottom layer{}",
+            s.ground.name(),
+            n.len(),
+            if s.ground.contact() {
+                ", pushing only (they lift off where the part pulls)"
+            } else {
+                ""
+            }
+        );
     }
     if s.plane2d.is_none() {
-        pin(&mut p, mirror)?;
+        pin_with_contact(&mut p, mirror)?;
     }
     // each load is spread over its own nodes so its magnitudes sum to its force
     let nn = active.len();
@@ -891,12 +1135,15 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     }
     p.cases = cases.keys().copied().collect();
     p.loads = cases.into_values().collect();
+    if supports.is_empty() && s.ground.contact() {
+        check_tipping(&p)?;
+    }
     let mut nload = loaded.iter().filter(|b| **b).count();
     if let Some(a) = s.plane2d {
         p = plane2d::project(&p, a, lo[a] as f64);
         let mut m = mirror;
         m[a] = false;
-        pin(&mut p, m)?;
+        pin_with_contact(&mut p, m)?;
         let layers = p.extrude.as_ref().map_or(1, |x| x.layers);
         println!(
             "2D: projected along {}, a slab standing for {} mm ({layers} elements) of thickness",
@@ -918,7 +1165,9 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
     }
     // (in 2D, not counting the slab's out-of-plane hold)
     let held = 7 & !s.plane2d.map_or(0, |a| 1u8 << a);
-    let nfixed = p.fixed.iter().filter(|b| **b & held != 0).count();
+    let nfixed = (0..p.fixed.len())
+        .filter(|&i| (p.fixed[i] | p.contact.get(i).copied().unwrap_or(0)) & held != 0)
+        .count();
     let n = p.n;
     let ndomain = p.domain.iter().filter(|b| **b).count();
     let npassive = p.passive.iter().filter(|b| **b).count();
@@ -1013,40 +1262,73 @@ impl Fem<'_> {
 
     /// y = K u, gathered per node (each node sums the rows of its up to 8 elements).
     fn matvec(&self, u: &[f64], y: &mut [f64]) {
-        let [nx, ny, _] = self.p.nodes();
-        let [ex, ey, ez] = self.p.n;
         y.par_chunks_mut(3).enumerate().for_each(|(n, yn)| {
-            yn.fill(0.0);
             let free = self.free[n];
             if free == 0 {
+                yn.fill(0.0);
                 return;
             }
-            let (i, j, k) = (n % nx, (n / nx) % ny, n / (nx * ny));
-            for a in 0..8 {
-                let (di, dj, dk) = (a & 1, a >> 1 & 1, a >> 2 & 1);
-                if i < di || j < dj || k < dk || i - di >= ex || j - dj >= ey || k - dk >= ez {
-                    continue;
-                }
-                let e = ((k - dk) * ey + (j - dj)) * ex + (i - di);
-                let ee = self.ee[e];
-                if ee == 0.0 {
-                    continue;
-                }
-                let nodes = self.element_nodes(e);
-                for (b, &m) in nodes.iter().enumerate() {
-                    let um = &u[3 * m..3 * m + 3];
-                    for c in 0..3 {
-                        let row = &self.ke[3 * a + c][3 * b..3 * b + 3];
-                        yn[c] += ee * (row[0] * um[0] + row[1] * um[1] + row[2] * um[2]);
-                    }
-                }
-            }
+            let f = self.node_force(n, u);
             for (c, y) in yn.iter_mut().enumerate() {
-                if free >> c & 1 == 0 {
-                    *y = 0.0;
-                }
+                *y = if free >> c & 1 == 0 { 0.0 } else { f[c] };
             }
         });
+    }
+
+    /// (K u) at node `n`, on all three axes whatever is held there (on a held axis, the reaction
+    /// plus the load).
+    fn node_force(&self, n: usize, u: &[f64]) -> [f64; 3] {
+        let [nx, ny, _] = self.p.nodes();
+        let [ex, ey, ez] = self.p.n;
+        let mut yn = [0.0; 3];
+        let (i, j, k) = (n % nx, (n / nx) % ny, n / (nx * ny));
+        for a in 0..8 {
+            let (di, dj, dk) = (a & 1, a >> 1 & 1, a >> 2 & 1);
+            if i < di || j < dj || k < dk || i - di >= ex || j - dj >= ey || k - dk >= ez {
+                continue;
+            }
+            let e = ((k - dk) * ey + (j - dj)) * ex + (i - di);
+            let ee = self.ee[e];
+            if ee == 0.0 {
+                continue;
+            }
+            let nodes = self.element_nodes(e);
+            for (b, &m) in nodes.iter().enumerate() {
+                let um = &u[3 * m..3 * m + 3];
+                for c in 0..3 {
+                    let row = &self.ke[3 * a + c][3 * b..3 * b + 3];
+                    yn[c] += ee * (row[0] * um[0] + row[1] * um[1] + row[2] * um[2]);
+                }
+            }
+        }
+        yn
+    }
+
+    /// A preconditioner for this system (`it` and `g`: print the hierarchy on the first one).
+    fn precond(&self, solver: &Solver, announce: bool) -> Box<Precond<'_>> {
+        match solver {
+            Solver::Multigrid(ms) => {
+                let mut m = mg::Multigrid::new(self, ms);
+                if announce {
+                    let c = m.coarsest();
+                    println!(
+                        "multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
+                        m.levels(),
+                        c[0],
+                        c[1],
+                        c[2],
+                        ms.smoother
+                    );
+                }
+                Box::new(move |r: &[f64], z: &mut [f64]| m.precondition(r, z))
+            }
+            _ => {
+                let inv = self.inv_diag();
+                Box::new(move |r: &[f64], z: &mut [f64]| {
+                    z.par_iter_mut().zip(r).zip(&inv).for_each(|((z, r), d)| *z = r * d)
+                })
+            }
+        }
     }
 
     fn inv_diag(&self) -> Vec<f64> {
@@ -1275,6 +1557,69 @@ impl Projection {
     }
 }
 
+/// What `solve_contact` did.
+struct ContactSolve {
+    /// CG iterations, over all rounds
+    cg: usize,
+    rounds: usize,
+    /// the touching nodes settled (else `contact::MAX_ROUNDS` ran out)
+    settled: bool,
+    /// time building preconditioners (s)
+    setup: f64,
+}
+
+/// Solve case `c` on a contact ground: with its touching nodes held, then again with the set
+/// updated (`Contact::update`), until it settles. `fem`: the system with `base` free (the problem's
+/// own supports); `u` is the start and the result.
+#[allow(clippy::too_many_arguments)]
+fn solve_contact(
+    fem: &Fem,
+    base: &[u8],
+    ct: &mut contact::Contact,
+    c: usize,
+    f: &[f64],
+    u: &mut [f64],
+    solver: &Solver,
+    tol: f64,
+    announce: bool,
+) -> ContactSolve {
+    let mut r = ContactSolve {
+        cg: 0,
+        rounds: 0,
+        settled: false,
+        setup: 0.0,
+    };
+    for round in 1..=contact::MAX_ROUNDS {
+        let t0 = Instant::now();
+        let fc = Fem {
+            free: ct.free(base, c),
+            ee: fem.ee.clone(),
+            ..*fem
+        };
+        let mut precond = fc.precond(solver, announce && round == 1);
+        r.setup += t0.elapsed().as_secs_f64();
+        let n = fc.solve(f, u, tol, CG_MAXIT, &mut *precond);
+        if n >= CG_MAXIT {
+            println!("warning: CG did not converge in {CG_MAXIT} iterations");
+        }
+        r.cg += n;
+        r.rounds += 1;
+        let rz: Vec<f64> = ct
+            .nodes
+            .par_iter()
+            .map(|&i| fc.node_force(i, u)[2] - f[3 * i + 2])
+            .collect();
+        let uz: Vec<f64> = ct.nodes.iter().map(|&i| u[3 * i + 2]).collect();
+        let umax = u.par_iter().map(|v| v.abs()).reduce(|| 0.0, f64::max);
+        let ch = ct.update(c, &rz, &uz, umax);
+        if !ch.any() {
+            r.settled = true;
+            break;
+        }
+    }
+    r
+}
+
 /// Timings (s) and solver work of one optimizer iteration.
 #[derive(Clone, Debug, Default)]
 pub struct IterStats {
@@ -1293,6 +1638,12 @@ pub struct IterStats {
     /// CG tolerance used
     pub cg_tol: f64,
     pub compliance: f64,
+    /// contact ground: solves over all cases (each a round of the active set)
+    pub contact_rounds: usize,
+    /// contact ground: cases whose touching nodes hadn't settled after `contact::MAX_ROUNDS`
+    pub contact_unsettled: usize,
+    /// contact ground: per case, the nodes touching down
+    pub touching: Vec<usize>,
 }
 
 pub struct Outcome {
@@ -1402,6 +1753,13 @@ fn model(full: Problem, shape: &Shape, s: &Settings) -> Model {
         return Model::single(full);
     }
     match symmetry::reduce(&full, axes) {
+        Ok(m) if m.groups.len() > 1 && full.has_contact() => {
+            println!(
+                "symmetry not used: the load cases aren't symmetric, and with the ground only pushing \
+                 their mirror parts can't be solved apart; solving the whole part"
+            );
+            Model::single(full)
+        }
         Ok(m) => {
             if let Some(d) = m.describe() {
                 println!("{d}");
@@ -1586,6 +1944,21 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
         let Some(gpu) = gpu else {
             bail!("the GPU solver needs a GPU");
         };
+        if m.groups.iter().any(|g| g.has_contact()) {
+            // TODO: contact on the GPU; until then the ground holds both ways there
+            println!(
+                "note: the GPU solver doesn't let the ground's nodes lift off yet: it holds them (as --ground glued)"
+            );
+            let mut m = m.clone();
+            for g in &mut m.groups {
+                for (f, c) in g.fixed.iter_mut().zip(&g.contact) {
+                    *f |= c;
+                }
+                g.contact.clear();
+            }
+            let bases: Vec<LoadBasis> = m.groups.iter().map(|g| g.load_basis()).collect();
+            return gpu_opt::optimize_gpu(&m, &bases, s, ms, out, gpu, stage);
+        }
         return gpu_opt::optimize_gpu(m, &bases, s, ms, out, gpu, stage);
     }
     let ke = hex_ke(s.nu);
@@ -1596,6 +1969,8 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
     }
     // per group (one without symmetry): free DOFs, loads per case
     let frees: Vec<Vec<u8>> = m.groups.iter().map(|g| g.free_mask()).collect();
+    // per group: the contact ground's touching nodes per case (kept from iteration to iteration)
+    let mut contacts: Vec<Option<contact::Contact>> = m.groups.iter().map(contact::Contact::new).collect();
     let fs: Vec<Vec<Vec<f64>>> = m
         .groups
         .iter()
@@ -1717,37 +2092,44 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
                 free: frees[g].clone(),
             };
             let (basis, fs, us) = (&bases[g], &fs[g], &mut us[g]);
-            let mut precond: Box<Precond> = match &s.solver {
-                Solver::Multigrid(ms) => {
-                    let mut m = mg::Multigrid::new(&fem, ms);
-                    if it == 1 && g == 0 {
-                        let c = m.coarsest();
-                        println!(
-                            "multigrid: {} levels, coarsest {}x{}x{} elements, {:?}",
-                            m.levels(),
-                            c[0],
-                            c[1],
-                            c[2],
-                            ms.smoother
-                        );
-                    }
-                    Box::new(move |r: &[f64], z: &mut [f64]| m.precondition(r, z))
-                }
-                _ => {
-                    let inv = fem.inv_diag();
-                    Box::new(move |r: &[f64], z: &mut [f64]| {
-                        z.par_iter_mut().zip(r).zip(&inv).for_each(|((z, r), d)| *z = r * d)
-                    })
-                }
-            };
-            st.setup += t0.elapsed().as_secs_f64();
-            // each load case separately; the objective is their summed compliance
-            for &c in &basis.solved {
-                let n = fem.solve(&fs[c], &mut us[c], tol, CG_MAXIT, &mut *precond);
+            let announce = it == 1 && g == 0;
+            let cg_warn = |n: usize| {
                 if n >= CG_MAXIT {
                     println!("warning: CG did not converge in {CG_MAXIT} iterations");
                 }
-                st.cg.push(n);
+            };
+            match &mut contacts[g] {
+                None => {
+                    let mut precond = fem.precond(&s.solver, announce);
+                    st.setup += t0.elapsed().as_secs_f64();
+                    // each load case separately; the objective is their summed compliance
+                    for &c in &basis.solved {
+                        let n = fem.solve(&fs[c], &mut us[c], tol, CG_MAXIT, &mut *precond);
+                        cg_warn(n);
+                        st.cg.push(n);
+                    }
+                }
+                Some(ct) => {
+                    // each case with its own touching nodes, solved until they settle
+                    for &c in &basis.solved {
+                        let r = solve_contact(
+                            &fem,
+                            &frees[g],
+                            ct,
+                            c,
+                            &fs[c],
+                            &mut us[c],
+                            &s.solver,
+                            tol,
+                            announce && c == 0,
+                        );
+                        st.setup += r.setup;
+                        st.contact_rounds += r.rounds;
+                        st.contact_unsettled += !r.settled as usize;
+                        st.cg.push(r.cg);
+                    }
+                    st.touching = (0..basis.solved.len()).map(|c| ct.touching(c)).collect();
+                }
             }
             for (c, how) in basis.cases.iter().enumerate() {
                 if let CaseSolve::Combined(a) = how {
@@ -1982,8 +2364,20 @@ fn print_iteration(
     } else {
         String::new()
     };
+    // contact ground: the solves its active set took, and the touching nodes per case
+    let contact = if st.touching.is_empty() {
+        String::new()
+    } else {
+        let t: Vec<String> = st.touching.iter().map(|n| n.to_string()).collect();
+        let unsettled = if st.contact_unsettled > 0 {
+            format!(" ({} unsettled)", st.contact_unsettled)
+        } else {
+            String::new()
+        };
+        format!(", {} solves, touching {}{unsettled}", st.contact_rounds, t.join("/"))
+    };
     println!(
-        "it {it:3}: compliance {compliance:.4e} N·mm, max displacement {max_disp:.4} mm, change {change:.3}, grey {:.0}%{beta}, {} CG its, {:.1} s [setup {:.2} solve {:.2} update {:.2} io {:.2}]",
+        "it {it:3}: compliance {compliance:.4e} N·mm, max displacement {max_disp:.4} mm, change {change:.3}, grey {:.0}%{beta}, {} CG its{contact}, {:.1} s [setup {:.2} solve {:.2} update {:.2} io {:.2}]",
         grey * 100.0,
         st.cg.iter().sum::<usize>(),
         t0.elapsed().as_secs_f64(),
@@ -2074,6 +2468,7 @@ pub(super) mod tests {
             fixed: vec![0; n.map(|v| v + 1).iter().product()],
             loads: vec![],
             cases: vec![],
+            contact: vec![],
             extrude: None,
         }
     }
@@ -2315,6 +2710,7 @@ pub(super) mod tests {
             fixed,
             loads: vec![f.clone(), rocked(1.0), rocked(-1.0), g.clone(), clamped],
             cases: vec![1, 2, 3, 4, 5],
+            contact: vec![],
             extrude: None,
         };
         let b = p.load_basis();
@@ -2628,10 +3024,13 @@ pub(super) mod tests {
         assert!(close(sum(&p.loads[0]), [0.0, 0.0, -w]));
         assert!(close(sum(&p.loads[1]), [0.2 * w, 0.0, -w]), "{:?}", sum(&p.loads[1]));
         assert!(close(sum(&p.loads[4]), [0.0, -0.2 * w, -w]), "{:?}", sum(&p.loads[4]));
-        // the bottom layer rests on rollers; a few of its nodes are pinned sideways too
-        let bottom = p.node_pos(p.fixed.iter().position(|f| *f != 0).unwrap())[2];
+        // the bottom layer rests on the ground (contact in Z, nothing held in Z for good); a few
+        // of its nodes are pinned sideways too
+        let bottom = p.node_pos(p.contact.iter().position(|f| *f != 0).unwrap())[2];
+        let ground: Vec<usize> = (0..p.contact.len()).filter(|&i| p.contact[i] != 0).collect();
+        assert!(ground.iter().all(|&i| p.contact[i] == 4 && p.node_pos(i)[2] == bottom));
         let held: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i] != 0).collect();
-        assert!(held.iter().all(|&i| p.fixed[i] & 4 != 0 && p.node_pos(i)[2] == bottom));
+        assert!(held.iter().all(|&i| p.fixed[i] & 4 == 0 && p.contact[i] == 4));
         // three pins (X and Y at one, the other axis at another), each a patch of the nodes within
         // PIN_PATCH_MM (at least 1.5 elements: here 3 mm, so the pin and its 4 or 8 neighbours)
         let pinned: Vec<usize> = held.iter().copied().filter(|&i| p.fixed[i] & 3 != 0).collect();
@@ -2642,7 +3041,24 @@ pub(super) mod tests {
         };
         // every pinned node is in some pin's patch: next to another pinned node
         assert!(pinned.iter().all(|&i| pinned.iter().any(|&j| j != i && near(i, j))));
-        assert_eq!(rigid_rank(&p), 6);
+        // with the ground touching (each case keeps some of it), the part can't move
+        let mut q = p.clone();
+        for i in 0..q.fixed.len() {
+            q.fixed[i] |= q.contact[i];
+        }
+        assert_eq!(rigid_rank(&q), 6);
+        // glued: the bottom layer held for good, in all axes
+        let p = setup(
+            &shape,
+            &Settings {
+                ground: Ground::Glued,
+                ..s
+            },
+            &gpu,
+        )
+        .unwrap();
+        assert!(!p.has_contact());
+        assert_eq!(p.fixed.iter().filter(|f| **f == 7).count(), ground.len());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2668,6 +3084,7 @@ pub(super) mod tests {
             fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]],
             cases: vec![1],
+            contact: vec![],
             extrude: None,
         };
         let active = p.active_nodes();
@@ -2702,6 +3119,7 @@ pub(super) mod tests {
             fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]],
             cases: vec![1],
+            contact: vec![],
             extrude: None,
         };
         for j in 0..=n[1] {
@@ -2773,6 +3191,161 @@ pub(super) mod tests {
         assert!(its < 100, "{its} MGCG iterations");
     }
 
+    /// A block on a contact ground (slide or grip), loaded down and pushed sideways at the top
+    /// hard enough to lift its windward edge: (case 0) the weight alone keeps every node touching;
+    /// (case 1) the set settles with no touching node pulled down and no free node below the
+    /// ground, the windward edge lifted and the leeward one touching, and the reactions carry the
+    /// weight. With a glued ground (all nodes held) the same push pulls on the windward edge.
+    fn block_on_contact(grip: bool) {
+        let n = [12, 4, 6];
+        let ne: usize = n.iter().product();
+        let nn: usize = n.iter().map(|v| v + 1).product();
+        let mut p = Problem {
+            n,
+            h: 1.0,
+            origin: [0.0; 3],
+            domain: vec![true; ne],
+            passive: vec![false; ne],
+            fixed: vec![0; nn],
+            loads: vec![vec![[0.0; 3]; nn]; 2],
+            cases: vec![1, 2],
+            contact: vec![0; nn],
+            extrude: None,
+        };
+        for j in 0..=n[1] {
+            for i in 0..=n[0] {
+                let b = p.node(i, j, 0);
+                p.contact[b] = if grip { 7 } else { 4 };
+            }
+        }
+        pin_with_contact(&mut p, [false; 3]).unwrap();
+        let top: Vec<usize> = (0..=n[1])
+            .flat_map(|j| (0..=n[0]).map(move |i| (i, j)))
+            .map(|(i, j)| p.node(i, j, n[2]))
+            .collect();
+        let w = 10.0;
+        for &t in &top {
+            p.loads[0][t][2] = -w / top.len() as f64;
+            // sideways push of 0.75 w at the top: the centre of pressure moves 0.75 * 6 = 4.5 mm
+            // toward +X, to 1.5 mm of the leeward edge (inside the footprint, past its middle third)
+            p.loads[1][t] = [0.75 * w / top.len() as f64, 0.0, -w / top.len() as f64];
+        }
+        check_tipping(&p).unwrap();
+        let ke = hex_ke(0.3);
+        let fem = Fem {
+            p: &p,
+            ke: &ke,
+            ee: vec![1000.0; ne],
+            free: p.free_mask(),
+        };
+        let solver = Solver::Multigrid(mg::MgSettings::default());
+        let mut ct = contact::Contact::new(&p).unwrap();
+        for c in 0..2 {
+            let f: Vec<f64> = p.loads[c].iter().flatten().copied().collect();
+            let mut u = vec![0.0; f.len()];
+            let mut settled = false;
+            // the set settles within a few calls (each up to MAX_ROUNDS solves)
+            for _ in 0..4 {
+                let r = solve_contact(&fem, &fem.free, &mut ct, c, &f, &mut u, &solver, 1e-10, false);
+                if r.settled {
+                    settled = true;
+                    break;
+                }
+            }
+            assert!(settled, "case {c} didn't settle");
+            let fc = Fem {
+                free: ct.free(&fem.free, c),
+                ee: fem.ee.clone(),
+                ..fem
+            };
+            let mut total = 0.0;
+            let mut lifted_x = vec![];
+            for (k, &i) in ct.nodes.iter().enumerate() {
+                let rz = fc.node_force(i, &u)[2] - f[3 * i + 2];
+                if ct.touch[c][k] {
+                    assert!(rz > -1e-3 * w / ct.nodes.len() as f64, "case {c}: node {i} pulls {rz}");
+                    total += rz;
+                } else {
+                    assert!(u[3 * i + 2] > -1e-9, "case {c}: node {i} below the ground");
+                    lifted_x.push(p.node_pos(i)[0]);
+                }
+            }
+            assert!((total - w).abs() < 1e-6 * w, "case {c}: reactions {total} vs {w}");
+            if c == 0 {
+                assert!(lifted_x.is_empty(), "the weight alone lifts {lifted_x:?}");
+            } else {
+                // a rigid block would touch on 3 × 1.5 mm at the leeward edge
+                assert!(
+                    lifted_x.contains(&0.0) && lifted_x.iter().all(|&x| x < 9.0),
+                    "lifted {lifted_x:?}"
+                );
+                assert!(ct.touch[c][ct.nodes.iter().position(|&i| p.node_pos(i)[0] == 12.0).unwrap()]);
+            }
+        }
+        // glued: the windward edge pulls
+        let mut g = p.clone();
+        for i in 0..nn {
+            g.fixed[i] |= g.contact[i];
+        }
+        g.contact = vec![];
+        let fem = Fem {
+            p: &g,
+            ke: &ke,
+            ee: vec![1000.0; ne],
+            free: g.free_mask(),
+        };
+        let f: Vec<f64> = g.loads[1].iter().flatten().copied().collect();
+        let mut u = vec![0.0; f.len()];
+        let mut m = mg::Multigrid::new(&fem, &mg::MgSettings::default());
+        fem.solve(&f, &mut u, 1e-10, 500, &mut |r, z| m.precondition(r, z));
+        let edge = g.node(0, 2, 0);
+        assert!(fem.node_force(edge, &u)[2] < 0.0);
+    }
+
+    #[test]
+    fn block_on_sliding_contact() {
+        block_on_contact(false);
+    }
+
+    #[test]
+    fn block_on_gripping_contact() {
+        block_on_contact(true);
+    }
+
+    #[test]
+    fn tipping_and_lifting_cases_are_refused() {
+        let n = [4, 4, 4];
+        let nn: usize = n.iter().map(|v| v + 1).product();
+        let mut p = Problem {
+            n,
+            h: 1.0,
+            origin: [0.0; 3],
+            domain: vec![true; 64],
+            passive: vec![false; 64],
+            fixed: vec![0; nn],
+            loads: vec![vec![[0.0; 3]; nn]],
+            cases: vec![7],
+            contact: vec![0; nn],
+            extrude: None,
+        };
+        for j in 0..=4 {
+            for i in 0..=4 {
+                let b = p.node(i, j, 0);
+                p.contact[b] = 4;
+            }
+        }
+        let top = p.node(2, 2, 4);
+        p.loads[0][top] = [0.0, 0.0, -1.0];
+        check_tipping(&p).unwrap();
+        // pushed sideways as hard as it presses down, at twice the half width: tips
+        p.loads[0][top] = [1.0, 0.0, -1.0];
+        let e = check_tipping(&p).unwrap_err().to_string();
+        assert!(e.contains("case 7 tips"), "{e}");
+        p.loads[0][top] = [0.0, 0.0, 1.0];
+        let e = check_tipping(&p).unwrap_err().to_string();
+        assert!(e.contains("pulls the part up"), "{e}");
+    }
+
     /// reproduces uniaxial tension exactly, so the top moves F L / (E A).
     #[test]
     fn column_in_tension() {
@@ -2787,6 +3360,7 @@ pub(super) mod tests {
             fixed: vec![0; 2 * 2 * 5],
             loads: vec![vec![[0.0; 3]; 2 * 2 * 5]],
             cases: vec![1],
+            contact: vec![],
             extrude: None,
         };
         for j in 0..2 {

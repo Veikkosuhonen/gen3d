@@ -659,7 +659,8 @@ fn supports_and_loads_ui(ui: &mut egui::Ui, prims: &[Prim], ground: Ground, boun
             ui.label("ground");
             ui.label(match ground {
                 Ground::Slide => "the bottom rests on it, free to slide",
-                _ => "the bottom rests on it, gripped",
+                Ground::Grip => "the bottom rests on it, gripped",
+                _ => "the bottom is glued to it",
             });
             ui.end_row();
         }
@@ -1813,10 +1814,10 @@ impl App {
                     col,
                     egui::Stroke::new(1.5, egui::Color32::from_rgb(140, 170, 120)),
                 ));
-                let name = if self.opt.ground == Ground::Slide {
-                    "ground (slides)"
-                } else {
-                    "ground (grips)"
+                let name = match self.opt.ground {
+                    Ground::Slide => "ground (slides)",
+                    Ground::Grip => "ground (grips)",
+                    _ => "ground (glued)",
                 };
                 painter.text(pts[0], egui::Align2::LEFT_TOP, name, font.clone(), text);
             }
@@ -3538,8 +3539,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Stands on the ground").on_hover_text(
                 "the bottom of the shape rests on a table or floor. The optimizer picks where the part \
-                 touches down. Note: the ground can still pull on the part (a linear model can't let it \
-                 lift off), so check the result for feet that would hang in tension",
+                 touches down. The ground only pushes: where a load case would pull the part down, it \
+                 lifts off there (unless glued)",
             );
             let running = self.opt_job.running();
             ui.add_enabled_ui(!running, |ui| {
@@ -3550,7 +3551,9 @@ impl App {
                      can't use the ground to tie its feet together",
                 );
                 ui.selectable_value(g, Ground::Grip, "grips")
-                    .on_hover_text("held in all directions: a grippy surface, or glued down");
+                    .on_hover_text("held in all directions where it touches down: a grippy surface");
+                ui.selectable_value(g, Ground::Glued, "glued")
+                    .on_hover_text("held in all directions, and the ground can pull: glued, screwed or bolted down");
             });
         });
         ui.add_enabled_ui(!self.opt_job.running(), |ui| {

@@ -37,6 +37,12 @@ Two physics points drive it:
 - **Lift-off (unilateral ground)**: release ground nodes whose reaction pulls on the part, re-solve,
   repeat (an active set per load case, every few optimizer iterations). Without it a stand can still
   hang from the ground.
+  - [x] CPU (2026-11-18): `contact.rs`, `solve_contact`; `slide` and `grip` are contact, `glued` is
+    the old bilateral ground; tipping check per domain piece.
+  - [ ] GPU: per-case masks, the reactions on the GPU, the same rounds (it holds the ground both
+    ways meanwhile).
+  - [ ] Symmetry with contact: solve one case of each mirror pair and mirror its solution (now
+    asymmetric cases are solved on the whole part).
 - **GPU coarse levels with per-axis masks**, to get roller problems back to ~12 CG iterations.
 - **Persist the ground** with the design (the sidecar, or a `//! ground` directive); it is an
   Optimize setting for now, like the material share.

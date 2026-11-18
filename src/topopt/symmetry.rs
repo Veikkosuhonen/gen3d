@@ -43,6 +43,7 @@ pub(crate) struct Sym {
 /// problem itself). All groups share the grid, domain and kept regions; they differ in their
 /// supports and loads. Every group has a load vector for every case (zero where a case has no
 /// part in that pattern).
+#[derive(Clone)]
 pub(crate) struct Model {
     pub groups: Vec<Problem>,
     pub sym: Option<Sym>,
@@ -230,7 +231,8 @@ pub(crate) fn reduce(full: &Problem, axes: [bool; 3]) -> Result<Model, String> {
             for j in 0..ny {
                 for i in 0..nx {
                     let [mi, mj, mk] = flip([i, j, k], n[a] + 1);
-                    if full.fixed[nd(i, j, k)] != full.fixed[nd(mi, mj, mk)] {
+                    let (q, r) = (nd(i, j, k), nd(mi, mj, mk));
+                    if full.fixed[q] != full.fixed[r] || full.contact.get(q) != full.contact.get(r) {
                         return Err(format!("the supports aren't symmetric about the {name} plane"));
                     }
                 }
@@ -268,6 +270,7 @@ pub(crate) fn reduce(full: &Problem, axes: [bool; 3]) -> Result<Model, String> {
     let mut patterns = vec![];
     for &pat in &combos {
         let mut fixed = vec![0u8; rnn];
+        let mut contact = vec![0u8; if full.contact.is_empty() { 0 } else { rnn }];
         let mut loads = vec![vec![[0.0f64; 3]; rnn]; full.loads.len()];
         let mut any = false;
         for kk in 0..rz {
@@ -276,6 +279,9 @@ pub(crate) fn reduce(full: &Problem, axes: [bool; 3]) -> Result<Model, String> {
                     let r = [ii, jj, kk];
                     let ri = (kk * ry + jj) * rx + ii;
                     let mut f = full.fixed[image(r, 0)];
+                    if let Some(c) = contact.get_mut(ri) {
+                        *c = full.contact[image(r, 0)];
+                    }
                     let mut w = 1.0;
                     for a in (0..3).filter(|&a| axes[a] && r[a] == 0) {
                         // on the plane: a symmetric part can't cross it, an antisymmetric one
@@ -313,6 +319,7 @@ pub(crate) fn reduce(full: &Problem, axes: [bool; 3]) -> Result<Model, String> {
                 domain: domain.clone(),
                 passive: passive.clone(),
                 fixed,
+                contact: contact.clone(),
                 loads,
                 cases: full.cases.clone(),
                 extrude: full.extrude.clone(),

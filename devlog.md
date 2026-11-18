@@ -3,6 +3,63 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-18: The ground only pushes (contact, CPU)
+
+**Why:** `--ground slide|grip` held the bottom layer's nodes as ordinary supports, so the ground
+could pull. Measured on `table stand` (8 mm, CPU, 100 N with rock 0.7), the ground reactions'
+pull grew with the design: 56 N in the rocked ±X cases at iteration 1, 139 N at iteration 10 (more
+than the weight), 131 N at 30. The optimizer was tying the windward feet to the table.
+
+**What:**
+- `Problem.contact`: per node, the axes a contact ground holds while the node touches down. The
+  ground goes there instead of into `fixed` for `slide` (Z) and `grip` (XYZ). The new `glued`
+  is the old behaviour (held for good, both ways). The pins against sliding are still chosen as if
+  the ground held (`pin_with_contact`) and stay in `fixed`.
+- `contact.rs`: a primal-dual active set per load case. All nodes start touching. After each
+  solve, touching nodes whose vertical reaction (K u - f) pulls (below -1e-3 × the mean reaction)
+  lift off, and lifted nodes below the ground (u_z < -1e-6 × max |u|) touch again. Repeat until the
+  set settles, at most 8 solves per case and iteration. The sets carry over between iterations.
+  With the set settled the sensitivities are the usual ones (the reactions do no work).
+- CPU loop: `solve_contact` builds each round's preconditioner with that case's mask.
+  `load_basis` solves every case when there is contact (contact isn't linear). `model()` keeps a
+  mirror reduction only if it has a single (all-symmetric) load pattern. `Fem::node_force` is the
+  per-node row of `matvec`, used for the reactions.
+- `check_tipping` in `setup`, when the ground alone holds the part: per load case and per
+  connected piece of the domain, the centre of pressure must be inside the convex hull of that
+  piece's ground nodes (half an element of margin), and the load must press down.
+- The iteration line adds `N solves, touching a/b/c/...`. The app gets a *glued* choice, and its
+  hover text no longer warns that the ground can pull.
+- GPU: not yet. It holds the contact nodes both ways (as `glued`) and prints a note.
+
+**Result:**
+- `table stand` as saved (rock 0.7) is refused. Its domain is two separate leg blocks (the
+  board is only a load region), and with 50 N and a 35 N push at 214 mm on each leg, the centre of
+  pressure falls 137 mm from the leg's centre, outside its 200 mm foot: `load case 1001 tips over
+  the piece of the domain standing on (-408..-208, ...)`. Before this the ground's pull held each
+  leg up. Without the check, the active set peeled each foot down to a line (a mechanism, 1e9 mm
+  displacements).
+- The same shape with rock 0.3 (8 mm, CPU mg, `--no-symmetry --no-coarse-start`, 60 iterations):
+  slide 102 s, compliance 0.699. Glued 44 s, compliance 0.299. Glued is stiffer because the ground
+  pulls, and it solves 3 cases where slide solves 5. Solves per iteration: 27 at iteration 1, 10 at
+  20, 7 at 40. Touching nodes at 40: 2008 upright, 1276 rocked ±X, 1082 ±Y (of 2340).
+- `iphone_stand` (slide, CPU): 10-16 solves per iteration over 5 cases in the first 15
+  iterations, 0.4-0.9 s each.
+
+**Verified:** new tests `block_on_sliding_contact` and `block_on_gripping_contact`. A 12×4×6 block
+pushed sideways enough to lift its windward edge settles with no touching node pulling, no lifted
+node below the ground, the reactions equal to the weight, and a leeward contact strip like a rigid
+block's (3 × 1.5 mm). Glued, the windward edge pulls. `tipping_and_lifting_cases_are_refused`.
+`ground_weight_and_rocking` now checks the contact mask, and that glued holds the whole bottom.
+Full suite, the ignored GPU test, clippy.
+
+**Still open:**
+- The GPU path (the main target): per-case masks and hierarchies, the reactions on the GPU, the
+  same rounds.
+- Symmetry with contact: solve one case of each mirror pair and mirror the solution.
+- Nodes under void flip in and out with near-zero reactions and cost extra solves. A settle
+  tolerance (a few changes count as settled) may cut rounds.
+- Friction for `grip` is unlimited (no friction cone).
+
 ## 2026-11-17: Keep a mirrored design symmetric past the coarse start
 
 **Why:** `iphone_stand` (mirror in X, 0.6 mm, slide ground) lost its symmetry at iteration 36, the

@@ -340,9 +340,11 @@ enum Cmd {
         /// total load in N, spread over the field_load region
         #[arg(long, default_value_t = 100.0)]
         force: f64,
-        /// the part stands on the ground: the bottom of the domain is supported, held vertically
-        /// only (slide; a few small patches, 4 mm in radius, are also held sideways so it can't
-        /// slide or spin away) or in all directions (grip)
+        /// the part stands on the ground: the bottom of the domain is supported. slide: pushed up
+        /// only, free to slide (a few small patches, 4 mm in radius, are held sideways so it can't
+        /// slide or spin away); grip: held in all directions where it touches down. Both only push:
+        /// where the part would pull on the ground it lifts off (solved per load case). glued: held
+        /// in all directions everywhere, and the ground can pull
         #[arg(long, value_enum, default_value_t = topopt::Ground::None)]
         ground: topopt::Ground,
         /// Young's modulus in MPa (PLA ~3500)

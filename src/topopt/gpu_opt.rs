@@ -749,6 +749,7 @@ mod tests {
             fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]; 3],
             cases: vec![1, 2, 3],
+            contact: vec![],
             extrude: None,
         };
         let [nx, ny, nz] = n.map(|v| v + 1);
@@ -797,6 +798,7 @@ mod tests {
             fixed: vec![0; nn],
             loads: vec![vec![[0.0; 3]; nn]],
             cases: vec![1],
+            contact: vec![],
             extrude: None,
         };
         for k in 0..=n[2] {

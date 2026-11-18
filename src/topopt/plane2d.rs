@@ -78,6 +78,7 @@ pub(crate) fn project(p: &Problem, axis: usize, origin_axis: f64) -> Problem {
     let (pn, spn) = (n.map(|v| v + 1), sn.map(|v| v + 1));
     let nsn: usize = spn.iter().product();
     let mut fixed = vec![0u8; nsn];
+    let mut contact = vec![0u8; if p.contact.is_empty() { 0 } else { nsn }];
     let mut loads = vec![vec![[0.0; 3]; nsn]; p.loads.len()];
     let w = 0.5 / layers as f64;
     for i in 0..p.fixed.len() {
@@ -86,6 +87,9 @@ pub(crate) fn project(p: &Problem, axis: usize, origin_axis: f64) -> Problem {
             ijk[axis] = l;
             let s = cell(ijk, spn);
             fixed[s] |= p.fixed[i];
+            if let Some(&c) = p.contact.get(i) {
+                contact[s] |= c & !(1 << axis);
+            }
             for (c, load) in p.loads.iter().enumerate() {
                 for comp in (0..3).filter(|&comp| comp != axis) {
                     loads[c][s][comp] += w * load[i][comp];
@@ -122,6 +126,7 @@ pub(crate) fn project(p: &Problem, axis: usize, origin_axis: f64) -> Problem {
         domain,
         passive,
         fixed,
+        contact,
         loads,
         cases: p.cases.clone(),
         extrude: Some(std::sync::Arc::new(Extrude {

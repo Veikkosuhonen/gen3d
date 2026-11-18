@@ -97,6 +97,7 @@ fn hash_problem(h: &mut u64, p: &Problem) {
         eat(&[d as u8 | (k as u8) << 1]);
     }
     eat(&p.fixed);
+    eat(&p.contact);
     for case in &p.loads {
         for v in case.iter().flatten() {
             eat(&v.to_le_bytes());
