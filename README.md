@@ -486,7 +486,8 @@ primitive's force is spread over its own nodes. A script's `field_load` is load 
 **Ground** (`--ground`, *Stands on the ground* in the app): the bottom layer of the design domain
 rests on a table or floor, and the optimizer picks where the part touches down.
 - `slide`: the ground pushes up only and the part is free to slide and spread sideways. A few small
-  patches (4 mm radius) are pinned sideways so it can't slide or spin away.
+  patches (4 mm radius) are pinned sideways so it can't slide or spin away. With a coarse start
+  the fine grid keeps the coarse grid's pins (the design grows its feet over them).
 - `grip`: where the part touches down it is held in all directions (no slip).
 - `glued`: held in all directions everywhere, and the ground can pull (glued, screwed or bolted).
 

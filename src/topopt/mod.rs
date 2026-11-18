@@ -663,9 +663,40 @@ pub const PIN_PATCH_MM: f64 = 4.0;
 /// sliding. That mode was then so soft (300 mm displacements under 100 N on a 0.9 m stand) that
 /// the GPU solver's f32 multigrid stalled on it at some element sizes, and the optimizer saw a
 /// point load at each pin.
-fn pin(p: &mut Problem, mirror: [bool; 3]) -> Result<()> {
+///
+/// `at`: pins of the same problem on another grid (`Pinning::pins`, mirror images included), held
+/// instead of this grid's own choice at the supported nodes nearest them, as long as they hold the
+/// part. Returns the pins held.
+fn pin(p: &mut Problem, mirror: [bool; 3], at: &[Pin]) -> Result<Vec<Pin>> {
     let pts = p.nodes();
     let mut pins = stabilize(p);
+    let held: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i] != 0).collect();
+    if !pins.is_empty() && !at.is_empty() {
+        let before = p.fixed.clone();
+        let dist2 = |i: usize, q: [f64; 3]| {
+            let o = p.node_pos(i);
+            (0..3).map(|c| (o[c] - q[c]).powi(2)).sum::<f64>()
+        };
+        // among the nodes inside a footprint, as `stabilize` picks (the grids' footprints can differ:
+        // a foot 0.8 mm below the rest is the whole bottom layer on one grid, alone on another)
+        let best = held.iter().map(|&i| node_elements(p, i)).max().unwrap_or(0);
+        let inner: Vec<usize> = held.iter().copied().filter(|&i| node_elements(p, i) == best).collect();
+        let near: Vec<(usize, u8)> = at
+            .iter()
+            .map(|&(q, axes)| {
+                let i = *inner
+                    .iter()
+                    .min_by(|&&a, &&b| dist2(a, q).total_cmp(&dist2(b, q)))
+                    .unwrap();
+                (i, axes)
+            })
+            .collect();
+        let out = hold_pins(p, &held, &near, "as on the coarse grid");
+        if rigid_rank(p) == 6 {
+            return Ok(out);
+        }
+        p.fixed = before;
+    }
     // with mirror planes, the pins' mirror images too (so the supports stay symmetric)
     for (a, _) in mirror.iter().enumerate().filter(|(_, m)| **m) {
         for k in 0..pins.len() {
@@ -678,9 +709,21 @@ fn pin(p: &mut Problem, mirror: [bool; 3]) -> Result<()> {
             }
         }
     }
+    let out = hold_pins(p, &held, &pins, "the supports alone let the part move");
+    if rigid_rank(p) < 6 {
+        bail!("the supports can't hold the part in place (all on one line?): add or widen a support");
+    }
+    Ok(out)
+}
+
+/// A pin: where it is and the axes it holds.
+type Pin = ([f64; 3], u8);
+
+/// Hold each of `pins` (node, axes) with the supported nodes (`held`) within the pin patch of it.
+fn hold_pins(p: &mut Problem, held: &[usize], pins: &[(usize, u8)], why: &str) -> Vec<Pin> {
     let r = PIN_PATCH_MM.max(1.5 * p.h);
-    let held: Vec<usize> = (0..p.fixed.len()).filter(|&i| p.fixed[i] != 0).collect();
-    for (i, axes) in pins {
+    let mut out = vec![];
+    for &(i, axes) in pins {
         let q = p.node_pos(i);
         let patch: Vec<usize> = held
             .iter()
@@ -699,37 +742,70 @@ fn pin(p: &mut Problem, mirror: [bool; 3]) -> Result<()> {
             .map(|c| ['X', 'Y', 'Z'][c])
             .collect();
         println!(
-            "pinned {} node{} around ({:.1}, {:.1}, {:.1}) in {names}: the supports alone let the part move",
+            "pinned {} node{} around ({:.1}, {:.1}, {:.1}) in {names}: {why}",
             patch.len().max(1),
             if patch.len() > 1 { "s" } else { "" },
             q[0],
             q[1],
             q[2]
         );
+        out.push((q, axes));
     }
-    if rigid_rank(p) < 6 {
-        bail!("the supports can't hold the part in place (all on one line?): add or widen a support");
-    }
-    Ok(())
+    out
 }
 
 /// `pin`, with the contact ground counted as holding (each case keeps part of it touching down).
 /// The pins are added to `fixed`; the ground's own axes stay in `contact`.
-fn pin_with_contact(p: &mut Problem, mirror: [bool; 3]) -> Result<()> {
+fn pin_with_contact(p: &mut Problem, mirror: [bool; 3], at: &[Pin]) -> Result<Pinning> {
+    let mut pg = Pinning {
+        fixed: p.fixed.clone(),
+        contact: p.contact.clone(),
+        mirror,
+        pins: vec![],
+    };
     if p.contact.is_empty() {
-        return pin(p, mirror);
+        pg.pins = pin(p, mirror, at)?;
+        return Ok(pg);
     }
-    let base = p.fixed.clone();
     for (f, c) in p.fixed.iter_mut().zip(&p.contact) {
         *f |= c;
     }
-    pin(p, mirror)?;
+    pg.pins = pin(p, mirror, at)?;
     for i in 0..p.fixed.len() {
         // a pin never needs a ground axis (the ground already held it)
-        p.fixed[i] = base[i] | (p.fixed[i] & !p.contact[i]);
+        p.fixed[i] = pg.fixed[i] | (p.fixed[i] & !p.contact[i]);
         p.contact[i] &= !p.fixed[i];
     }
-    Ok(())
+    Ok(pg)
+}
+
+/// How `setup` pinned a problem: its supports before the pins, and the pins.
+pub(crate) struct Pinning {
+    fixed: Vec<u8>,
+    contact: Vec<u8>,
+    mirror: [bool; 3],
+    pub(crate) pins: Vec<Pin>,
+}
+
+/// Pin `p` (pinned as `pg` says) where the pins `at` of the same problem on another grid are,
+/// when its own pins are elsewhere. A coarse start's design grows its feet over the coarse grid's
+/// pins (on a slide ground they hold it sideways); fine-grid pins elsewhere, under void, held the
+/// fine grid's solid part only through void elements, and its CG diverged (seen on a stand at
+/// 1 mm). Whether the pins changed.
+fn repin(p: &mut Problem, pg: &Pinning, at: &[Pin]) -> Result<bool> {
+    let same =
+        pg.pins.len() == at.len()
+            && pg.pins.iter().zip(at).all(|((a, x), (b, y))| {
+                x == y && (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>() <= 4.0 * p.h * p.h
+            });
+    if pg.pins.is_empty() || at.is_empty() || same {
+        return Ok(false);
+    }
+    println!("fine grid: moving the pins to where the coarse grid's are (its design rests on them)");
+    p.fixed = pg.fixed.clone();
+    p.contact = pg.contact.clone();
+    pin_with_contact(p, pg.mirror, at)?;
+    Ok(true)
 }
 
 /// With only a contact ground holding the part, each load case must press each body of the
@@ -906,6 +982,11 @@ fn inside_hull(h: &[[f64; 2]], q: [f64; 2], margin: f64) -> bool {
 /// Sample the shape's domain and boundary-condition fields on the element grid (with
 /// `Settings::plane2d`: then projected into a 2D slab, see `plane2d.rs`).
 pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
+    Ok(setup_pinned(shape, s, gpu)?.0)
+}
+
+/// `setup`, and how it pinned the problem (for `repin`).
+fn setup_pinned(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<(Problem, Pinning)> {
     let h = s.voxel;
     if h <= 0.0 {
         bail!("voxel size must be positive");
@@ -1071,8 +1152,9 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
             }
         );
     }
+    let mut pinning = None;
     if s.plane2d.is_none() {
-        pin_with_contact(&mut p, mirror)?;
+        pinning = Some(pin_with_contact(&mut p, mirror, &[])?);
     }
     // each load is spread over its own nodes so its magnitudes sum to its force
     let nn = active.len();
@@ -1143,7 +1225,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         p = plane2d::project(&p, a, lo[a] as f64);
         let mut m = mirror;
         m[a] = false;
-        pin_with_contact(&mut p, m)?;
+        pinning = Some(pin_with_contact(&mut p, m, &[])?);
         let layers = p.extrude.as_ref().map_or(1, |x| x.layers);
         println!(
             "2D: projected along {}, a slab standing for {} mm ({layers} elements) of thickness",
@@ -1181,7 +1263,7 @@ pub fn setup(shape: &Shape, s: &Settings, gpu: &Gpu) -> Result<Problem> {
         p.loads.len(),
         if p.loads.len() == 1 { "" } else { "s" }
     );
-    Ok(p)
+    Ok((p, pinning.expect("pinned in 3D or after projecting")))
 }
 
 /// Stiffness matrix of a unit-cube trilinear hex with E = 1 (2x2x2 Gauss). A cube of size h with
@@ -1796,10 +1878,30 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
         checkpoint::remove(out);
         None
     };
-    let fine = model(setup(shape, s, gpu)?, shape, s);
+    let (mut full, pinning) = setup_pinned(shape, s, gpu)?;
     // the whole part's elements (the coarse grid's resolution is what matters, not the model's size)
-    let ndomain = (fine.p().domain.iter().filter(|d| **d).count() as f64 * fine.copies()) as usize;
+    let ndomain = full.domain.iter().filter(|d| **d).count();
     let coarse_start = s.coarse_start && s.beta_max > 1.0 && ndomain / 8 >= COARSE_MIN_ELEMENTS;
+    let cs = Settings {
+        voxel: 2.0 * s.voxel,
+        beta_max: 1.0,
+        ..s.clone()
+    };
+    // the coarse grid before the fine model: the fine grid holds the coarse grid's pins (`repin`),
+    // also when resuming on the fine grid (so its supports are those it was written with)
+    let fine_resume = ck.as_ref().is_some_and(|c| !c.header.coarse);
+    let mut coarse = None;
+    if coarse_start && (!fine_resume || !pinning.pins.is_empty()) {
+        if fine_resume {
+            println!("the coarse grid, for its pins:");
+        } else {
+            println!("coarse start: the beta 1 stage at {:.3} mm", cs.voxel);
+        }
+        let (cp, cpin) = setup_pinned(shape, &cs, gpu)?;
+        repin(&mut full, &pinning, &cpin.pins)?;
+        coarse = Some(model(cp, shape, &cs));
+    }
+    let fine = model(full, shape, s);
     let resumed = |c: &checkpoint::Checkpoint, p: &Model, grid: &str| -> Result<Stage> {
         c.check(p)?;
         let h = &c.header;
@@ -1826,13 +1928,7 @@ pub fn run(shape: &Shape, s: &Settings, out: &Path, gpu: &Gpu, resume: bool) -> 
     let stage = match &ck {
         Some(c) if !c.header.coarse => resumed(c, &fine, "fine")?,
         _ if coarse_start => {
-            let cs = Settings {
-                voxel: 2.0 * s.voxel,
-                beta_max: 1.0,
-                ..s.clone()
-            };
-            println!("coarse start: the beta 1 stage at {:.3} mm", cs.voxel);
-            let coarse = model(setup(shape, &cs, gpu)?, shape, &cs);
+            let coarse = coarse.expect("set up above");
             let stage = match &ck {
                 Some(c) => resumed(c, &coarse, "coarse")?,
                 None => Stage {
@@ -3203,7 +3299,7 @@ pub(super) mod tests {
                 p.contact[b] = if grip { 7 } else { 4 };
             }
         }
-        pin_with_contact(&mut p, [false; 3]).unwrap();
+        pin_with_contact(&mut p, [false; 3], &[]).unwrap();
         let top: Vec<usize> = (0..=n[1])
             .flat_map(|j| (0..=n[0]).map(move |i| (i, j)))
             .map(|(i, j)| p.node(i, j, n[2]))
@@ -3285,6 +3381,58 @@ pub(super) mod tests {
         fem.solve(&f, &mut u, 1e-10, 500, &mut |r, z| m.precondition(r, z));
         let edge = g.node(0, 2, 0);
         assert!(fem.node_force(edge, &u)[2] < 0.0);
+    }
+
+    /// `repin` holds a slide ground's pins where another grid's are (at the nearest supported
+    /// nodes, with the same axes), keeps them when they already are there, and falls back to the
+    /// grid's own when the given ones don't hold the part.
+    #[test]
+    fn pins_follow_the_coarse_grid() {
+        let n = [20, 12, 4];
+        let ne: usize = n.iter().product();
+        let nn: usize = n.iter().map(|v| v + 1).product();
+        let mut p = Problem {
+            n,
+            h: 1.0,
+            origin: [0.0; 3],
+            domain: vec![true; ne],
+            passive: vec![false; ne],
+            fixed: vec![0; nn],
+            loads: vec![vec![[0.0; 3]; nn]],
+            cases: vec![1],
+            contact: vec![0; nn],
+            extrude: None,
+        };
+        for j in 0..=n[1] {
+            for i in 0..=n[0] {
+                let b = p.node(i, j, 0);
+                p.contact[b] = 4;
+            }
+        }
+        let pg = pin_with_contact(&mut p, [false; 3], &[]).unwrap();
+        assert!(!pg.pins.is_empty());
+        let held = |p: &Problem| -> Vec<usize> { (0..nn).filter(|&i| p.fixed[i] != 0).collect() };
+        let own = held(&p);
+        // the same pins: nothing changes
+        assert!(!repin(&mut p, &pg, &pg.pins).unwrap());
+        // elsewhere (off the nodes, a fraction of an element): the nearest nodes, same axes
+        let at: Vec<Pin> = vec![([3.2, 2.9, -0.3], 3), ([16.8, 2.1, 0.0], 3), ([10.0, 9.4, 0.0], 1)];
+        assert!(repin(&mut p, &pg, &at).unwrap());
+        for &(q, axes) in &at {
+            let i = p.node(q[0].round() as usize, q[1].round() as usize, 0);
+            assert_eq!(p.fixed[i], axes, "pin at {q:?}");
+            assert_eq!(p.contact[i], 4);
+        }
+        assert_ne!(held(&p), own);
+        // (with the ground holding Z)
+        let mut q = p.clone();
+        for (f, c) in q.fixed.iter_mut().zip(&q.contact) {
+            *f |= c;
+        }
+        assert_eq!(rigid_rank(&q), 6);
+        // pins that can't hold it (one, in X only): the grid's own
+        assert!(repin(&mut p, &pg, &[([10.0, 6.0, 0.0], 1)]).unwrap());
+        assert_eq!(held(&p), own);
     }
 
     #[test]

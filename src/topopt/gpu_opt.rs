@@ -1003,7 +1003,7 @@ mod tests {
                     p.contact[b] = if grip { 7 } else { 4 };
                 }
             }
-            super::super::pin_with_contact(&mut p, [false; 3]).unwrap();
+            super::super::pin_with_contact(&mut p, [false; 3], &[]).unwrap();
             let top: Vec<usize> = (0..=n[1])
                 .flat_map(|j| (0..=n[0]).map(move |i| (i, j)))
                 .map(|(i, j)| p.node(i, j, n[2]))

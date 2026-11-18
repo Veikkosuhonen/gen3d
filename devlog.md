@@ -3,6 +3,49 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-18: The fine grid keeps the coarse grid's pins
+
+**Why:** `iphone_stand` on a slide ground at 1 mm (726k elements) diverged on the fine grid's
+first iteration ("CG stalled at relative residual 6.6e2", then 1e18, then "GPU CG diverged"). The
+coarse stage ran fine. Its first solve already failed, with every ground node touching, so the
+contact rounds weren't the cause. On a slide ground only the pins hold the part sideways, and each
+grid picks its own: the coarse grid (2 mm) pinned (±22, 17) and (±32, −51), the fine grid
+(±9, −4) and (±40, −57). The coarse design is solid over its pins (density 1) and void over the
+fine grid's (0). So on the fine grid the part was held sideways only through void elements
+(E_min), which is singular in f32.
+
+The grids pick different pins because their ground differs: the stand's four cylinders reach
+0.8 mm below its boxes, and the lowest node layer catches only the cylinder discs on some grids
+(596 nodes at 2 mm) and the whole bottom on others (6968 at 1 mm; at 1.8 / 3.6 mm the other way
+round).
+
+**What:**
+- `pin` can take pins of another grid (`at`): it holds the footprint-interior supported node
+  nearest each one, with the same axes. If those don't hold the part, it falls back to its own
+  choice.
+- `pin_with_contact` returns a `Pinning`: the supports before pinning, and the pins.
+- `repin` re-pins a problem at given pins when its own are elsewhere.
+- `run` now sets up the coarse grid before building the fine model, and re-pins the fine problem
+  at the coarse grid's pins ("fine grid: moving the pins to where the coarse grid's are"). It
+  does this also when resuming a fine-grid checkpoint, so its supports match the checkpoint.
+  The coarse-start threshold counts the whole problem's domain elements, as before.
+
+**Result:** with the 1 mm slide run, the fine grid's first iteration takes 188 CG iterations, and
+the run is done in 16.7 s: 80 iterations, compliance 1.980. At the default size (1.8 mm) the run
+takes 12.0 s with compliance 0.481 (0.478 with the fine grid's own pins).
+
+**Verified:** new test `pins_follow_the_coarse_grid`:
+- it moves the pins to the nearest nodes with the same axes;
+- the same pins are a no-op;
+- pins that can't hold the part fall back to the grid's own.
+
+The suite (81 tests) passes and clippy is clean.
+
+**Still open:** the ground (the lowest node layer) depends on the element size when parts of the
+bottom differ by less than an element. The coarse design can then rest on ground the fine grid
+doesn't have. A tolerance (e.g. nodes within half an element of the lowest layer) would make
+the grids agree.
+
 ## 2026-11-18: Contact ground on the GPU
 
 **Why:** the GPU is the main solver, and after the CPU change it still held the contact ground
