@@ -1944,21 +1944,6 @@ fn optimize_stage(m: &Model, s: &Settings, out: &Path, gpu: Option<&Gpu>, stage:
         let Some(gpu) = gpu else {
             bail!("the GPU solver needs a GPU");
         };
-        if m.groups.iter().any(|g| g.has_contact()) {
-            // TODO: contact on the GPU; until then the ground holds both ways there
-            println!(
-                "note: the GPU solver doesn't let the ground's nodes lift off yet: it holds them (as --ground glued)"
-            );
-            let mut m = m.clone();
-            for g in &mut m.groups {
-                for (f, c) in g.fixed.iter_mut().zip(&g.contact) {
-                    *f |= c;
-                }
-                g.contact.clear();
-            }
-            let bases: Vec<LoadBasis> = m.groups.iter().map(|g| g.load_basis()).collect();
-            return gpu_opt::optimize_gpu(&m, &bases, s, ms, out, gpu, stage);
-        }
         return gpu_opt::optimize_gpu(m, &bases, s, ms, out, gpu, stage);
     }
     let ke = hex_ke(s.nu);

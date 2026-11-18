@@ -79,9 +79,10 @@ pub(super) fn live_elements(m: &Model, x: &[f64], rmin: f64) -> Vec<bool> {
         .map(|i| {
             let q = [i % nn[0], i / nn[0] % nn[1], i / (nn[0] * nn[1])];
             let on_plane = (0..3).any(|a| mirror[a] && q[a] == 0);
-            m.groups
-                .iter()
-                .any(|g| (g.fixed[i] & !thin != 0 && !on_plane) || g.loads.iter().any(|l| l[i] != [0.0; 3]))
+            m.groups.iter().any(|g| {
+                ((g.fixed[i] | g.contact.get(i).copied().unwrap_or(0)) & !thin != 0 && !on_plane)
+                    || g.loads.iter().any(|l| l[i] != [0.0; 3])
+            })
         })
         .collect();
     let mut live: Vec<bool> = (0..ne)
@@ -537,6 +538,23 @@ pub(super) fn optimize_gpu(
     let mut lambda = stage.state.lambda;
     let mut last_change = stage.state.last_change;
     let target = s.volfrac * ndesign as f64;
+    // per group: a contact ground's touching nodes per case (kept from iteration to iteration),
+    // and per case the load on its contact nodes along Z (the reactions are K u - f)
+    let mut contacts: Vec<Option<super::contact::Contact>> =
+        m.groups.iter().map(super::contact::Contact::new).collect();
+    let fz: Vec<Vec<Vec<f64>>> = m
+        .groups
+        .iter()
+        .zip(&contacts)
+        .map(|(g, ct)| match ct {
+            Some(ct) => g
+                .loads
+                .iter()
+                .map(|l| ct.nodes.iter().map(|&i| l[i][2]).collect())
+                .collect(),
+            None => vec![],
+        })
+        .collect();
     // per group: optimizer iterations since the smoothers' λmax was estimated (None: estimate next
     // time)
     let mut estimate_age: Vec<Option<usize>> = vec![None; mgs.len()];
@@ -563,9 +581,12 @@ pub(super) fn optimize_gpu(
         let t0 = Instant::now();
         let mut st = IterStats::default();
         e.run(&[&prog_stiffness])?;
-        for (mg, age) in mgs.iter().zip(&mut estimate_age) {
+        for ((mg, age), ct) in mgs.iter().zip(&mut estimate_age).zip(&contacts) {
             let estimate = age.is_none_or(|a| a >= REESTIMATE_EVERY);
-            mg.build(estimate)?;
+            // (with contact each solve builds for its own touching nodes: here only to estimate)
+            if ct.is_none() || estimate {
+                mg.build(estimate)?;
+            }
             *age = Some(if estimate { 0 } else { age.unwrap() + 1 });
         }
         st.setup = t0.elapsed().as_secs_f64();
@@ -579,32 +600,36 @@ pub(super) fn optimize_gpu(
         };
         st.cg_tol = tol;
         let mut rebuilt = 0.0;
-        for (mg, age) in mgs.iter().zip(&mut estimate_age) {
+        for (g, (mg, age)) in mgs.iter().zip(&mut estimate_age).enumerate() {
             for c in 0..mg.us.len() {
-                let mut n = match mg.solve(c, tol, STALE_CG_ITS) {
-                    // seen on a 2D slab's first fine iteration after a coarse start: as a stall,
-                    // but from zero (a second breakdown is an error)
-                    Err(e) if e.is::<super::gpu_mg::Diverged>() => STALE_CG_ITS,
-                    r => r?,
+                let Some(ct) = &mut contacts[g] else {
+                    let n = solve_case(mg, age, c, tol, &mut rebuilt)?;
+                    st.cg.push(n);
+                    continue;
                 };
-                if n >= STALE_CG_ITS {
-                    // not converged yet (or broke down): an old λmax estimate may have weakened
-                    // the smoother, or a fresh one come out too low; refresh it (carefully if it
-                    // was fresh) and carry on from where CG got to
+                // its own touching nodes, solved until they settle (as `super::solve_contact`)
+                let mut total = 0;
+                let mut settled = false;
+                for _ in 0..super::contact::MAX_ROUNDS {
                     let t = Instant::now();
-                    if *age == Some(0) {
-                        mg.reestimate_long()?;
-                    } else {
-                        mg.build(true)?;
-                    }
-                    *age = Some(0);
+                    mg.contact_set(c, &ct.touch[c])?;
+                    mg.build(false)?;
                     rebuilt += t.elapsed().as_secs_f64();
-                    n += mg.solve(c, tol, CG_MAXIT)?;
+                    total += solve_case(mg, age, c, tol, &mut rebuilt)?;
+                    let r = mg.contact_read(c)?;
+                    let rz: Vec<f64> = r.ku.iter().zip(&fz[g][c]).map(|(k, f)| k - f).collect();
+                    let ch = ct.update(c, &rz, &r.uz, r.umax);
+                    st.contact_rounds += 1;
+                    if !ch.any() {
+                        settled = true;
+                        break;
+                    }
                 }
-                if n >= CG_MAXIT {
-                    println!("warning: CG did not converge in {CG_MAXIT} iterations");
-                }
-                st.cg.push(n);
+                st.contact_unsettled += !settled as usize;
+                st.cg.push(total);
+            }
+            if let Some(ct) = &contacts[g] {
+                st.touching = (0..mg.us.len()).map(|c| ct.touching(c)).collect();
             }
         }
         e.run(&[&prog_energy])?;
@@ -726,6 +751,33 @@ pub(super) fn optimize_gpu(
         super::print_done(&result, t_start, out);
     }
     Ok(result)
+}
+
+/// Solve solved-case slot `c` of `mg` to `tol`. A solve that hasn't converged after
+/// `STALE_CG_ITS` (or broke down) refreshes the smoothers' λmax estimate (a long re-estimate if
+/// it was fresh; the time goes to `rebuilt`) and carries on from where CG got to.
+fn solve_case(mg: &GpuMg, age: &mut Option<usize>, c: usize, tol: f64, rebuilt: &mut f64) -> Result<usize> {
+    let mut n = match mg.solve(c, tol, STALE_CG_ITS) {
+        // seen on a 2D slab's first fine iteration after a coarse start: as a stall, but from zero
+        // (a second breakdown is an error)
+        Err(e) if e.is::<super::gpu_mg::Diverged>() => STALE_CG_ITS,
+        r => r?,
+    };
+    if n >= STALE_CG_ITS {
+        let t = Instant::now();
+        if *age == Some(0) {
+            mg.reestimate_long()?;
+        } else {
+            mg.build(true)?;
+        }
+        *age = Some(0);
+        *rebuilt += t.elapsed().as_secs_f64();
+        n += mg.solve(c, tol, CG_MAXIT)?;
+    }
+    if n >= CG_MAXIT {
+        println!("warning: CG did not converge in {CG_MAXIT} iterations");
+    }
+    Ok(n)
 }
 
 #[cfg(test)]
@@ -910,6 +962,110 @@ mod tests {
         let whole = optimize_stage(&Model::single(full), &s, &dir.join("whole.vti"), Some(&gpu), &st).unwrap();
         let quarter = optimize_stage(&m, &s, &dir.join("quarter.vti"), Some(&gpu), &st).unwrap();
         compare_runs(&whole, &quarter, &dir, 2e-3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// On a contact ground (slide and grip) the GPU loop follows the CPU loop too: a block on the
+    /// ground pressed down (case 1) and pushed sideways hard enough to lift part of its foot
+    /// (case 2). Same compliance and touching nodes per case, iteration by iteration.
+    #[test]
+    fn gpu_contact_matches_cpu() {
+        let Ok(gpu) = crate::gpu::headless() else {
+            eprintln!("no GPU; skipped");
+            return;
+        };
+        if gpu.is_software() {
+            eprintln!("software GPU; skipped");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("gen3d-gpucontact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for grip in [false, true] {
+            let n = [16, 6, 10];
+            let ne: usize = n.iter().product();
+            let nn: usize = n.iter().map(|v| v + 1).product();
+            let mut p = Problem {
+                n,
+                h: 1.0,
+                origin: [0.0; 3],
+                domain: vec![true; ne],
+                // a kept-solid top plate takes the load
+                passive: (0..ne).map(|e| e / (n[0] * n[1]) == n[2] - 1).collect(),
+                fixed: vec![0; nn],
+                loads: vec![vec![[0.0; 3]; nn]; 2],
+                cases: vec![1, 2],
+                contact: vec![0; nn],
+                extrude: None,
+            };
+            for j in 0..=n[1] {
+                for i in 0..=n[0] {
+                    let b = p.node(i, j, 0);
+                    p.contact[b] = if grip { 7 } else { 4 };
+                }
+            }
+            super::super::pin_with_contact(&mut p, [false; 3]).unwrap();
+            let top: Vec<usize> = (0..=n[1])
+                .flat_map(|j| (0..=n[0]).map(move |i| (i, j)))
+                .map(|(i, j)| p.node(i, j, n[2]))
+                .collect();
+            let w = 20.0 / top.len() as f64;
+            for &t in &top {
+                p.loads[0][t] = [0.0, 0.0, -w];
+                // the centre of pressure 0.5 × 10 mm toward +X: past the middle third of the foot
+                p.loads[1][t] = [0.5 * w, 0.0, -w];
+            }
+            super::super::check_tipping(&p).unwrap();
+            let settings = |solver| Settings {
+                voxel: 1.0,
+                volfrac: 0.3,
+                penal: 3.0,
+                rmin: 1.5,
+                iters: 10,
+                tol: 0.0,
+                e0: 3500.0,
+                nu: 0.35,
+                force: 0.0,
+                beta_max: 0.0,
+                solver,
+                emin: 1e-9,
+                cg_tol: 1e-6,
+                adaptive_tol: false,
+                ground: Ground::Slide,
+                coarse_start: false,
+                symmetry: true,
+                overhang: false,
+                up: crate::mesh::Up::PlusZ,
+                plane2d: None,
+            };
+            let ms = MgSettings::default();
+            let cpu = optimize(&p, &settings(Solver::Multigrid(ms)), &dir.join("cpu.vti"), None).unwrap();
+            let gpu_r = optimize(&p, &settings(Solver::Gpu(ms)), &dir.join("gpu.vti"), Some(&gpu)).unwrap();
+            assert_eq!(cpu.iterations, gpu_r.iterations);
+            for (it, (a, b)) in cpu.stats.iter().zip(&gpu_r.stats).enumerate() {
+                let rel = (a.compliance - b.compliance).abs() / a.compliance;
+                assert!(
+                    rel < 2e-3,
+                    "grip {grip}, iteration {}: compliance {} (CPU) vs {} (GPU)",
+                    it + 1,
+                    a.compliance,
+                    b.compliance
+                );
+                // a node at the edge of a contact patch may differ
+                for c in 0..2 {
+                    let d = a.touching[c].abs_diff(b.touching[c]);
+                    assert!(
+                        d <= 2,
+                        "grip {grip}, iteration {}, case {c}: {} touching (CPU) vs {} (GPU)",
+                        it + 1,
+                        a.touching[c],
+                        b.touching[c]
+                    );
+                }
+            }
+            // the pushed case ends with part of the foot lifted
+            let last = &gpu_r.stats.last().unwrap().touching;
+            assert!(last[1] < last[0], "grip {grip}: nothing lifted ({last:?})");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

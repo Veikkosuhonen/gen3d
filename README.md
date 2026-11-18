@@ -499,8 +499,9 @@ With contact every case is solved (none is a combination of others), and mirror 
 when every case is symmetric. Before running, each case is checked against tipping: for each
 separate piece of the domain, its load must press on the ground inside the piece's footprint (the
 centre of pressure inside the convex hull of its ground nodes), or the run stops with the case and
-the piece. A stand made of separate legs needs each leg to stand on its own. *The GPU solver doesn't
-do contact yet: it holds the ground both ways, as `glued`, with a note.*
+the piece. A stand made of separate legs needs each leg to stand on its own. On the GPU each round writes
+the case's touching nodes into the multigrid's support mask and rebuilds its coarse levels; the
+reactions are read at the contact nodes only.
 
 Script and primitives combine: when primitives use a role, the script's own `field_fixed`,
 `field_load` or `field_keep` (if any) is renamed and wrapped, so the field is the script's region plus

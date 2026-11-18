@@ -3,6 +3,55 @@
 Newest entries first. Each entry covers what changed and why, the design decisions, how it was verified,
 and what is still open.
 
+## 2026-11-18: Contact ground on the GPU
+
+**Why:** the GPU is the main solver, and after the CPU change it still held the contact ground
+both ways (as `glued`).
+
+**What:**
+- `GpuMg` gets a `GpuContact` when its problem has contact nodes: per contact node, its stored
+  node, its free mask while touching and while lifted. Two new kernels:
+  - `contact_set` writes a case's touching set into the hierarchy's `free` buffer and zeroes the
+    held displacement of touching nodes (a node that lands starts on the ground; otherwise CG
+    would treat its old displacement as prescribed).
+  - `contact_read` gathers (K u)_z and u_z at the contact nodes. K u comes from `apply_fine` with
+    an all-free mask, written into CG's `q`, which is free between solves. A `MaxNorm` reduce gives
+    max |u|. Only 2 floats per contact node come back.
+- The hierarchy starts with every contact node touching. Loads on contact DOFs are left out, as on
+  the CPU (`free` masked).
+- `gpu_opt`: per case, the same rounds as `solve_contact`: set, `build(false)`, solve (the stall
+  and re-estimate logic now lives in `solve_case`), read, `Contact::update`. The build at the start
+  of each iteration only runs for a contact group when its λmax estimate is due. `live_elements`
+  counts contact nodes as held.
+- The CPU-only fallback is gone.
+
+**Result:**
+- Rock-0.3 copy of `table stand`, 8 mm, `--no-symmetry --no-coarse-start`, 60 iterations. GPU
+  slide 5.9 s (CPU 102 s), GPU glued 1.9 s. Compliance follows the CPU: iteration 1 297.22 vs
+  296.65, iteration 20 0.92043 vs 0.92054, iteration 55 0.70189 vs 0.70230, with touching counts
+  within a few nodes. The final values differ (0.630 vs 0.699) only because the GPU's
+  β continuation stepped to 8 at iteration 60, as glued also does between the two.
+- Same shape at the default GPU size (5.9 mm, 139k elements, coarse start): slide 12.1 s
+  (83 iterations, compliance 0.216), glued 4.7 s (76, 0.117; mirrored to a quarter, 3 solves for 5
+  cases). With contact, setup (a rebuild per round) takes about twice the solve time per iteration.
+- `iphone_stand` default (1.8 mm, 127k elements): slide 10.7 s, 118 iterations, compliance 0.478.
+  Glued 5.1 s, 76 iterations, 0.790. That is the same as the old `grip` before these changes
+  (0.79043) and as glued without symmetry, so the glued run isn't affected by this change.
+
+**Verified:** new `gpu_contact_matches_cpu`. A block with a kept top plate, pressed and pushed
+sideways, slide and grip, 10 iterations: compliance within 2e-3 of the CPU each iteration (it
+matched to 5 digits) and touching nodes within 2 per case. Full suite, the ignored GPU test,
+clippy. `bench-topopt` (no ground) unchanged.
+
+**Still open:**
+- A rebuild per case and round dominates contact iterations. Options: skip the rebuild when a
+  case's set didn't change and the hierarchy still holds it, or keep the coarse levels and change
+  only the fine mask (level 1 is exact through the fine grid).
+- `iphone_stand`: glued (0.790) ends less stiff than slide (0.478), though holding more can only
+  help for a given design. It's a different layout, from a glued run that stops at 76 iterations.
+  To check: evaluate each design under the other's ground.
+- As before: symmetry with contact, and nodes under void flipping.
+
 ## 2026-11-18: The ground only pushes (contact, CPU)
 
 **Why:** `--ground slide|grip` held the bottom layer's nodes as ordinary supports, so the ground

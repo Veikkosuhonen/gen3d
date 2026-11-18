@@ -1343,6 +1343,53 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3
     y[idx[i]] += val[i];
 }
 
+//// kernel contact_set
+// A contact ground's touching nodes for one load case (contact.rs): per contact node i < P.m.x,
+// nodes[i] = (stored node, free axes while touching, free axes when lifted, -). A touching node
+// gets the first mask and its displacement zeroed on the held axes (a node that touches down
+// again starts on the ground), a lifted one the second.
+@group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> touch: array<f32>;
+@group(0) @binding(3) var<storage, read_write> free: array<u32>;
+@group(0) @binding(4) var<storage, read_write> u: array<f32>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let i = flat(wg, nwg, li);
+    if i >= P.m.x { return; }
+    let c = nodes[i];
+    if c.x == NONE { return; }
+    if touch[i] > 0.5 {
+        free[c.x] = c.y;
+        for (var a = 0u; a < 3u; a++) {
+            if ((c.y >> a) & 1u) == 0u { u[3u * c.x + a] = 0.0; }
+        }
+    } else {
+        free[c.x] = c.z;
+    }
+}
+
+//// kernel contact_read
+// Per contact node i < P.m.x (as in `contact_set`): out[2i] = y_z (y = K u, unmasked), out[2i + 1]
+// = u_z; zeros for a node that isn't stored.
+@group(0) @binding(1) var<storage, read> nodes: array<vec4<u32>>;
+@group(0) @binding(2) var<storage, read> y: array<f32>;
+@group(0) @binding(3) var<storage, read> u: array<f32>;
+@group(0) @binding(4) var<storage, read_write> out: array<f32>;
+
+@compute @workgroup_size(128)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>,
+        @builtin(local_invocation_index) li: u32) {
+    let i = flat(wg, nwg, li);
+    if i >= P.m.x { return; }
+    let g = nodes[i].x;
+    var r = vec2<f32>(0.0);
+    if g != NONE { r = vec2<f32>(y[3u * g + 2u], u[3u * g + 2u]); }
+    out[2u * i] = r.x;
+    out[2u * i + 1u] = r.y;
+}
+
 //// kernel reduce_design
 // Like dot_partial, over design elements only (bit 2 of the element flags). P.m.y: 0 Σ a, 2 max
 // |a - b|, 3 count of 0.1 < a < 0.9.

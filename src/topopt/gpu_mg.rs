@@ -59,6 +59,8 @@ const CHECK_EVERY: usize = 4;
 const STALL_ITS: usize = 1000;
 
 // scalar slots
+/// a contact round's largest displacement (`GpuMg::contact_read`)
+const UMAX: u32 = 12;
 const RR: u32 = 0;
 const RZ: u32 = 2;
 const RZN: u32 = 3;
@@ -163,6 +165,35 @@ pub(super) struct GpuMg<'a> {
     estimate_long: Vec<Step>,
     init: Vec<Vec<Step>>,
     iter: Vec<Vec<Step>>,
+    /// a contact ground's nodes (`contact.rs`), None without one
+    contact: Option<GpuContact>,
+}
+
+/// A contact ground on the fine grid: the touching nodes of the case being solved are written into
+/// `free` before each solve, and the reactions read after it.
+struct GpuContact {
+    /// per contact node (in `Contact::nodes` order): stored node (NONE if its brick isn't
+    /// stored), free axes while touching, free axes when lifted, 0
+    nodes: wgpu::Buffer,
+    n: usize,
+    /// per contact node: 1 touching, 0 lifted (written per solve)
+    touch: wgpu::Buffer,
+    /// every stored node free (K u unmasked, for the reactions)
+    free_all: wgpu::Buffer,
+    /// per contact node: (K u)_z, u_z
+    out: wgpu::Buffer,
+    /// per solved case: write the touching nodes; read the reactions (and the largest displacement)
+    set: Vec<Vec<Step>>,
+    read: Vec<Vec<Step>>,
+}
+
+/// What a contact round reads back for each contact node.
+pub(super) struct ContactRead {
+    /// (K u)_z: the vertical reaction plus the load
+    pub ku: Vec<f64>,
+    pub uz: Vec<f64>,
+    /// the largest displacement (norm)
+    pub umax: f64,
 }
 
 impl<'a> GpuMg<'a> {
@@ -222,7 +253,13 @@ impl<'a> GpuMg<'a> {
         let table64 = mg::masked_ptkp_table(ke);
         let table2: Vec<f32> = mg::free_level2_table(&table64).iter().map(|&v| v as f32).collect();
         let table: Vec<f32> = table64.iter().map(|&v| v as f32).collect();
-        let free32: Vec<u32> = free.iter().map(|&f| f as u32).collect();
+        // (a contact ground starts touching everywhere: `contact_set` changes it per case)
+        let contact_axes = |m: usize| p.contact.get(m).copied().unwrap_or(0);
+        let free32: Vec<u32> = free
+            .iter()
+            .enumerate()
+            .map(|(m, &f)| (f & !contact_axes(m)) as u32)
+            .collect();
         let free32 = levels[0].gather(&free32, p.n.map(|v| v + 1), 1, 0);
         let lens: Vec<usize> = levels.iter().map(|b| 3 * b.len()).collect();
         let len = |l: usize| lens[l];
@@ -230,11 +267,12 @@ impl<'a> GpuMg<'a> {
         // loads touch few nodes: kept as (DOF, value) lists, with |f|² for the stopping test
         let mut fs = vec![];
         let mut ff = vec![];
+        // (a load on a contact ground's node is left out: it would push on the ground)
         for l in basis.solved.iter().map(|&c| &p.loads[c]) {
             let (mut idx, mut val, mut sq) = (vec![], vec![], 0.0);
             for (m, v) in l.iter().enumerate() {
                 for (c, &x) in v.iter().enumerate() {
-                    if free[m] >> c & 1 == 1 && x != 0.0 {
+                    if (free[m] & !contact_axes(m)) >> c & 1 == 1 && x != 0.0 {
                         let q = [
                             m % fine_nodes[0],
                             m / fine_nodes[0] % fine_nodes[1],
@@ -359,7 +397,37 @@ impl<'a> GpuMg<'a> {
             estimate_long: vec![],
             init: vec![],
             iter: vec![],
+            contact: None,
         };
+        if p.has_contact() {
+            let fine = &g.bricks[0];
+            let rows: Vec<[u32; 4]> = (0..p.contact.len())
+                .filter(|&m| p.contact[m] != 0)
+                .map(|m| {
+                    let q = [
+                        m % fine_nodes[0],
+                        m / fine_nodes[0] % fine_nodes[1],
+                        m / (fine_nodes[0] * fine_nodes[1]),
+                    ];
+                    let i = fine.index(q).map_or(NONE, |i| i as u32);
+                    [i, (free[m] & !p.contact[m]) as u32, free[m] as u32, 0]
+                })
+                .collect();
+            let all: Vec<u32> = vec![7; fine.len()];
+            let n = rows.len();
+            g.contact = Some(GpuContact {
+                nodes: init("contact nodes", bytemuck::cast_slice(&rows)),
+                n,
+                touch: buf("contact touch", n),
+                free_all: init("all free", bytemuck::cast_slice(&all)),
+                out: buf("contact read", 2 * n),
+                set: vec![],
+                read: vec![],
+            });
+            let (set, read) = (0..g.us.len()).map(|c| g.record_contact(c)).unzip();
+            let ct = g.contact.as_mut().unwrap();
+            (ct.set, ct.read) = (set, read);
+        }
         g.setup = g.record_setup();
         g.estimate = g.record_estimate(POWER_STEPS);
         g.estimate_long = g.record_estimate(POWER_STEPS_LONG);
@@ -395,6 +463,77 @@ impl<'a> GpuMg<'a> {
             ],
             self.bgroups(0),
         );
+    }
+
+    /// The contact programs of solved-case slot `c`: (write its touching nodes into `free`, zeroing
+    /// the displacement they are held in; read (K u)_z and u_z at the contact nodes, and max |u|).
+    fn record_contact(&self, c: usize) -> (Vec<Step>, Vec<Step>) {
+        let ct = self.contact.as_ref().unwrap();
+        let u = &self.us[c];
+        let pm = Params {
+            m: [ct.n as u32, 0, 0, 0],
+            ..Default::default()
+        };
+        let mut set = vec![];
+        self.e.step(
+            &mut set,
+            "contact_set",
+            pm,
+            &[&ct.nodes, &ct.touch, &self.free, u],
+            threads(ct.n),
+        );
+        let mut read = vec![];
+        // K u unmasked, in CG's q (free between solves)
+        self.e.step(
+            &mut read,
+            &self.k("apply_fine"),
+            Params {
+                n: self.pn(0),
+                ..Default::default()
+            },
+            &[
+                &self.ee,
+                &ct.free_all,
+                &self.ke,
+                u,
+                &self.q,
+                &self.pages[0],
+                &self.coords[0],
+            ],
+            self.bgroups(0),
+        );
+        self.e.step(
+            &mut read,
+            "contact_read",
+            pm,
+            &[&ct.nodes, &self.q, u, &ct.out],
+            threads(ct.n),
+        );
+        let nn = self.len(0) / 3;
+        self.e
+            .reduce(&mut read, super::gpu_engine::Reduce::MaxNorm, u, u, u, nn, UMAX);
+        (set, read)
+    }
+
+    /// Hold solved-case slot `c`'s touching nodes (per contact node, `Contact::nodes` order) for
+    /// its next solve. The hierarchy must be built again before solving.
+    pub(super) fn contact_set(&self, c: usize, touch: &[bool]) -> Result<()> {
+        let ct = self.contact.as_ref().unwrap();
+        let t: Vec<f32> = touch.iter().map(|&t| t as u32 as f32).collect();
+        self.e.write_f32(&ct.touch, &t);
+        self.e.run(&[&ct.set[c]])
+    }
+
+    /// After solving slot `c`: (K u)_z and u_z at the contact nodes, and the largest displacement.
+    pub(super) fn contact_read(&self, c: usize) -> Result<ContactRead> {
+        let ct = self.contact.as_ref().unwrap();
+        self.e.run(&[&ct.read[c]])?;
+        let v = self.e.read_f32(&ct.out, 2 * ct.n)?;
+        Ok(ContactRead {
+            ku: v.iter().step_by(2).map(|&x| x as f64).collect(),
+            uz: v.iter().skip(1).step_by(2).map(|&x| x as f64).collect(),
+            umax: self.e.read_scalar(UMAX)? as f64,
+        })
     }
 
     /// The steps that form combined case `c` in `uc`: Σ a u_slot, the first term overwriting it

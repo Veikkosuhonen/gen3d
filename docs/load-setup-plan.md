@@ -39,8 +39,8 @@ Two physics points drive it:
   hang from the ground.
   - [x] CPU (2026-11-18): `contact.rs`, `solve_contact`; `slide` and `grip` are contact, `glued` is
     the old bilateral ground; tipping check per domain piece.
-  - [ ] GPU: per-case masks, the reactions on the GPU, the same rounds (it holds the ground both
-    ways meanwhile).
+  - [x] GPU (2026-11-18): `contact_set` / `contact_read` kernels, the hierarchy rebuilt per case
+    and round, the same rounds as the CPU.
   - [ ] Symmetry with contact: solve one case of each mirror pair and mirror its solution (now
     asymmetric cases are solved on the whole part).
 - **GPU coarse levels with per-axis masks**, to get roller problems back to ~12 CG iterations.

@@ -43,7 +43,6 @@ pub(crate) struct Sym {
 /// problem itself). All groups share the grid, domain and kept regions; they differ in their
 /// supports and loads. Every group has a load vector for every case (zero where a case has no
 /// part in that pattern).
-#[derive(Clone)]
 pub(crate) struct Model {
     pub groups: Vec<Problem>,
     pub sym: Option<Sym>,
